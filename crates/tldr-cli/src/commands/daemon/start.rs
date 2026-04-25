@@ -23,7 +23,7 @@ use crate::output::OutputFormat;
 use super::daemon::{start_daemon_background, wait_for_daemon, TLDRDaemon};
 use super::error::DaemonError;
 use super::ipc::{check_socket_alive, cleanup_socket, compute_socket_path, IpcListener};
-use super::pid::{check_stale_pid, cleanup_stale_pid, compute_pid_path, try_acquire_lock};
+use super::pid::{compute_pid_path, try_acquire_lock};
 use super::types::DaemonConfig;
 
 // =============================================================================
@@ -81,13 +81,17 @@ impl DaemonStartArgs {
                 .join(&self.project)
         });
 
-        // Check for stale PID file and clean up
-        let pid_path = compute_pid_path(&project);
-        if check_stale_pid(&pid_path)? {
-            cleanup_stale_pid(&pid_path)?;
-        }
+        // Note: stale PID cleanup is intentionally NOT performed here. The
+        // flock-based `try_acquire_lock` (called below in foreground mode and
+        // inside `start_daemon_background` for background mode) handles stale
+        // PIDs safely INSIDE the lock — pre-lock cleanup would reopen the
+        // TOCTOU window from issue #14 (two concurrent starts could both
+        // pass the staleness check before either acquired the lock).
 
-        // Check for stale socket and clean up
+        // Check for stale socket and clean up. The socket-side TOCTOU is
+        // additionally guarded by `IpcListener::bind_unix`, which now treats
+        // an existing socket as `AddressInUse` rather than silently
+        // unlink-and-rebind (issue #14).
         let socket_path = compute_socket_path(&project);
         if socket_path.exists() && !check_socket_alive(&project).await {
             // Socket exists but daemon is not responding - stale

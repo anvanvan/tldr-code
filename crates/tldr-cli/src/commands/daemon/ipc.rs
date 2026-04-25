@@ -216,16 +216,22 @@ impl IpcListener {
         // Check for existing symlink (TIGER-P3-04)
         check_not_symlink(&socket_path)?;
 
-        // Remove existing socket if present (could be stale)
-        if socket_path.exists() {
-            // Double-check it's not a symlink before removing
-            check_not_symlink(&socket_path)?;
-            std::fs::remove_file(&socket_path).map_err(DaemonError::SocketBindFailed)?;
-        }
-
-        // Bind the Unix socket
-        let listener =
-            tokio::net::UnixListener::bind(&socket_path).map_err(DaemonError::SocketBindFailed)?;
+        // Issue #14 (TOCTOU fix): do NOT silently unlink an existing socket
+        // here. Pre-fix, a second concurrent start could observe the file
+        // existing, remove it, and bind a fresh socket — clobbering a live
+        // first daemon's IPC endpoint. Instead, attempt the bind directly;
+        // if a socket is already present we surface `AddressInUse`.
+        // Stale-socket cleanup is the responsibility of the caller (start.rs)
+        // after a liveness probe via `check_socket_alive`.
+        let listener = tokio::net::UnixListener::bind(&socket_path).map_err(|e| {
+            if e.kind() == io::ErrorKind::AddrInUse {
+                DaemonError::AddressInUse {
+                    addr: socket_path.display().to_string(),
+                }
+            } else {
+                DaemonError::SocketBindFailed(e)
+            }
+        })?;
 
         // Set socket permissions to 0600 (owner-only) - TIGER-P3-01
         let permissions = std::fs::Permissions::from_mode(0o600);
