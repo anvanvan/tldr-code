@@ -153,6 +153,6 @@ M4 (`crates/tldr-daemon/src/state.rs`) or M6
 
 ## Commit
 
-`<COMMIT_SHA>` — see updated contract.json VAL-005.
+`c82e004` — see updated contract.json VAL-005.
 
 [issue]: https://github.com/parcadei/tldr-code/issues/13

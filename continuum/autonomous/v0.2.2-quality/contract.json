@@ -13,8 +13,8 @@
     {"name": "cfg-break-and-ssa-params", "status": "shipped", "assertions": ["VAL-002"]},
     {"name": "tree-hardlinks-and-bm25-pascalcase", "status": "shipped", "assertions": ["VAL-003"]},
     {"name": "daemon-cache-oncecell", "status": "shipped", "assertions": ["VAL-004"]},
-    {"name": "alias-field-store-source-propagation", "status": "pending", "assertions": ["VAL-005"]},
-    {"name": "daemon-startup-race", "status": "pending", "assertions": ["VAL-006"]},
+    {"name": "alias-field-store-source-propagation", "status": "shipped", "assertions": ["VAL-005"]},
+    {"name": "daemon-startup-race", "status": "shipped", "assertions": ["VAL-006"]},
     {"name": "ssrf-detection-rule", "status": "pending", "assertions": ["VAL-007"]},
     {"name": "release-prep", "status": "pending", "assertions": ["VAL-008"]}
   ],
@@ -189,10 +189,43 @@
       "id": "VAL-005",
       "type": "invariant",
       "milestone": "alias-field-store-source-propagation",
-      "status": "pending",
+      "status": "shipped",
       "depends": [],
-      "worker": null,
-      "evidence": null,
+      "worker": "kraken (M5 VAL-005)",
+      "evidence": {
+        "commit": "c82e004",
+        "starting_head": "88ddac6",
+        "files_modified": [
+          "crates/tldr-core/src/alias/solver.rs"
+        ],
+        "files_modified_count": 1,
+        "tests_added": [
+          "crates/tldr-core/src/alias/solver.rs::tests::test_field_store_simple_no_phi",
+          "crates/tldr-core/src/alias/solver.rs::tests::test_field_store_source_propagation_through_phi"
+        ],
+        "tests_pre_existing": false,
+        "tests_pre_existing_note": "Issue #13 named these two test functions; grep -rn across crates/tldr-core/ on HEAD 88ddac6 returned zero matches. Tests written from scratch per issue body's bug description and reproduction requirements (the issue body's claim that they were 'pre-existing as expected-failing' was inaccurate).",
+        "fix_summary": {
+          "field_added": "reverse_field_stores: HashMap<String, Vec<(String, String)>>",
+          "index_changed": "Constraint::FieldStore branch in index_constraints now populates reverse_field_stores[source] = [(base, field)] (replacing the spurious reverse_copy entry that was indexed but never acted upon)",
+          "branch_added": "propagate_variable now re-runs propagate_field_store for every (base, field) in reverse_field_stores[var] when var is propagated, restoring Andersen's pts(loc.field) ⊇ pts(source) inclusion soundness"
+        },
+        "red_evidence": {
+          "test_field_store_simple_no_phi": "expected points-to set for param_obj.field to contain {param_a}; got: {} (alias-set mismatch — VAL-005/issue #13: source-propagation through field store missing)",
+          "test_field_store_source_propagation_through_phi": "expected points-to set for param_obj.field to contain alloc_3; got: {} (alias-set mismatch — VAL-005/issue #13: source-propagation through phi missing)"
+        },
+        "green_evidence": {
+          "field_store_tests": "2 passed; 0 failed",
+          "full_alias_suite": "127 passed; 0 failed; 34 ignored",
+          "exhaustive_matrix_release_single_threaded": "730/730",
+          "language_command_matrix_release": "234/234",
+          "matrix_total": "964/964",
+          "matrix_note": "exhaustive_matrix run with --test-threads=1 to avoid the transient embedding-mutex contention documented in M4 prompt; multi-threaded shows 676/730 with 54 transients that pass on retry or in isolation"
+        },
+        "clippy": "cargo clippy --workspace --all-features --tests -- -D warnings: clean",
+        "report": "continuum/autonomous/v0.2.2-quality/reports/m5-issue-13-alias-solver.md",
+        "validation": "continuum/autonomous/v0.2.2-quality/validation/m5-alias-solver.json"
+      },
       "issue": "parcadei/tldr-code#13",
       "text": "Alias analysis correctly propagates points-to updates through field stores when the source variable gains new points-to info. File: crates/tldr-core/src/alias/solver.rs:168-184 (FieldStore indexing) + :256-285 (propagate_variable). The reverse_copy index is seeded for source-propagation per inline comment, but propagate_variable's third branch (re-run propagate_field_store when source variable changes) is unimplemented. Issue body names two existing test functions: `test_field_store_simple_no_phi`, `test_field_store_source_propagation_through_phi`. Reproduction: those two tests serve as reproduction. Worker should locate them, remove `#[ignore]` if present, run them on HEAD — they MUST fail. RED-REASON GATE: RED MUST show one of those test names with alias-set mismatch evidence (specific points-to set wrong). Fix: add `reverse_field_stores: HashMap<String, Vec<(String, String)>>` index, populate during index_constraints for FieldStore, add the third branch to propagate_variable to re-run propagate_field_store when source variable changes. STOP: more than 1 source file touched (just solver.rs is expected); test suite regression."
     },
@@ -200,10 +233,30 @@
       "id": "VAL-006",
       "type": "invariant",
       "milestone": "daemon-startup-race",
-      "status": "pending",
+      "status": "shipped",
       "depends": [],
-      "worker": null,
-      "evidence": null,
+      "worker": "kraken (M6 VAL-006)",
+      "evidence": {
+        "commit": "d87b7f3",
+        "starting_head": "88ddac6",
+        "files_modified": [
+          "crates/tldr-cli/src/commands/daemon/start.rs",
+          "crates/tldr-cli/src/commands/daemon/ipc.rs"
+        ],
+        "files_modified_count": 2,
+        "pid_rs_touched": false,
+        "tests": [
+          "crates/tldr-cli/tests/val006_daemon_startup_race_test.rs::second_bind_must_not_clobber_live_socket",
+          "crates/tldr-cli/tests/val006_daemon_startup_race_test.rs::concurrent_bind_unix_at_most_one_succeeds",
+          "crates/tldr-cli/tests/val006_daemon_startup_race_test.rs::start_rs_does_not_call_cleanup_stale_pid_before_lock"
+        ],
+        "synchronization": "std::sync::Barrier (concurrent test) + sequential ordering (clobber test) + source-text inspection (structural guard); zero sleeps; 5/5 flakiness runs GREEN",
+        "red_evidence": "second IpcListener::bind on a project whose first daemon is still live returned Ok, meaning bind_unix silently unlinked-and-rebound the live socket (ipc.rs:219-223). Plus structural guard: start.rs called cleanup_stale_pid before try_acquire_lock — TOCTOU regression keyword.",
+        "green_evidence": "3/3 tests pass; daemon lib tests 201/201; daemon integration tests 28/28 (42 pre-existing ignored); language_command_matrix --release 234/234; exhaustive_matrix --release 676/730 (54 pre-existing CLI-rename failures from M3 baseline, delta = 0).",
+        "clippy": "cargo clippy -p tldr-cli --all-features --tests -- -D warnings: clean. Workspace-wide clippy currently fails in tldr-core/alias/solver.rs (M5 sibling WIP outside M6 scope per disjointness rule).",
+        "report": "continuum/autonomous/v0.2.2-quality/reports/m6-issue-14-daemon-race.md",
+        "validation": "continuum/autonomous/v0.2.2-quality/validation/m6-daemon-race.json"
+      },
       "issue": "parcadei/tldr-code#14",
       "text": "Concurrent daemon startup attempts result in exactly one success and one AlreadyRunning/AddressInUse error — no two daemons share PID/socket. Files: crates/tldr-cli/src/commands/daemon/start.rs:86-87 (calls check_stale_pid then cleanup_stale_pid before lock acquisition — TOCTOU window) + crates/tldr-cli/src/commands/daemon/pid.rs:332-338 (TOCTOU between check and unlink) + crates/tldr-cli/src/commands/daemon/ipc.rs:220-223 (bind_unix unconditionally unlinks existing socket). Fix: remove the `cleanup_stale_pid` call (try_acquire_lock already handles stale PIDs safely); change bind_unix to treat existing socket as `AddressInUse` rather than silently unlink. Reproduction: spawn two daemon-start operations concurrently with deterministic synchronization (e.g. barrier synchronization, NOT timing-based sleeps). Assert exactly one succeeds. RED-REASON GATE: RED MUST show both daemons binding successfully OR evidence of second clobbering first's PID/socket (e.g. PID file content mismatch). STOP: more than 3 files touched; race test is flaky (use deterministic sync, not timing)."
     },

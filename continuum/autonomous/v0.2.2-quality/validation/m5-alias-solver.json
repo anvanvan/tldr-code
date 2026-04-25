@@ -5,7 +5,7 @@
   "title": "Alias field-store source propagation",
   "status": "passed",
   "starting_head": "88ddac6",
-  "commit": "<COMMIT_SHA>",
+  "commit": "c82e004",
   "files_modified": [
     "crates/tldr-core/src/alias/solver.rs"
   ],
