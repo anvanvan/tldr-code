@@ -607,20 +607,103 @@ fn get_sinks(vuln_type: VulnType, language: Language) -> Vec<(&'static str, &'st
             ],
         },
         VulnType::Ssrf => match language {
-            Language::Python
-            | Language::TypeScript
-            | Language::JavaScript
-            | Language::Go
-            | Language::Rust
-            | Language::Java
-            | Language::C
+            // VAL-007 (M7, v0.2.2): SSRF sink patterns. The shape mirrors
+            // the VulnType::Deserialization arm below: `(pattern, description)`
+            // tuples matched as substrings against the source line. The
+            // taint engine's second pass at scan_file_vulns:887-933 fires
+            // a finding when (a) `line.contains(sink_pattern)` AND (b)
+            // `line.contains(tainted_var)` on the same line.
+            Language::Python => vec![
+                ("requests.get(", "HTTP request with user-controlled URL (requests.get)"),
+                ("requests.post(", "HTTP POST with user-controlled URL (requests.post)"),
+                ("requests.put(", "HTTP PUT with user-controlled URL (requests.put)"),
+                ("requests.delete(", "HTTP DELETE with user-controlled URL (requests.delete)"),
+                ("requests.head(", "HTTP HEAD with user-controlled URL (requests.head)"),
+                ("requests.patch(", "HTTP PATCH with user-controlled URL (requests.patch)"),
+                ("requests.request(", "HTTP request with user-controlled URL (requests.request)"),
+                ("urllib.request.urlopen(", "URL open with user-controlled input"),
+                ("urlopen(", "URL open with user-controlled input"),
+                ("httpx.get(", "HTTP request with user-controlled URL (httpx.get)"),
+                ("httpx.post(", "HTTP POST with user-controlled URL (httpx.post)"),
+                ("httpx.request(", "HTTP request with user-controlled URL (httpx.request)"),
+                ("aiohttp.ClientSession", "Async HTTP session with user-controlled URL"),
+            ],
+            Language::JavaScript | Language::TypeScript => vec![
+                ("fetch(", "HTTP request with user-controlled URL (fetch)"),
+                ("axios.get(", "HTTP request with user-controlled URL (axios.get)"),
+                ("axios.post(", "HTTP POST with user-controlled URL (axios.post)"),
+                ("axios.put(", "HTTP PUT with user-controlled URL (axios.put)"),
+                ("axios.delete(", "HTTP DELETE with user-controlled URL (axios.delete)"),
+                ("axios.request(", "HTTP request with user-controlled URL (axios.request)"),
+                ("axios(", "HTTP request with user-controlled URL (axios)"),
+                ("http.get(", "HTTP request with user-controlled URL (http.get)"),
+                ("http.request(", "HTTP request with user-controlled URL (http.request)"),
+                ("https.get(", "HTTPS request with user-controlled URL (https.get)"),
+                ("https.request(", "HTTPS request with user-controlled URL (https.request)"),
+                ("got(", "HTTP request with user-controlled URL (got)"),
+                ("superagent.get(", "HTTP request with user-controlled URL (superagent)"),
+                ("node-fetch(", "HTTP request with user-controlled URL (node-fetch)"),
+            ],
+            Language::Go => vec![
+                ("http.Get(", "HTTP request with user-controlled URL (http.Get)"),
+                ("http.Post(", "HTTP POST with user-controlled URL (http.Post)"),
+                ("http.PostForm(", "HTTP POST form with user-controlled URL (http.PostForm)"),
+                ("http.Head(", "HTTP HEAD with user-controlled URL (http.Head)"),
+                ("http.NewRequest(", "HTTP request constructor with user-controlled URL"),
+                ("http.NewRequestWithContext(", "HTTP request constructor with user-controlled URL"),
+            ],
+            Language::Java => vec![
+                ("URL(", "URL construction with user-controlled input"),
+                (".openConnection(", "URL connection open with user-controlled URL"),
+                (".openStream(", "URL stream open with user-controlled URL"),
+                ("HttpClient.newHttpClient", "HttpClient with user-controlled URL"),
+                (".send(", "HttpClient send with user-controlled URI"),
+                ("URI.create(", "URI construction with user-controlled input"),
+                ("HttpRequest.newBuilder(", "HttpRequest builder with user-controlled URI"),
+                ("RestTemplate", "Spring RestTemplate with user-controlled URL"),
+                (".getForObject(", "Spring REST call with user-controlled URL"),
+                (".postForObject(", "Spring REST POST with user-controlled URL"),
+            ],
+            Language::Rust => vec![
+                ("reqwest::get(", "HTTP request with user-controlled URL (reqwest::get)"),
+                ("reqwest::Client", "reqwest client with user-controlled URL"),
+                (".get(", "HTTP GET with user-controlled URL (reqwest/ureq client)"),
+                (".post(", "HTTP POST with user-controlled URL (reqwest/ureq client)"),
+                ("ureq::get(", "HTTP request with user-controlled URL (ureq::get)"),
+                ("ureq::post(", "HTTP POST with user-controlled URL (ureq::post)"),
+                ("hyper::Client", "hyper client with user-controlled URL"),
+                ("Url::parse(", "URL parse with user-controlled input"),
+            ],
+            Language::Ruby => vec![
+                ("Net::HTTP.get(", "HTTP request with user-controlled URL (Net::HTTP.get)"),
+                ("Net::HTTP.post(", "HTTP POST with user-controlled URL (Net::HTTP.post)"),
+                ("Net::HTTP.start(", "HTTP session with user-controlled host"),
+                ("URI.open(", "URI open with user-controlled input"),
+                ("URI.parse(", "URI parse with user-controlled input"),
+                ("RestClient.get(", "HTTP request with user-controlled URL (RestClient)"),
+                ("RestClient.post(", "HTTP POST with user-controlled URL (RestClient)"),
+                ("HTTParty.get(", "HTTP request with user-controlled URL (HTTParty)"),
+                ("open(", "Kernel#open with user-controlled URL (allows http://)"),
+            ],
+            Language::Php => vec![
+                ("file_get_contents(", "File/URL read with user-controlled input"),
+                ("fopen(", "File/URL open with user-controlled input"),
+                ("curl_exec(", "cURL execution with user-controlled URL (CURLOPT_URL)"),
+                ("curl_setopt(", "cURL option set with user-controlled URL (CURLOPT_URL)"),
+                ("get_headers(", "HTTP headers fetch with user-controlled URL"),
+                ("readfile(", "File/URL read with user-controlled input"),
+                ("Guzzle\\Client", "Guzzle HTTP client with user-controlled URL"),
+                ("->request(", "HTTP request with user-controlled URL (Guzzle/PSR-18)"),
+            ],
+            // Stretch languages NOT yet covered by M7 — deferred to v0.2.3.
+            // These return vec![] until sink patterns are added; no findings
+            // will fire for SSRF in these languages, matching pre-M7 behavior.
+            Language::C
             | Language::Cpp
-            | Language::Ruby
             | Language::Kotlin
             | Language::Swift
             | Language::CSharp
             | Language::Scala
-            | Language::Php
             | Language::Lua
             | Language::Luau
             | Language::Elixir
@@ -835,11 +918,18 @@ fn scan_file_vulns(path: &Path, vuln_filter: Option<VulnType>) -> TldrResult<Vec
     let vuln_types = if let Some(vt) = vuln_filter {
         vec![vt]
     } else {
+        // VAL-007 (M7, v0.2.2): Ssrf added to the default scan set so
+        // `tldr vuln` (which calls scan_vulnerabilities with vuln_type=None
+        // from crates/tldr-cli/src/commands/remaining/vuln.rs:641) actually
+        // runs the SSRF rule. Pre-M7 it was excluded — even after sink
+        // patterns existed, no SSRF findings would fire unless the user
+        // passed `--type ssrf` explicitly.
         vec![
             VulnType::SqlInjection,
             VulnType::Xss,
             VulnType::CommandInjection,
             VulnType::PathTraversal,
+            VulnType::Ssrf,
             VulnType::Deserialization,
         ]
     };
@@ -1730,5 +1820,343 @@ os.system("cat " + filename)
         )
         .unwrap();
         assert!(!findings.is_empty());
+    }
+
+    // --- VAL-007 (M7): SSRF detection rule --------------------------------
+    //
+    // Pre-fix the `VulnType::Ssrf => match language` block at vuln.rs:609-628
+    // returned vec![] for every language, so no SSRF findings ever fired
+    // through `scan_vulnerabilities` / `scan_file_vulns`. These tests pin
+    // the rule to the per-language sink patterns documented in the
+    // VulnType::Ssrf arm of `get_sinks`.
+    //
+    // RED on HEAD: each `assert!(!findings.is_empty(), ...)` fails because
+    // `findings` is empty (no sink patterns). GREEN after fix.
+
+    #[test]
+    fn test_e2e_python_ssrf_requests_get() {
+        let findings = assert_detects_vuln(
+            "vuln.py",
+            "target = request.args.get(\"url\")\nrequests.get(target)",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: Python `requests.get(target)` with tainted target must \
+             produce >= 1 SSRF finding; got 0. The Ssrf sink list at \
+             vuln.rs:609-628 must include `requests.get(`."
+        );
+        assert!(
+            findings.iter().all(|f| f.vuln_type == VulnType::Ssrf),
+            "All findings should be Ssrf; got {:?}",
+            findings.iter().map(|f| f.vuln_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_e2e_python_ssrf_urllib_urlopen() {
+        let findings = assert_detects_vuln(
+            "vuln.py",
+            "target = request.args.get(\"url\")\nurllib.request.urlopen(target)",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: Python `urllib.request.urlopen(target)` with tainted \
+             target must produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    #[test]
+    fn test_e2e_python_ssrf_httpx_get() {
+        let findings = assert_detects_vuln(
+            "vuln.py",
+            "target = request.args.get(\"url\")\nhttpx.get(target)",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: Python `httpx.get(target)` with tainted target must \
+             produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    #[test]
+    fn test_e2e_typescript_ssrf_fetch() {
+        let findings = assert_detects_vuln(
+            "vuln.ts",
+            "const target = req.query.url;\nawait fetch(target);",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: TypeScript `fetch(target)` with tainted target must \
+             produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    #[test]
+    fn test_e2e_typescript_ssrf_axios_get() {
+        let findings = assert_detects_vuln(
+            "vuln.ts",
+            "const target = req.query.url;\nawait axios.get(target);",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: TypeScript `axios.get(target)` with tainted target must \
+             produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    #[test]
+    fn test_e2e_javascript_ssrf_fetch() {
+        let findings = assert_detects_vuln(
+            "vuln.js",
+            "const target = req.query.url;\nfetch(target);",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: JavaScript `fetch(target)` with tainted target must \
+             produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    #[test]
+    fn test_e2e_go_ssrf_http_get() {
+        let findings = assert_detects_vuln(
+            "vuln.go",
+            "target := r.URL.Query().Get(\"url\")\nhttp.Get(target)",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: Go `http.Get(target)` with tainted target must \
+             produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    #[test]
+    fn test_e2e_go_ssrf_http_post() {
+        let findings = assert_detects_vuln(
+            "vuln.go",
+            "target := r.URL.Query().Get(\"url\")\nhttp.Post(target, \"application/json\", body)",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: Go `http.Post(target, ...)` with tainted target must \
+             produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    #[test]
+    fn test_e2e_go_ssrf_http_newrequest() {
+        let findings = assert_detects_vuln(
+            "vuln.go",
+            "target := r.URL.Query().Get(\"url\")\nhttp.NewRequest(\"GET\", target, nil)",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: Go `http.NewRequest(method, target, body)` with tainted \
+             target must produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    // --- Stretch languages: Java, Rust, Ruby, PHP ---
+
+    #[test]
+    fn test_e2e_java_ssrf_url_openconnection() {
+        let findings = assert_detects_vuln(
+            "Vuln.java",
+            "String target = request.getParameter(\"url\");\nnew URL(target).openConnection();",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: Java `new URL(target).openConnection()` with tainted \
+             target must produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    #[test]
+    fn test_e2e_rust_ssrf_reqwest_get() {
+        let findings = assert_detects_vuln(
+            "main.rs",
+            "let target = std::env::var(\"URL\").unwrap();\nreqwest::get(target);",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: Rust `reqwest::get(target)` with tainted target must \
+             produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    #[test]
+    fn test_e2e_ruby_ssrf_net_http_get() {
+        let findings = assert_detects_vuln(
+            "app.rb",
+            "target = params[:url]\nNet::HTTP.get(target)",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: Ruby `Net::HTTP.get(target)` with tainted target must \
+             produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    #[test]
+    fn test_e2e_php_ssrf_file_get_contents() {
+        let findings = assert_detects_vuln(
+            "index.php",
+            "target = $_GET['url'];\nfile_get_contents(target);",
+            VulnType::Ssrf,
+        )
+        .unwrap();
+        assert!(
+            !findings.is_empty(),
+            "VAL-007: PHP `file_get_contents(target)` with tainted target \
+             must produce >= 1 SSRF finding; got 0."
+        );
+    }
+
+    /// VAL-007: SSRF must be part of the default `vuln_types` list scanned
+    /// when the caller passes `vuln_filter = None` to `scan_file_vulns`.
+    /// Pre-fix, the default list at vuln.rs:838-845 was
+    /// {SqlInjection, Xss, CommandInjection, PathTraversal, Deserialization}
+    /// — Ssrf was excluded. So even after populating the sink patterns,
+    /// `scan_vulnerabilities(path, None, None)` (the default CLI call site
+    /// at crates/tldr-cli/src/commands/remaining/vuln.rs:641) would still
+    /// silently skip SSRF unless the user passed `--type ssrf` explicitly.
+    #[test]
+    fn test_e2e_ssrf_in_default_vuln_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("vuln.go");
+        std::fs::write(
+            &file,
+            "package main\nimport \"net/http\"\nfunc h(r *http.Request) { target := r.URL.Query().Get(\"u\"); http.Get(target) }",
+        )
+        .unwrap();
+        // No vuln_filter — relies on Ssrf being in the default list.
+        let findings = scan_file_vulns(&file, None).unwrap();
+        let ssrf_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.vuln_type == VulnType::Ssrf)
+            .collect();
+        assert!(
+            !ssrf_findings.is_empty(),
+            "VAL-007: SSRF must be included in the default vuln_types list \
+             at vuln.rs:838-845; otherwise `tldr vuln` (which calls \
+             scan_vulnerabilities with vuln_type=None) silently skips SSRF \
+             scanning. Got findings: {:?}",
+            findings.iter().map(|f| f.vuln_type).collect::<Vec<_>>()
+        );
+    }
+
+    /// Coverage check on get_sinks itself — ensure each shipped language
+    /// has at least one SSRF sink pattern. Uses literal pattern lookup to
+    /// pin the canonical strings and prevent silent regressions where a
+    /// future refactor empties one language's list.
+    #[test]
+    fn test_get_sinks_ssrf_has_per_language_coverage() {
+        // Required (M7 acceptance): Python + TS/JS + Go.
+        let py = get_sinks(VulnType::Ssrf, Language::Python);
+        assert!(
+            py.iter().any(|(p, _)| *p == "requests.get("),
+            "Python SSRF sinks must include requests.get(; got {:?}",
+            py
+        );
+        assert!(
+            py.iter().any(|(p, _)| *p == "urllib.request.urlopen("),
+            "Python SSRF sinks must include urllib.request.urlopen(; got {:?}",
+            py
+        );
+
+        let ts = get_sinks(VulnType::Ssrf, Language::TypeScript);
+        assert!(
+            ts.iter().any(|(p, _)| *p == "fetch("),
+            "TypeScript SSRF sinks must include fetch(; got {:?}",
+            ts
+        );
+        assert!(
+            ts.iter().any(|(p, _)| *p == "axios.get("),
+            "TypeScript SSRF sinks must include axios.get(; got {:?}",
+            ts
+        );
+
+        let js = get_sinks(VulnType::Ssrf, Language::JavaScript);
+        assert!(
+            js.iter().any(|(p, _)| *p == "fetch("),
+            "JavaScript SSRF sinks must include fetch(; got {:?}",
+            js
+        );
+
+        let go = get_sinks(VulnType::Ssrf, Language::Go);
+        assert!(
+            go.iter().any(|(p, _)| *p == "http.Get("),
+            "Go SSRF sinks must include http.Get(; got {:?}",
+            go
+        );
+        assert!(
+            go.iter().any(|(p, _)| *p == "http.NewRequest("),
+            "Go SSRF sinks must include http.NewRequest(; got {:?}",
+            go
+        );
+
+        // Stretch (M7 in-scope if shipped): Java, Rust, Ruby, PHP.
+        // These assertions guard the stretch coverage; if a stretch
+        // language is deferred to v0.2.3 the corresponding assertion
+        // should be deleted in the same commit that defers it.
+        let java = get_sinks(VulnType::Ssrf, Language::Java);
+        assert!(
+            !java.is_empty(),
+            "Java SSRF sinks must be populated (stretch language for M7); \
+             defer to v0.2.3 by removing this assertion if shipping without \
+             Java. Got {:?}",
+            java
+        );
+
+        let rust = get_sinks(VulnType::Ssrf, Language::Rust);
+        assert!(
+            !rust.is_empty(),
+            "Rust SSRF sinks must be populated (stretch language for M7); \
+             defer to v0.2.3 by removing this assertion if shipping without \
+             Rust. Got {:?}",
+            rust
+        );
+
+        let ruby = get_sinks(VulnType::Ssrf, Language::Ruby);
+        assert!(
+            !ruby.is_empty(),
+            "Ruby SSRF sinks must be populated (stretch language for M7); \
+             defer to v0.2.3 by removing this assertion if shipping without \
+             Ruby. Got {:?}",
+            ruby
+        );
+
+        let php = get_sinks(VulnType::Ssrf, Language::Php);
+        assert!(
+            !php.is_empty(),
+            "PHP SSRF sinks must be populated (stretch language for M7); \
+             defer to v0.2.3 by removing this assertion if shipping without \
+             PHP. Got {:?}",
+            php
+        );
     }
 }

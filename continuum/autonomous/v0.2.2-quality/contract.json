@@ -15,7 +15,7 @@
     {"name": "daemon-cache-oncecell", "status": "shipped", "assertions": ["VAL-004"]},
     {"name": "alias-field-store-source-propagation", "status": "shipped", "assertions": ["VAL-005"]},
     {"name": "daemon-startup-race", "status": "shipped", "assertions": ["VAL-006"]},
-    {"name": "ssrf-detection-rule", "status": "pending", "assertions": ["VAL-007"]},
+    {"name": "ssrf-detection-rule", "status": "shipped", "assertions": ["VAL-007"]},
     {"name": "release-prep", "status": "pending", "assertions": ["VAL-008"]}
   ],
   "assertions": [
@@ -264,11 +264,79 @@
       "id": "VAL-007",
       "type": "invariant",
       "milestone": "ssrf-detection-rule",
-      "status": "pending",
+      "status": "passed",
       "depends": [],
-      "worker": null,
-      "evidence": null,
+      "worker": "kraken (M7 VAL-007, v0.2.2-quality wave 3)",
+      "evidence": {
+        "commit": "PENDING_COMMIT_SHA",
+        "starting_head": "c82e004",
+        "files_modified": [
+          "crates/tldr-core/src/security/vuln.rs"
+        ],
+        "files_added": [
+          "crates/tldr-cli/tests/vuln_ssrf_test.rs",
+          "crates/tldr-cli/tests/fixtures/ssrf_python/Vuln.py",
+          "crates/tldr-cli/tests/fixtures/ssrf_typescript/Vuln.ts",
+          "crates/tldr-cli/tests/fixtures/ssrf_go/Vuln.go"
+        ],
+        "files_modified_count_in_security_dir": 1,
+        "languages_shipped": [
+          "Python", "TypeScript", "JavaScript", "Go", "Java", "Rust", "Ruby", "Php"
+        ],
+        "languages_deferred_to_v0_2_3": [
+          "C", "Cpp", "Kotlin", "Swift", "CSharp", "Scala", "Lua", "Luau", "Elixir", "Ocaml"
+        ],
+        "tests_added_core": [
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_python_ssrf_requests_get",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_python_ssrf_urllib_urlopen",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_python_ssrf_httpx_get",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_typescript_ssrf_fetch",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_typescript_ssrf_axios_get",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_javascript_ssrf_fetch",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_go_ssrf_http_get",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_go_ssrf_http_post",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_go_ssrf_http_newrequest",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_java_ssrf_url_openconnection",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_rust_ssrf_reqwest_get",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_ruby_ssrf_net_http_get",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_php_ssrf_file_get_contents",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_e2e_ssrf_in_default_vuln_types",
+          "crates/tldr-core/src/security/vuln.rs::tests::test_get_sinks_ssrf_has_per_language_coverage"
+        ],
+        "tests_added_cli": [
+          "crates/tldr-cli/tests/vuln_ssrf_test.rs::vuln_typescript_emits_ssrf_finding",
+          "crates/tldr-cli/tests/vuln_ssrf_test.rs::vuln_go_emits_ssrf_finding",
+          "crates/tldr-cli/tests/vuln_ssrf_test.rs::vuln_ssrf_findings_carry_cwe_918"
+        ],
+        "fix_summary": {
+          "block_replaced": "VulnType::Ssrf => match language at vuln.rs:609-628 (was vec![] for every language) populated with sink patterns for Python, TS/JS, Go, Java, Rust, Ruby, PHP. C/C++/Kotlin/Swift/C#/Scala/Lua/Luau/Elixir/OCaml left as explicit empty arms — deferred to v0.2.3 (none required for the M7 acceptance set; no behavior change for those languages vs pre-M7).",
+          "block_added_to_default_list": "VulnType::Ssrf added to the default vuln_types list at vuln.rs:838-845 (so scan_vulnerabilities with vuln_filter=None — the default CLI invocation path at crates/tldr-cli/src/commands/remaining/vuln.rs:641 — actually runs the SSRF rule)."
+        },
+        "wire_format": {
+          "vuln_type_json": "ssrf",
+          "vuln_type_display": "Server-Side Request Forgery",
+          "cwe_id": "CWE-918",
+          "serde_attribute": "#[serde(rename_all = \"snake_case\")] on tldr_core::security::vuln::VulnType (vuln.rs:37)"
+        },
+        "red_evidence": {
+          "core_unit_tests": "15 failures, every panic literally contains 'got 0' or 'got []' or 'Got findings: [SqlInjection]'. Captured at continuum/autonomous/v0.2.2-quality/reports/m7-red-capture.txt. Examples: 'VAL-007: Python `requests.get(target)` with tainted target must produce >= 1 SSRF finding; got 0.' / 'Python SSRF sinks must include requests.get(; got []' / 'VAL-007: SSRF must be included in the default vuln_types list at vuln.rs:838-845 ... Got findings: [SqlInjection]'.",
+          "cli_integration_tests": "3 failures: vuln_typescript_emits_ssrf_finding (`findings: []`), vuln_go_emits_ssrf_finding (vuln_types: ['sqlinjection', 'sqlinjection', 'sqlinjection', 'sqlinjection'] — no 'ssrf' in array; the 4 spurious sqlinjection findings come from the existing Go SQL sink list at vuln.rs:307-310 matching the substring `.Query(` inside the taint source `r.URL.Query().Get(\"url\")` — pre-existing noise unrelated to SSRF), vuln_ssrf_findings_carry_cwe_918 (no SSRF finding to verify CWE-918 wire-up)."
+        },
+        "green_evidence": {
+          "core_security_tests": "63 passed; 0 failed; 0 ignored (pre-existing 48 + new 15)",
+          "cli_vuln_tests": "12 passed; 0 failed (vuln_autodetect 6 + vuln_sarif_deserialization 2 + vuln_ssrf 3 + walker_consolidation 1)",
+          "exhaustive_matrix_release_single_threaded": "730/730",
+          "language_command_matrix_release": "234/234",
+          "matrix_total": "964/964",
+          "matrix_baseline_match": "M5 c82e004"
+        },
+        "clippy": "cargo clippy --workspace --all-features --tests -- -D warnings: clean",
+        "matrix_note": "exhaustive_matrix run with --test-threads=1 per M5's documented embedding-mutex contention.",
+        "report": "continuum/autonomous/v0.2.2-quality/reports/m7-ssrf-detection.md",
+        "validation": "continuum/autonomous/v0.2.2-quality/validation/m7-ssrf-detection.json"
+      },
       "issue": "follow-up from v0.2.1 M2 — saved in memory tldr_code_v022_ssrf_rule.md",
+      "status_resolution": "VAL-007 PASSED. The SSRF detection rule is implemented for 8 languages (M7 acceptance was 3: Python + TS/JS + Go; shipped 5 stretch beyond: TS, JS, Java, Rust, Ruby, PHP). The empty `VulnType::Ssrf => match language` block at vuln.rs:609-628 was populated with `(pattern, description)` tuples mirroring the Deserialization arm's shape, plumbing into the existing taint-engine flow (no engine changes). Additionally, `VulnType::Ssrf` was added to the default `vuln_types` list at vuln.rs:838-845 so the rule actually fires when `scan_vulnerabilities` is called with `vuln_filter=None` (the default CLI path). 10 languages (C, C++, Kotlin, Swift, C#, Scala, Lua, Luau, Elixir, OCaml) are explicit empty arms — deferred to v0.2.3, behavior matches pre-M7 (no false positives, no false negatives beyond what existed). 18 tests added (15 core unit + 3 CLI integration). RED on HEAD c82e004: 15+3 tests fail with explicit 'got 0' / 'got []' / 'no ssrf in vuln_types array' assertions naming missing SSRF detection. GREEN after fix: all 18 pass; pre-existing 48 vuln tests still pass; clippy clean; matrix 964/964 (matches M5 baseline). Files modified in security/: 1 (vuln.rs); STOP cap was 5. Wire format: `vuln_type` JSON field == `\"ssrf\"` (snake_case via serde); `cwe_id` == `\"CWE-918\"`. Commit: PENDING_COMMIT_SHA.",
       "text": "`tldr vuln` emits SSRF findings when scanning code that calls a URL-fetching sink with taint-tracked user input. File: crates/tldr-core/src/security/vuln.rs:609-628 (`VulnType::Ssrf => match language` block) currently returns `vec![]` for every language. Reference: existing `VulnType::Deserialization => match language` block at vuln.rs:629-712 for per-language sink-pattern shape. Per-language sinks (starting points): Python (requests.get/post, urllib.request.urlopen, httpx.get), JS/TS (fetch, axios.get/post, http.get/request), Go (http.Get/Post/NewRequest+client.Do), Java (new URL().openConnection, HttpClient.send, URI.create), Rust (reqwest::get, reqwest::Client::new().get, ureq::get), Ruby (Net::HTTP.get, URI.open, RestClient.get), PHP (file_get_contents, curl_exec after CURLOPT_URL, fopen). Sink fires when URL/URI argument is taint-tracked from user input — existing taint engine handles this; worker integrates new sinks into existing flow. Reproduction: per-language fixtures at crates/tldr-cli/tests/fixtures/ssrf_<lang>/, each with a function taking user input as URL → calling the sink. Run `tldr vuln --format json`; assert `vuln_type` field equals the canonical SSRF Display string (read vuln.rs:60 — Display impl shows 'Server-Side Request Forgery'). Tests MUST RED on HEAD with empty findings. RED-REASON GATE: RED MUST show empty `findings` array OR specific assertion failure naming missing SSRF detection. Acceptance: at minimum 3 languages (Python + TypeScript/JavaScript + Go) shipping with working detection + fixtures. Remaining 4 languages either implemented OR documented as v0.2.3 follow-up in milestone report. STOP: more than 7 languages need fixtures (escalate); detection requires changes outside vuln.rs (escalate)."
     },
     {
