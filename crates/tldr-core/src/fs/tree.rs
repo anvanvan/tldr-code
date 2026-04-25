@@ -147,9 +147,12 @@ fn build_tree_children(
     gitignore: Option<&ignore::gitignore::Gitignore>,
 ) -> TldrResult<Vec<FileTree>> {
     let mut children = Vec::new();
-    let mut seen_inodes: HashSet<u64> = HashSet::new();
 
-    // Use WalkDir with follow_links disabled for M13 (symlink cycle detection)
+    // Use WalkDir with follow_links disabled for M13 (symlink cycle detection).
+    // Because follow_links is false, walkdir physically cannot traverse a
+    // symlink-induced cycle, so no in-walk inode tracking is required.
+    // Issue #15: a previous inode-tracking heuristic incorrectly flagged
+    // hardlinked files as cycles; that heuristic has been removed.
     // Note: We don't use filter_entry on the root, as filter_entry would skip
     // the entire directory if the root has a hidden name (like .tmp...)
     let walker = WalkDir::new(dir)
@@ -173,19 +176,6 @@ fn build_tree_children(
         }
 
         let name = entry.file_name().to_string_lossy().to_string();
-
-        // Check for symlink cycles using inode - M13 mitigation
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if let Ok(metadata) = entry.metadata() {
-                let inode = metadata.ino();
-                if seen_inodes.contains(&inode) {
-                    return Err(TldrError::SymlinkCycle(path.to_path_buf()));
-                }
-                seen_inodes.insert(inode);
-            }
-        }
 
         if entry.file_type().is_dir() {
             // Skip default skip directories
@@ -402,5 +392,45 @@ mod tests {
 
         assert!(!files.is_empty());
         assert!(files.iter().any(|f| f.ends_with("main.py")));
+    }
+
+    /// Regression test for issue #15 — tree builder must NOT report
+    /// SymlinkCycle when traversing a directory containing hardlinked files.
+    /// WalkDir is configured with follow_links(false), so no real symlink
+    /// cycle can occur; the previous inode-tracking heuristic incorrectly
+    /// flagged hardlinks as cycles.
+    #[test]
+    fn test_get_file_tree_hardlinks_no_symlink_cycle() {
+        let dir = TempDir::new().unwrap();
+        let original = dir.path().join("original.txt");
+        let hard = dir.path().join("hardlink.txt");
+
+        fs::write(&original, "shared content").unwrap();
+        fs::hard_link(&original, &hard).expect("hardlink creation failed");
+
+        // Sanity: both paths exist and reference the same inode on Unix.
+        assert!(original.exists());
+        assert!(hard.exists());
+
+        let result = get_file_tree(dir.path(), None, true, None);
+
+        // Pre-fix: returns Err(TldrError::SymlinkCycle(...)).
+        // Post-fix: returns Ok with both files listed.
+        assert!(
+            result.is_ok(),
+            "tree builder must not report SymlinkCycle on hardlinks; got: {:?}",
+            result.err()
+        );
+        let tree = result.unwrap();
+        let names: Vec<&str> = tree
+            .children
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"original.txt") && names.contains(&"hardlink.txt"),
+            "expected both hardlinked files in tree; got: {:?}",
+            names
+        );
     }
 }

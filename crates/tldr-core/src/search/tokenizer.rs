@@ -215,11 +215,15 @@ impl Tokenizer {
             // Start new token on:
             // 1. Transition from lower to upper (camelCase boundary)
             // 2. Transition from upper to upper+lower (HTTPRequest -> HTTP, Request)
+            //    — guarded by `current.len() > 1` so single-letter PascalCase
+            //    prefixes like `IService` / `XRequest` are NOT split at index 1
+            //    (issue #8); HTTPRequest still splits because at the boundary
+            //    `current` is "HTTP" with len 4.
             // 3. After underscore
             let should_split = !current.is_empty()
                 && (prev_was_underscore
                     || !prev_was_upper && is_upper
-                    || is_upper && next_is_lower);
+                    || (is_upper && next_is_lower && current.len() > 1));
 
             if should_split {
                 tokens.push(std::mem::take(&mut current));
@@ -315,5 +319,44 @@ mod tests {
         let tokenizer = Tokenizer::new();
         let parts = tokenizer.split_identifier("process_data");
         assert_eq!(parts, vec!["process", "data"]);
+    }
+
+    /// Regression test for issue #8 — single-letter PascalCase prefixes
+    /// (e.g. `IService`, `XRequest`) must NOT be split at the first
+    /// character. The pre-existing `is_upper && next_is_lower` rule
+    /// incorrectly produced `["I", "Service"]`, and tokenize() then
+    /// dropped `"I"` via the `min_length >= 2` filter, removing the
+    /// canonical `iservice` token entirely.
+    #[test]
+    fn test_tokenize_single_letter_pascal_prefix() {
+        let tokenizer = Tokenizer::new();
+        let upper_tokens = tokenizer.tokenize("IService");
+        let lower_tokens = tokenizer.tokenize("iservice");
+
+        assert!(
+            upper_tokens.contains(&"iservice".to_string()),
+            "tokenize(\"IService\") must yield canonical 'iservice' token; got: {:?}",
+            upper_tokens
+        );
+        assert!(
+            lower_tokens.contains(&"iservice".to_string()),
+            "tokenize(\"iservice\") must yield 'iservice' token; got: {:?}",
+            lower_tokens
+        );
+    }
+
+    /// Regression test for issue #8 — guard must preserve the existing
+    /// HTTPRequest-style boundary (multi-letter uppercase run followed by
+    /// upper+lower transition). Splits at the LAST uppercase letter.
+    #[test]
+    fn test_tokenize_http_abbreviation_still_splits() {
+        let tokenizer = Tokenizer::new();
+        let tokens = tokenizer.tokenize("HTTPRequest");
+        assert!(
+            tokens.contains(&"http".to_string())
+                && tokens.contains(&"request".to_string()),
+            "HTTPRequest must still split into ['http','request']; got: {:?}",
+            tokens
+        );
     }
 }

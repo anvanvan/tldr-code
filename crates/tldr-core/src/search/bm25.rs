@@ -426,4 +426,28 @@ mod tests {
         let results = index.search("nonexistent", 10);
         assert!(results.is_empty());
     }
+
+    /// Regression test for issue #8 — BM25 search must match a
+    /// single-letter PascalCase prefix identifier (`IService`) regardless
+    /// of the query's case. Pre-fix the tokenizer split `IService` into
+    /// `["I", "Service"]` then dropped `"I"` (min_length=2), so the
+    /// canonical `iservice` token was never indexed and the query found
+    /// zero matches.
+    #[test]
+    fn test_bm25_single_letter_pascal_prefix_match() {
+        let mut index = Bm25Index::new(1.5, 0.75);
+        index.add_document("file1", "interface IService { method(): void; }");
+
+        let lower_results = index.search("iservice", 10);
+        assert!(
+            !lower_results.is_empty(),
+            "BM25 search for 'iservice' against IService-containing fixture must return >= 1 result; got 0 results"
+        );
+
+        let upper_results = index.search("IService", 10);
+        assert!(
+            !upper_results.is_empty(),
+            "BM25 search for 'IService' against IService-containing fixture must return >= 1 result; got 0 results"
+        );
+    }
 }
