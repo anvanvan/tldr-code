@@ -77,7 +77,7 @@ pub fn construct_minimal_ssa_with_statements(
     let line_to_block = build_line_to_block_map(cfg);
 
     // Phase 1: Collect variable definitions and place phi functions
-    let var_defs = collect_variable_definitions(dfg, &line_to_block);
+    let var_defs = collect_variable_definitions(cfg, dfg, &line_to_block);
     let phi_placements = place_phi_functions(&var_defs, &dom_frontier);
 
     // Phase 2: Build initial SSA blocks structure
@@ -90,6 +90,7 @@ pub fn construct_minimal_ssa_with_statements(
         dom_tree: &dom_tree,
         line_to_block: &line_to_block,
         statements,
+        entry_block: cfg.entry_block,
     };
     rename_variables_recursive(
         cfg.entry_block,
@@ -150,7 +151,7 @@ pub fn construct_semi_pruned_ssa_with_statements(
     let line_to_block = build_line_to_block_map(cfg);
 
     // Phase 1: Collect variable definitions, filtering out block-local variables
-    let var_defs = collect_variable_definitions(dfg, &line_to_block);
+    let var_defs = collect_variable_definitions(cfg, dfg, &line_to_block);
     let non_local_vars = filter_non_local_variables(dfg, &line_to_block);
 
     // Only place phi for non-local variables
@@ -171,6 +172,7 @@ pub fn construct_semi_pruned_ssa_with_statements(
         dom_tree: &dom_tree,
         line_to_block: &line_to_block,
         statements,
+        entry_block: cfg.entry_block,
     };
     rename_variables_recursive(
         cfg.entry_block,
@@ -236,7 +238,7 @@ pub fn construct_pruned_ssa_with_statements(
     let line_to_block = build_line_to_block_map(cfg);
 
     // Phase 1: Collect variable definitions
-    let var_defs = collect_variable_definitions(dfg, &line_to_block);
+    let var_defs = collect_variable_definitions(cfg, dfg, &line_to_block);
 
     // Place phi functions, but only where variable is live
     let phi_placements = place_phi_functions_pruned(&var_defs, &dom_frontier, live_vars);
@@ -251,6 +253,7 @@ pub fn construct_pruned_ssa_with_statements(
         dom_tree: &dom_tree,
         line_to_block: &line_to_block,
         statements,
+        entry_block: cfg.entry_block,
     };
     rename_variables_recursive(
         cfg.entry_block,
@@ -381,8 +384,16 @@ fn resolve_uses_on_line(
 // Helper Functions: Variable Definition Collection
 // =============================================================================
 
-/// Collect all variable definitions from DFG, grouped by variable name
+/// Collect all variable definitions from DFG, grouped by variable name.
+///
+/// Definitions whose source line falls outside every CFG block (e.g.
+/// function parameters declared on the signature line) are "orphaned" —
+/// they would otherwise be silently dropped. Mirroring the recovery
+/// pattern in `crates/tldr-core/src/dfg/reaching.rs:131-134`, such
+/// orphaned definitions fall back to the CFG entry block so they still
+/// participate in phi placement and renaming. (Fixes parcadei/tldr-code#6.)
 fn collect_variable_definitions(
+    cfg: &CfgInfo,
     dfg: &DfgInfo,
     line_to_block: &HashMap<u32, usize>,
 ) -> HashMap<String, HashSet<usize>> {
@@ -391,12 +402,12 @@ fn collect_variable_definitions(
     for var_ref in &dfg.refs {
         // Both Definition and Update create new versions
         if matches!(var_ref.ref_type, RefType::Definition | RefType::Update) {
-            if let Some(block_id) = get_block_for_line(var_ref.line, line_to_block) {
-                var_defs
-                    .entry(var_ref.name.clone())
-                    .or_default()
-                    .insert(block_id);
-            }
+            let block_id = get_block_for_line(var_ref.line, line_to_block)
+                .unwrap_or(cfg.entry_block);
+            var_defs
+                .entry(var_ref.name.clone())
+                .or_default()
+                .insert(block_id);
         }
     }
 
@@ -650,6 +661,10 @@ struct SsaRenamingContext<'a> {
     dom_tree: &'a DominatorTree,
     line_to_block: &'a HashMap<u32, usize>,
     statements: &'a [String],
+    /// CFG entry block id — used as the home block for orphaned
+    /// definitions (function parameters declared on the signature
+    /// line). See `collect_variable_definitions` and #6.
+    entry_block: usize,
 }
 
 /// Rename variables using dominator tree traversal (recursive)
@@ -690,12 +705,27 @@ fn rename_variables_recursive(
         ssa_blocks[ssa_block_idx].phi_functions[idx].target = new_id;
     }
 
-    // Step 2: Process instructions from DFG refs in this block
+    // Step 2: Process instructions from DFG refs in this block.
+    //
+    // Orphaned definitions (e.g. function parameters declared on the
+    // signature line) fall outside every CFG block — their `line` does
+    // not map to any `block_id`. Per the recovery pattern in
+    // `crates/tldr-core/src/dfg/reaching.rs:131-134`, we attribute them
+    // to the CFG entry block so they receive SSA names and participate
+    // in renaming. (Fixes parcadei/tldr-code#6.)
     let refs_in_block: Vec<&VarRef> = context
         .dfg
         .refs
         .iter()
-        .filter(|r| get_block_for_line(r.line, context.line_to_block) == Some(block_id))
+        .filter(|r| {
+            let mapped = get_block_for_line(r.line, context.line_to_block);
+            match mapped {
+                Some(b) => b == block_id,
+                // Orphaned definitions / updates → entry block
+                None => block_id == context.entry_block
+                    && matches!(r.ref_type, RefType::Definition | RefType::Update),
+            }
+        })
         .collect();
 
     // Sort by line for correct processing order
@@ -834,12 +864,19 @@ fn fill_phi_sources(_cfg: &CfgInfo, ssa_blocks: &mut [SsaBlock], state: &Renamin
                     .get(&(phi.variable.clone(), pred_id))
                     .copied();
 
-                if let Some(version) = source_version {
-                    phi.sources.push(PhiSource {
-                        block: pred_id,
-                        name: version,
-                    });
-                }
+                // Always emit one PhiSource per predecessor — invariant required
+                // by downstream consumers (def-use chains, alias propagation,
+                // pretty-printers). When the variable was not defined on this
+                // predecessor's exit (e.g. a parameter joining the loop on the
+                // back-edge before any loop-body re-definition), use the
+                // reserved `SsaNameId(0)` undefined marker — see
+                // `RenamingState::new` ("0 reserved for undefined").
+                // Fixes parcadei/tldr-code#6 (phi operand count mismatch).
+                let name = source_version.unwrap_or(SsaNameId(0));
+                phi.sources.push(PhiSource {
+                    block: pred_id,
+                    name,
+                });
             }
         }
     }

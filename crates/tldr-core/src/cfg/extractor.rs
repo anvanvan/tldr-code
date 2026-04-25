@@ -185,7 +185,16 @@ struct CfgBuilder<'a> {
     edges: Vec<CfgEdge>,
     nested_functions: HashMap<String, CfgInfo>,
     current_block_id: usize,
+    /// Function-exit blocks (e.g. return, end-of-function). Reaching one of
+    /// these terminates the function's control flow.
     exit_blocks: Vec<usize>,
+    /// Loop-exit blocks created by `process_break_statement`. Reaching one
+    /// of these terminates the *loop body's* control flow but NOT the
+    /// function. They are tracked separately from `exit_blocks` so that
+    /// `break` statements do not pollute the function's reported exits, but
+    /// are still recognised by back-edge / fallthrough guards as terminating
+    /// the local control path. (Fixes parcadei/tldr-code#18.)
+    loop_exit_blocks: Vec<usize>,
 }
 
 impl<'a> CfgBuilder<'a> {
@@ -207,6 +216,7 @@ impl<'a> CfgBuilder<'a> {
             nested_functions: HashMap::new(),
             current_block_id: 0,
             exit_blocks: Vec::new(),
+            loop_exit_blocks: Vec::new(),
         }
     }
 
@@ -408,7 +418,8 @@ impl<'a> CfgBuilder<'a> {
             self.process_block(then_node, depth + 1)?;
 
             // Connect to join (unless we returned)
-            if !self.exit_blocks.contains(&self.current_block_id) {
+            if !self.exit_blocks.contains(&self.current_block_id)
+                && !self.loop_exit_blocks.contains(&self.current_block_id) {
                 self.add_edge(
                     self.current_block_id,
                     join_block,
@@ -431,7 +442,8 @@ impl<'a> CfgBuilder<'a> {
             // Handle elif by processing as nested if
             self.process_block(else_node, depth + 1)?;
 
-            if !self.exit_blocks.contains(&self.current_block_id) {
+            if !self.exit_blocks.contains(&self.current_block_id)
+                && !self.loop_exit_blocks.contains(&self.current_block_id) {
                 self.add_edge(
                     self.current_block_id,
                     join_block,
@@ -486,7 +498,8 @@ impl<'a> CfgBuilder<'a> {
             self.process_block(body_node, depth + 1)?;
 
             // Back edge to header
-            if !self.exit_blocks.contains(&self.current_block_id) {
+            if !self.exit_blocks.contains(&self.current_block_id)
+                && !self.loop_exit_blocks.contains(&self.current_block_id) {
                 self.add_edge(
                     self.current_block_id,
                     header_block,
@@ -545,7 +558,8 @@ impl<'a> CfgBuilder<'a> {
             self.process_block(body_node, depth + 1)?;
 
             // Back edge
-            if !self.exit_blocks.contains(&self.current_block_id) {
+            if !self.exit_blocks.contains(&self.current_block_id)
+                && !self.loop_exit_blocks.contains(&self.current_block_id) {
                 self.add_edge(
                     self.current_block_id,
                     header_block,
@@ -593,7 +607,8 @@ impl<'a> CfgBuilder<'a> {
             self.process_block(body_node, depth + 1)?;
 
             // Back edge to header
-            if !self.exit_blocks.contains(&self.current_block_id) {
+            if !self.exit_blocks.contains(&self.current_block_id)
+                && !self.loop_exit_blocks.contains(&self.current_block_id) {
                 self.add_edge(
                     self.current_block_id,
                     header_block,
@@ -712,7 +727,8 @@ impl<'a> CfgBuilder<'a> {
             // OCaml-style: try <expression> with <match_case>...
             self.current_block_id = try_block;
             self.process_statement(expr_body, depth + 1)?;
-            if !self.exit_blocks.contains(&self.current_block_id) {
+            if !self.exit_blocks.contains(&self.current_block_id)
+                && !self.loop_exit_blocks.contains(&self.current_block_id) {
                 self.add_edge(
                     self.current_block_id,
                     exit_block,
@@ -742,7 +758,8 @@ impl<'a> CfgBuilder<'a> {
                         self.current_block_id = except_block;
                         self.process_block(child, depth + 1)?;
 
-                        if !self.exit_blocks.contains(&self.current_block_id) {
+                        if !self.exit_blocks.contains(&self.current_block_id)
+                && !self.loop_exit_blocks.contains(&self.current_block_id) {
                             self.add_edge(
                                 self.current_block_id,
                                 exit_block,
@@ -767,7 +784,8 @@ impl<'a> CfgBuilder<'a> {
                             // Try block body
                             self.current_block_id = try_block;
                             self.process_block(child, depth + 1)?;
-                            if !self.exit_blocks.contains(&self.current_block_id) {
+                            if !self.exit_blocks.contains(&self.current_block_id)
+                && !self.loop_exit_blocks.contains(&self.current_block_id) {
                                 self.add_edge(
                                     self.current_block_id,
                                     exit_block,
@@ -793,7 +811,8 @@ impl<'a> CfgBuilder<'a> {
                             self.current_block_id = except_block;
                             self.process_block(child, depth + 1)?;
 
-                            if !self.exit_blocks.contains(&self.current_block_id) {
+                            if !self.exit_blocks.contains(&self.current_block_id)
+                && !self.loop_exit_blocks.contains(&self.current_block_id) {
                                 self.add_edge(
                                     self.current_block_id,
                                     exit_block,
@@ -817,7 +836,8 @@ impl<'a> CfgBuilder<'a> {
                             // Update exit block to be after finally
                             let new_exit =
                                 self.new_block(BlockType::Body, finally_end, finally_end);
-                            if !self.exit_blocks.contains(&self.current_block_id) {
+                            if !self.exit_blocks.contains(&self.current_block_id)
+                && !self.loop_exit_blocks.contains(&self.current_block_id) {
                                 self.add_edge(
                                     self.current_block_id,
                                     new_exit,
@@ -897,7 +917,8 @@ impl<'a> CfgBuilder<'a> {
                     self.current_block_id = case_block;
                     self.process_block(child, depth + 1)?;
 
-                    if !self.exit_blocks.contains(&self.current_block_id) {
+                    if !self.exit_blocks.contains(&self.current_block_id)
+                && !self.loop_exit_blocks.contains(&self.current_block_id) {
                         self.add_edge(
                             self.current_block_id,
                             join_block,
@@ -962,6 +983,11 @@ impl<'a> CfgBuilder<'a> {
         let break_block = self.new_block(BlockType::Body, start_line, end_line);
 
         self.add_edge(self.current_block_id, break_block, EdgeType::Break, None);
+
+        // Track the break block as a loop-exit so that subsequent
+        // back-edge / fallthrough guards do not synthesise spurious edges
+        // out of it. See `loop_exit_blocks` field doc and #18.
+        self.loop_exit_blocks.push(break_block);
 
         self.current_block_id = break_block;
         Ok(())
