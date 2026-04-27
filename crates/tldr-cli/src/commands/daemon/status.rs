@@ -10,13 +10,14 @@
 //! - Session statistics (if requested)
 //! - Hook activity statistics
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use serde::Serialize;
 
 use crate::output::OutputFormat;
 
+use super::daemon_active::read_active;
 use super::error::DaemonError;
 use super::ipc::send_command;
 use super::types::{DaemonCommand, DaemonResponse, DaemonStatus, SalsaCacheStats};
@@ -28,7 +29,11 @@ use super::types::{DaemonCommand, DaemonResponse, DaemonStatus, SalsaCacheStats}
 /// Arguments for the `daemon status` command.
 #[derive(Debug, Clone, Args)]
 pub struct DaemonStatusArgs {
-    /// Project root directory (default: current directory)
+    /// Project root directory (default: current directory).
+    ///
+    /// When omitted, falls back to the active daemon's project path
+    /// recorded by `daemon start`, allowing `tldr daemon status` to
+    /// report the running daemon's status from any working directory.
     #[arg(long, short = 'p', default_value = ".")]
     pub project: PathBuf,
 
@@ -80,12 +85,35 @@ impl DaemonStatusArgs {
 
     /// Async implementation of the daemon status command.
     async fn run_async(&self, format: OutputFormat, quiet: bool) -> anyhow::Result<()> {
-        // Resolve project path to absolute
-        let project = self.project.canonicalize().unwrap_or_else(|_| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(&self.project)
-        });
+        // VAL-013 (issue #20): when `--project` is the default (the literal
+        // ".", meaning the user did not pass an explicit path), prefer the
+        // active-daemon discovery record. This lets `daemon status` from any
+        // cwd find the running daemon by its recorded project path rather
+        // than mis-hashing the caller's cwd.
+        //
+        // If a record exists AND its PID is alive (validated by
+        // `read_active` via `kill(pid, 0)`), use the recorded project. If
+        // no record exists, fall back to the previous behaviour (canonicalize
+        // `--project`, which defaults to the cwd).
+        //
+        // An explicit `--project` passed by the user (anything other than
+        // `"."`) is ALWAYS honoured — the workaround path is preserved.
+        let project = if self.project == Path::new(".") {
+            match read_active() {
+                Some(active) => active.project,
+                None => self.project.canonicalize().unwrap_or_else(|_| {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join(&self.project)
+                }),
+            }
+        } else {
+            self.project.canonicalize().unwrap_or_else(|_| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(&self.project)
+            })
+        };
 
         // Send status command
         let cmd = DaemonCommand::Status {

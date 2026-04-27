@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::output::OutputFormat;
 
+use super::daemon_active::remove_active;
 use super::error::DaemonError;
 use super::ipc::{check_socket_alive, cleanup_socket, send_command};
 use super::pid::{cleanup_stale_pid, compute_pid_path};
@@ -86,10 +87,11 @@ impl DaemonStopArgs {
                 }
             }
 
-            // Clean up any stale files
+            // Clean up any stale files (incl. VAL-013 active-daemon record).
             let pid_path = compute_pid_path(&project);
             let _ = cleanup_stale_pid(&pid_path);
             let _ = cleanup_socket(&project);
+            let _ = remove_active();
 
             return Ok(());
         }
@@ -109,10 +111,11 @@ impl DaemonStopArgs {
                     retries += 1;
                 }
 
-                // Clean up files
+                // Clean up files (incl. VAL-013 active-daemon record).
                 let _ = cleanup_socket(&project);
                 let pid_path = compute_pid_path(&project);
                 let _ = cleanup_stale_pid(&pid_path);
+                let _ = remove_active();
 
                 let output = DaemonStopOutput {
                     status: "ok".to_string(),
@@ -150,10 +153,11 @@ impl DaemonStopArgs {
                     }
                 }
 
-                // Clean up any stale files
+                // Clean up any stale files (incl. VAL-013 active-daemon record).
                 let _ = cleanup_socket(&project);
                 let pid_path = compute_pid_path(&project);
                 let _ = cleanup_stale_pid(&pid_path);
+                let _ = remove_active();
 
                 Ok(())
             }

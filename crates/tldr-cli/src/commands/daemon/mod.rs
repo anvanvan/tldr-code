@@ -47,6 +47,7 @@
 
 pub mod cache_clear;
 pub mod cache_stats;
+pub mod daemon_active;
 #[path = "daemon.rs"]
 pub mod daemon_impl;
 pub mod error;
