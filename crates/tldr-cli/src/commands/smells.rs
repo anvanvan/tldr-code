@@ -13,7 +13,7 @@ use tldr_core::{
     SmellType, SmellsReport, SmellsWalkerOpts, ThresholdPreset,
 };
 
-use crate::commands::daemon_router::{params_with_path, try_daemon_route};
+use crate::commands::daemon_router::{params_for_smells, try_daemon_route};
 use crate::output::{format_smells_text, OutputFormat, OutputWriter};
 
 /// Detect code smells
@@ -48,6 +48,19 @@ pub struct SmellsArgs {
     /// Walk vendored/build dirs (node_modules, target, dist, etc.) that would normally be skipped.
     #[arg(long)]
     pub no_default_ignore: bool,
+
+    /// Limit the scan to specific files (repeatable; EXACT-PATH-ONLY, no glob expansion).
+    /// Each entry is validated via `validate_file_path` (rejects path traversal /
+    /// non-existent files). When set, the path argument becomes a project-root
+    /// anchor for output ordering only and the walker is bypassed. Implies
+    /// `--include-tests` (caller picked the list).
+    #[arg(long)]
+    pub files: Vec<PathBuf>,
+
+    /// Include findings from test files. Default: test-file findings are excluded
+    /// (PR-review default). Implicit `true` when `--files` is non-empty.
+    #[arg(long)]
+    pub include_tests: bool,
 }
 
 /// CLI wrapper for threshold preset
@@ -143,11 +156,45 @@ impl SmellsArgs {
     pub fn run(&self, format: OutputFormat, quiet: bool) -> Result<()> {
         let writer = OutputWriter::new(format, quiet);
 
+        // v0.2.3 (#1.D): when `--files` is non-empty, the caller explicitly named
+        // each path. Trust them and force `include_tests=true` so user-listed
+        // test files are not silently filtered.
+        let include_tests = self.include_tests || !self.files.is_empty();
+
+        // v0.2.3 (#1.D): each `--files` entry MUST go through the CORE
+        // validator (`tldr_core::validation::validate_file_path`) — same one
+        // the daemon uses. We pass the smells `path` argument as the project
+        // root so path-traversal attempts (`/etc/passwd`, `../../etc/...`)
+        // produce a hard error rather than a silent skip. Failures bubble up
+        // as a CLI error (non-zero exit), NOT a silent skip.
+        let project_root = if self.path.is_dir() {
+            // Try to canonicalize the path (so traversal checks work). Fall
+            // back to the literal path on canonicalize error (e.g. tmpdir
+            // shenanigans on macOS where /var -> /private/var).
+            dunce::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone())
+        } else {
+            // For file paths, use the parent dir (or "." if none).
+            self.path
+                .parent()
+                .map(|p| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."))
+        };
+        let mut validated_files: Vec<PathBuf> = Vec::with_capacity(self.files.len());
+        for f in &self.files {
+            let f_str = f.to_str().ok_or_else(|| {
+                anyhow::anyhow!("--files entry contains non-UTF8 bytes: {:?}", f)
+            })?;
+            let canonical =
+                tldr_core::validation::validate_file_path(f_str, Some(&project_root))
+                    .map_err(|e| anyhow::anyhow!("--files {}: {}", f.display(), e))?;
+            validated_files.push(canonical);
+        }
+
         // Try daemon first for cached result
         if let Some(report) = try_daemon_route::<SmellsReport>(
             &self.path,
             "smells",
-            params_with_path(Some(&self.path)),
+            params_for_smells(Some(&self.path), &validated_files, include_tests),
         ) {
             // Output based on format
             if writer.is_text() {
@@ -171,6 +218,8 @@ impl SmellsArgs {
         let walker_opts = SmellsWalkerOpts {
             no_default_ignore: self.no_default_ignore,
             lang: self.lang,
+            files: validated_files,
+            include_tests,
         };
         let report = if self.deep {
             analyze_smells_aggregated_with_walker_opts(

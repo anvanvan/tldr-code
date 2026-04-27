@@ -270,6 +270,12 @@ pub struct SmellsReport {
     pub by_file: HashMap<PathBuf, Vec<SmellFinding>>,
     /// Summary statistics
     pub summary: SmellsSummary,
+    /// Number of smells excluded because their source file matched a test-file
+    /// convention (only populated when `walker_opts.include_tests == false`).
+    /// Added in v0.2.3 (#1.D); `#[serde(default)]` keeps old daemon JSON
+    /// payloads backward-compatible.
+    #[serde(default)]
+    pub excluded_test_smells: usize,
 }
 
 /// Summary statistics for smell detection
@@ -289,7 +295,7 @@ pub struct SmellsSummary {
 /// files are discovered. The defaults match the shared
 /// [`crate::walker::ProjectWalker`] behavior: skip `node_modules`,
 /// `target`, hidden dirs, and honor `.gitignore`.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct SmellsWalkerOpts {
     /// If `true`, walk vendored/build directories (e.g. `node_modules`,
     /// `target`) that are normally skipped by default.
@@ -297,6 +303,14 @@ pub struct SmellsWalkerOpts {
     /// If `Some(lang)`, only scan files matching that language; if
     /// `None`, scan every supported language (historical behavior).
     pub lang: Option<Language>,
+    /// Caller-supplied file list. When non-empty, the walker is bypassed and
+    /// only these paths are analyzed (filtered to supported languages).
+    /// Added in v0.2.3 (#1.D) to support PR-focused scoping.
+    pub files: Vec<PathBuf>,
+    /// Include findings from test files. Default `false` (PR-review default).
+    /// Implicit `true` when `files` is non-empty (caller picked the list).
+    /// Added in v0.2.3 (#1.D).
+    pub include_tests: bool,
 }
 
 // =============================================================================
@@ -360,8 +374,30 @@ pub fn detect_smells_with_walker_opts(
     // Max file size to analyze (500KB) - skip minified/generated files
     const MAX_FILE_SIZE: u64 = 500 * 1024;
 
-    // Collect files to scan
-    let files: Vec<PathBuf> = if path.is_file() {
+    // Collect files to scan.
+    //
+    // v0.2.3 (#1.D): when `walker_opts.files` is non-empty, bypass the walker
+    // entirely and use the explicit list (subject to language + size filters).
+    let files: Vec<PathBuf> = if !walker_opts.files.is_empty() {
+        let lang_filter = walker_opts.lang;
+        walker_opts
+            .files
+            .iter()
+            .filter(|p| p.is_file())
+            .filter(|p| Language::from_path(p).is_some())
+            .filter(|p| match (Language::from_path(p), lang_filter) {
+                (Some(detected), Some(requested)) => detected == requested,
+                (Some(_), None) => true,
+                _ => false,
+            })
+            .filter(|p| {
+                p.metadata()
+                    .map(|m| m.len() <= MAX_FILE_SIZE)
+                    .unwrap_or(true)
+            })
+            .map(|p| p.to_path_buf())
+            .collect()
+    } else if path.is_file() {
         vec![path.to_path_buf()]
     } else {
         let mut walker = crate::walker::ProjectWalker::new(path);
@@ -393,7 +429,27 @@ pub fn detect_smells_with_walker_opts(
         .collect();
 
     let files_scanned = file_results.len();
-    let smells: Vec<SmellFinding> = file_results.into_iter().flatten().collect();
+    let raw_smells: Vec<SmellFinding> = file_results.into_iter().flatten().collect();
+
+    // v0.2.3 (#1.D): partition test-file findings out by default.
+    // `--include-tests` (or non-empty `files` list) opts back in to repo-wide
+    // behavior. Reuses the existing public helper at full path
+    // `crate::analysis::clones::is_test_file` (NOT re-exported through
+    // `analysis::mod.rs`).
+    let (excluded_test_smells, smells): (usize, Vec<SmellFinding>) = if walker_opts.include_tests {
+        (0, raw_smells)
+    } else {
+        let mut excluded = 0usize;
+        let mut kept: Vec<SmellFinding> = Vec::with_capacity(raw_smells.len());
+        for s in raw_smells {
+            if crate::analysis::clones::is_test_file(&s.file) {
+                excluded += 1;
+            } else {
+                kept.push(s);
+            }
+        }
+        (excluded, kept)
+    };
 
     // Group by file
     let mut by_file: HashMap<PathBuf, Vec<SmellFinding>> = HashMap::new();
@@ -425,6 +481,7 @@ pub fn detect_smells_with_walker_opts(
         files_scanned,
         by_file,
         summary,
+        excluded_test_smells,
     })
 }
 
@@ -2489,13 +2546,22 @@ pub fn analyze_smells_aggregated_with_walker_opts(
 ) -> TldrResult<SmellsReport> {
     let mut all_smells: Vec<SmellFinding> = Vec::new();
     let mut files_scanned: usize = 0;
+    // v0.2.3 (#1.D): track findings excluded by the test-file filter so the
+    // aggregated path mirrors the base path's `excluded_test_smells` counter.
+    let mut excluded_test_smells: usize = 0;
+    let include_tests = walker_opts.include_tests;
 
     if should_run_original_detectors(smell_type) {
-        if let Ok(base_report) =
-            detect_smells_with_walker_opts(path, threshold, smell_type, suggest, walker_opts)
-        {
+        if let Ok(base_report) = detect_smells_with_walker_opts(
+            path,
+            threshold,
+            smell_type,
+            suggest,
+            walker_opts.clone(),
+        ) {
             files_scanned = base_report.files_scanned;
             all_smells.extend(base_report.smells);
+            excluded_test_smells += base_report.excluded_test_smells;
         }
     }
 
@@ -2582,6 +2648,16 @@ pub fn analyze_smells_aggregated_with_walker_opts(
         );
     }
 
+    // v0.2.3 (#1.D): apply the test-file filter to the smells contributed by
+    // the deep sub-analyzers (cohesion, coupling, dead, clone, etc.). The base
+    // detector path was already filtered inside `detect_smells_with_walker_opts`
+    // and its excluded count is already accumulated above.
+    if !include_tests {
+        let pre = all_smells.len();
+        all_smells.retain(|s| !crate::analysis::clones::is_test_file(&s.file));
+        excluded_test_smells += pre - all_smells.len();
+    }
+
     sort_smells(&mut all_smells);
     let by_file = build_smells_by_file(&all_smells);
 
@@ -2596,6 +2672,7 @@ pub fn analyze_smells_aggregated_with_walker_opts(
         files_scanned,
         by_file,
         summary,
+        excluded_test_smells,
     })
 }
 

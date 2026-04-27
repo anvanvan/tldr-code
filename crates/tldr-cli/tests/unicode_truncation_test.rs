@@ -116,6 +116,7 @@ fn cli_smells_text_does_not_panic_on_cjk_smell_name() {
             by_type: HashMap::new(),
             avg_smells_per_file: 1.0,
         },
+        excluded_test_smells: 0,
     };
 
     let out = format_smells_text(&report);

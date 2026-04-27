@@ -333,6 +333,8 @@ async fn smells_handler_rejects_absolute_path_outside_project() {
         threshold: None,
         smell_type: None,
         suggest: false,
+        files: None,
+        include_tests: None,
     };
 
     let result = smells(State(state), Json(request)).await;

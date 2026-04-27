@@ -236,6 +236,31 @@ pub fn params_with_path_lang(path: &Path, lang: Option<&str>) -> serde_json::Val
     serde_json::Value::Object(obj)
 }
 
+/// Build JSON params for the `smells` command.
+///
+/// v0.2.3 (#1.D): the smells command supports a repeatable `--files` flag and
+/// an `--include-tests` flag. Both are forwarded to the daemon handler so the
+/// daemon can produce identical output to direct-compute mode. `files` is only
+/// emitted when non-empty so the daemon can detect "default" vs "scoped" mode.
+pub fn params_for_smells(
+    path: Option<&Path>,
+    files: &[PathBuf],
+    include_tests: bool,
+) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(p) = path {
+        obj.insert("path".to_string(), serde_json::json!(p));
+    }
+    if !files.is_empty() {
+        obj.insert("files".to_string(), serde_json::json!(files));
+    }
+    obj.insert(
+        "include_tests".to_string(),
+        serde_json::Value::Bool(include_tests),
+    );
+    serde_json::Value::Object(obj)
+}
+
 /// Build JSON params for dead code analysis.
 pub fn params_for_dead(path: Option<&Path>, entry: Option<&[String]>) -> serde_json::Value {
     let mut obj = serde_json::Map::new();

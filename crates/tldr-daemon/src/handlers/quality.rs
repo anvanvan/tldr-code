@@ -3,6 +3,7 @@
 //! These handlers provide code quality analysis including code smell detection
 //! and maintainability index calculation.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{extract::State, Json};
@@ -12,8 +13,8 @@ use crate::server::{DaemonResponse, HandlerError};
 use crate::state::DaemonState;
 
 use tldr_core::{
-    detect_smells, maintainability_index, validate_file_path, Language, MaintainabilityReport,
-    SmellType, SmellsReport, ThresholdPreset,
+    detect_smells_with_walker_opts, maintainability_index, validate_file_path, Language,
+    MaintainabilityReport, SmellType, SmellsReport, SmellsWalkerOpts, ThresholdPreset,
 };
 
 // =============================================================================
@@ -31,6 +32,12 @@ pub struct SmellsRequest {
     pub smell_type: Option<String>,
     #[serde(default)]
     pub suggest: bool,
+    /// v0.2.3 (#1.D): caller-supplied file list (empty = walk).
+    #[serde(default)]
+    pub files: Option<Vec<PathBuf>>,
+    /// v0.2.3 (#1.D): include test-pattern findings.
+    #[serde(default)]
+    pub include_tests: Option<bool>,
 }
 
 /// Smells handler - detects code smells
@@ -75,19 +82,32 @@ pub async fn smells(
 
     let suggest = request.suggest;
 
+    // v0.2.3 (#1.D): build walker opts so the daemon honors --files and
+    // --include-tests just like the CLI direct-compute path. Default
+    // include_tests=false matches the new CLI default; the CLI sets it true
+    // when --files is non-empty before sending, but we OR in `files.is_some()`
+    // here as a safety net.
+    let request_files = request.files.unwrap_or_default();
+    let include_tests = request.include_tests.unwrap_or(false) || !request_files.is_empty();
+    let walker_opts = SmellsWalkerOpts {
+        no_default_ignore: false,
+        lang: None,
+        files: request_files,
+        include_tests,
+    };
+
     // Run in blocking context (M10)
-    let result =
-        tokio::task::spawn_blocking(move || detect_smells(&path, threshold, smell_type, suggest))
-            .await
-            .map_err(|e| {
-                HandlerError(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Task join error: {}", e),
-                )
-            })?
-            .map_err(|e| {
-                HandlerError(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            })?;
+    let result = tokio::task::spawn_blocking(move || {
+        detect_smells_with_walker_opts(&path, threshold, smell_type, suggest, walker_opts)
+    })
+    .await
+    .map_err(|e| {
+        HandlerError(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Task join error: {}", e),
+        )
+    })?
+    .map_err(|e| HandlerError(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(DaemonResponse::ok(result)))
 }

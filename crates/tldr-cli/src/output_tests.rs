@@ -1157,6 +1157,7 @@ fn make_smells_report(smells: Vec<SmellFinding>) -> SmellsReport {
             by_type,
             avg_smells_per_file: avg,
         },
+        excluded_test_smells: 0,
     }
 }
 
