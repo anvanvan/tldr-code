@@ -392,6 +392,11 @@ pub fn validate_cfg(cfg: &CfgInfo) -> Result<(), TldrError> {
 ///
 /// Each language has its own set of source, sink, and sanitizer patterns.
 /// Currently only Python patterns are defined; other languages fall back to Python.
+///
+/// `Clone` is derived so multiple framework-specific banks can be merged into
+/// a single unified bank via [`merge_patterns`] (see TypeScript: Express +
+/// Next.js + Fastify + NestJS).
+#[derive(Clone)]
 pub struct LanguagePatterns {
     /// Regex patterns that identify taint sources and their source type.
     pub sources: Vec<(Regex, TaintSourceType)>,
@@ -399,6 +404,28 @@ pub struct LanguagePatterns {
     pub sinks: Vec<(Regex, TaintSinkType)>,
     /// Regex patterns that identify sanitizer calls and their sanitizer type.
     pub sanitizers: Vec<(Regex, SanitizerType)>,
+}
+
+/// Concatenate multiple `LanguagePatterns` banks into a single one.
+///
+/// Used to compose framework-specific TypeScript pattern banks (Express,
+/// Next.js, Fastify, NestJS) into the unified `TYPESCRIPT_PATTERNS` exposed
+/// to [`get_patterns`]. Adding a new framework: define a `<NAME>_PATTERNS`
+/// `lazy_static!` and append `&<NAME>_PATTERNS` to the slice passed here.
+fn merge_patterns(banks: &[&LanguagePatterns]) -> LanguagePatterns {
+    let mut sources = Vec::new();
+    let mut sinks = Vec::new();
+    let mut sanitizers = Vec::new();
+    for b in banks {
+        sources.extend(b.sources.iter().cloned());
+        sinks.extend(b.sinks.iter().cloned());
+        sanitizers.extend(b.sanitizers.iter().cloned());
+    }
+    LanguagePatterns {
+        sources,
+        sinks,
+        sanitizers,
+    }
 }
 
 lazy_static! {
@@ -446,8 +473,12 @@ lazy_static! {
 }
 
 lazy_static! {
-    /// TypeScript/JavaScript taint patterns.
-    static ref TYPESCRIPT_PATTERNS: LanguagePatterns = LanguagePatterns {
+    /// Express.js taint patterns (sub-bank of the unified TS pattern set).
+    ///
+    /// Matches the historical Express handler shape: `req.body`, `req.params`,
+    /// `req.query`, `req.cookies`, `req.headers`. Sinks are universal JS
+    /// (eval, child_process, innerHTML, document.write, .query/.execute).
+    static ref TYPESCRIPT_EXPRESS_PATTERNS: LanguagePatterns = LanguagePatterns {
         sources: vec![
             // HttpBody: req.body
             (Regex::new(r"req\.body").unwrap(), TaintSourceType::HttpBody),
@@ -485,6 +516,134 @@ lazy_static! {
             (Regex::new(r"(encodeURIComponent|DOMPurify\.sanitize)\s*\(").unwrap(), SanitizerType::Html),
         ],
     };
+}
+
+lazy_static! {
+    /// Next.js (App Router + Pages Router) taint patterns.
+    ///
+    /// Sources: `request.json()`, `request.formData()`, `request.text()`,
+    /// `request.body` (Pages Router API routes), `request.headers`,
+    /// `request.cookies`, `request.nextUrl.searchParams`, `searchParams.get`.
+    /// Sinks: universal JS plus `dangerouslySetInnerHTML` (React XSS).
+    static ref NEXTJS_PATTERNS: LanguagePatterns = LanguagePatterns {
+        sources: vec![
+            // HttpBody: App Router request.json() / request.text() / request.formData()
+            (Regex::new(r"request\.(json|text|formData)\s*\(").unwrap(), TaintSourceType::HttpBody),
+            // HttpBody: Pages Router req.body shape
+            (Regex::new(r"\brequest\.body\b").unwrap(), TaintSourceType::HttpBody),
+            // HttpParam: request.headers / request.cookies (App Router)
+            (Regex::new(r"request\.(headers|cookies)\b").unwrap(), TaintSourceType::HttpParam),
+            // HttpParam: request.nextUrl.searchParams
+            (Regex::new(r"request\.nextUrl\.searchParams\b").unwrap(), TaintSourceType::HttpParam),
+            // HttpParam: searchParams.get / searchParams.getAll / searchParams.has
+            (Regex::new(r"\bsearchParams\.(get|getAll|has)\s*\(").unwrap(), TaintSourceType::HttpParam),
+            // HttpParam: headers().get / cookies().get (App Router server helpers)
+            (Regex::new(r"\b(headers|cookies)\s*\(\s*\)\.get\s*\(").unwrap(), TaintSourceType::HttpParam),
+        ],
+        sinks: vec![
+            // FileWrite: NextResponse.redirect(url), Response.redirect(url) (open redirect)
+            (Regex::new(r"\b(NextResponse|Response)\.redirect\s*\(").unwrap(), TaintSinkType::FileWrite),
+            // FileWrite: NextResponse.json(data) (reflected XSS via response body)
+            (Regex::new(r"\bNextResponse\.json\s*\(").unwrap(), TaintSinkType::FileWrite),
+            // FileWrite: redirect(url) — server-action helper
+            (Regex::new(r"\bredirect\s*\(").unwrap(), TaintSinkType::FileWrite),
+            // FileWrite: dangerouslySetInnerHTML (React XSS)
+            (Regex::new(r"dangerouslySetInnerHTML").unwrap(), TaintSinkType::FileWrite),
+        ],
+        sanitizers: vec![
+            // Zod schema validation: .parse() / .safeParse()
+            (Regex::new(r"\.(parse|safeParse)\s*\(").unwrap(), SanitizerType::Numeric),
+        ],
+    };
+}
+
+lazy_static! {
+    /// Fastify taint patterns.
+    ///
+    /// Fastify uses `request` (NOT `req`) and `reply` (NOT `res`). Sources
+    /// cover `request.body`, `request.params`, `request.query`,
+    /// `request.headers`, `request.cookies`, `request.raw`. Sinks cover
+    /// `reply.send`, `reply.redirect`, `reply.header`.
+    static ref FASTIFY_PATTERNS: LanguagePatterns = LanguagePatterns {
+        sources: vec![
+            // HttpBody: request.body (Fastify form, no 'req' prefix)
+            (Regex::new(r"request\.body\b").unwrap(), TaintSourceType::HttpBody),
+            // HttpParam: request.params / .query / .headers / .cookies
+            (Regex::new(r"request\.(params|query|headers|cookies)\b").unwrap(), TaintSourceType::HttpParam),
+            // HttpBody: request.raw (raw IncomingMessage)
+            (Regex::new(r"request\.raw\b").unwrap(), TaintSourceType::HttpBody),
+        ],
+        sinks: vec![
+            // FileWrite: reply.send(...) (reflected XSS / open redirect via response)
+            (Regex::new(r"\breply\.send\s*\(").unwrap(), TaintSinkType::FileWrite),
+            // FileWrite: reply.redirect(...) (open redirect)
+            (Regex::new(r"\breply\.redirect\s*\(").unwrap(), TaintSinkType::FileWrite),
+            // FileWrite: reply.header(...) (header injection)
+            (Regex::new(r"\breply\.header\s*\(").unwrap(), TaintSinkType::FileWrite),
+        ],
+        sanitizers: vec![],
+    };
+}
+
+lazy_static! {
+    /// NestJS taint patterns (decorator-based controllers).
+    ///
+    /// Sources cover the `@Body()`, `@Query()`, `@Param()`, `@Headers()`,
+    /// `@Req()` / `@Request()`, `@UploadedFile`/`@UploadedFiles` decorators on
+    /// parameter declaration lines, plus manual `request.body` access inside
+    /// `@Req()`-injected handlers. Sinks cover the Express-style `res.send` /
+    /// `res.redirect` / `res.json` and the `Response.send` / `Response.redirect`
+    /// / `Response.json` builder forms.
+    ///
+    /// Sanitizers are INTENTIONALLY EMPTY: `class-validator` decorators
+    /// (`@IsInt`, `@IsEmail`, `@IsUrl`, etc.) validate format but do NOT
+    /// escape — calling them sanitizers would mislead on security. CHANGELOG
+    /// must note: "NestJS taint patterns recognize sources/sinks but not
+    /// class-validator sanitizers — expect higher flow counts than Express."
+    ///
+    /// Known limitation: decorator-injected parameters `(@Body() body: T)` are
+    /// invisible to per-line regex when the body of the handler uses the
+    /// untainted local name `body`. Coverage focuses on the manual
+    /// `@Req() request: Request` style and `request.body` access.
+    static ref NESTJS_PATTERNS: LanguagePatterns = LanguagePatterns {
+        sources: vec![
+            // HttpBody: @Body() decorator (parameter declaration line)
+            (Regex::new(r"@Body\s*\(").unwrap(), TaintSourceType::HttpBody),
+            // HttpParam: @Query / @Param / @Headers / @Cookies decorators
+            (Regex::new(r"@(Query|Param|Headers|Cookies)\s*\(").unwrap(), TaintSourceType::HttpParam),
+            // HttpBody: @Req / @Request decorators (whole request object exposed)
+            (Regex::new(r"@(Req|Request)\s*\(").unwrap(), TaintSourceType::HttpBody),
+            // HttpBody: @UploadedFile / @UploadedFiles decorators
+            (Regex::new(r"@UploadedFiles?\s*\(").unwrap(), TaintSourceType::HttpBody),
+            // HttpBody: manual request.body access inside @Req()-injected handlers
+            (Regex::new(r"request\.body\b").unwrap(), TaintSourceType::HttpBody),
+        ],
+        sinks: vec![
+            // FileWrite: res.send / res.redirect / res.json (Express-style @Res())
+            (Regex::new(r"\bres\.(send|redirect|json)\s*\(").unwrap(), TaintSinkType::FileWrite),
+            // FileWrite: Response.send / Response.redirect / Response.json (builder form)
+            (Regex::new(r"\bResponse\.(send|redirect|json)\s*\(").unwrap(), TaintSinkType::FileWrite),
+        ],
+        sanitizers: vec![],
+    };
+}
+
+lazy_static! {
+    /// Unified TypeScript / JavaScript taint patterns.
+    ///
+    /// Composed of Express + Next.js + Fastify + NestJS sub-banks via
+    /// [`merge_patterns`]. Adding a new framework: define a `<NAME>_PATTERNS`
+    /// `lazy_static!` and append `&<NAME>_PATTERNS` to the slice below.
+    ///
+    /// `get_patterns(Language::TypeScript | Language::JavaScript)` returns a
+    /// reference to this static; the public signature is unchanged from before
+    /// the multi-framework expansion.
+    static ref TYPESCRIPT_PATTERNS: LanguagePatterns = merge_patterns(&[
+        &TYPESCRIPT_EXPRESS_PATTERNS,
+        &NEXTJS_PATTERNS,
+        &FASTIFY_PATTERNS,
+        &NESTJS_PATTERNS,
+    ]);
 }
 
 lazy_static! {
