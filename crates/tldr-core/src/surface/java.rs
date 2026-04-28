@@ -104,6 +104,7 @@ fn extract_from_java_file(
 
         let qualified_name = format!("{}.{}", module_path, class.name);
         let kind = determine_java_kind(class, &source);
+        let is_interface = kind == ApiKind::Interface;
 
         apis.push(ApiEntry {
             qualified_name: qualified_name.clone(),
@@ -123,7 +124,13 @@ fn extract_from_java_file(
         });
 
         for method in &class.methods {
-            if !include_private && !is_java_public_at_line(&source, method.line_number as usize) {
+            // Interface methods are implicitly public in Java — no modifier
+            // needed. Bypass the per-method visibility check when the enclosing
+            // type is an interface. Mirrors rust_lang.rs:L174-L180 trait pattern.
+            if !include_private
+                && !is_interface
+                && !is_java_public_at_line(&source, method.line_number as usize)
+            {
                 continue;
             }
 
@@ -414,6 +421,58 @@ class Helper {
         assert_eq!(
             compute_java_module_path(file, root, "example_pkg"),
             "example_pkg.module-a.com.example.http"
+        );
+    }
+
+    #[test]
+    fn test_extract_java_surface_interface_methods_are_public_by_default() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir,
+            "src/main/java/com/example/IService.java",
+            r#"
+public interface IService {
+    void execute();
+    String getName();
+    int compute(int x);
+}
+"#,
+        );
+
+        let resolved = ResolvedPackage {
+            root_dir: dir.path().to_path_buf(),
+            package_name: "example".to_string(),
+            is_pure_source: true,
+            public_names: None,
+        };
+
+        // include_private = false — without the fix, interface methods are filtered out.
+        let surface = extract_java_api_surface(&resolved, false, None).unwrap();
+        let names: Vec<&str> = surface
+            .apis
+            .iter()
+            .map(|api| api.qualified_name.as_str())
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n.ends_with("IService")),
+            "Interface type should be in surface: {:?}",
+            names
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("IService.execute")),
+            "execute should be in surface: {:?}",
+            names
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("IService.getName")),
+            "getName should be in surface: {:?}",
+            names
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("IService.compute")),
+            "compute should be in surface: {:?}",
+            names
         );
     }
 }

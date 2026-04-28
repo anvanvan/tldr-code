@@ -105,6 +105,7 @@ fn extract_from_csharp_file(
         let class_name = effective_csharp_class_name(class, &source);
         let qualified_name = format!("{}.{}", module_path, class_name);
         let kind = determine_csharp_kind(class, &source);
+        let is_interface = kind == ApiKind::Interface;
 
         apis.push(ApiEntry {
             qualified_name: qualified_name.clone(),
@@ -124,7 +125,14 @@ fn extract_from_csharp_file(
         });
 
         for method in &class.methods {
-            if !include_private && !is_csharp_member_visible(&source, method.line_number as usize) {
+            // Interface methods are always public by language semantics — the
+            // explicit `public` modifier is omitted. Bypass the per-method
+            // visibility check when the enclosing type is an interface.
+            // Mirrors the Rust trait short-circuit at rust_lang.rs:L174-L180.
+            if !include_private
+                && !is_interface
+                && !is_csharp_member_visible(&source, method.line_number as usize)
+            {
                 continue;
             }
 
@@ -406,6 +414,62 @@ internal class Greeter
         assert_eq!(
             compute_csharp_module_path(file, root, "example_pkg"),
             "example_pkg.sdk.MySdk.Http"
+        );
+    }
+
+    #[test]
+    fn test_extract_csharp_surface_interface_methods_are_public_by_default() {
+        let dir = TempDir::new().unwrap();
+        write_file(
+            &dir,
+            "src/IService.cs",
+            r#"
+public interface IService
+{
+    void Execute();
+    string GetName();
+    int Compute(int x);
+}
+"#,
+        );
+
+        let resolved = ResolvedPackage {
+            root_dir: dir.path().to_path_buf(),
+            package_name: "example".to_string(),
+            is_pure_source: true,
+            public_names: None,
+        };
+
+        // include_private = false — without the fix, interface methods are filtered out.
+        let surface = extract_csharp_api_surface(&resolved, false, None).unwrap();
+        let names: Vec<&str> = surface
+            .apis
+            .iter()
+            .map(|api| api.qualified_name.as_str())
+            .collect();
+
+        // The interface itself must be present.
+        assert!(
+            names.iter().any(|n| n.ends_with("IService")),
+            "Interface type should be in surface: {:?}",
+            names
+        );
+
+        // All three interface methods must be present without --include-private.
+        assert!(
+            names.iter().any(|n| n.ends_with("IService.Execute")),
+            "Execute should be in surface: {:?}",
+            names
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("IService.GetName")),
+            "GetName should be in surface: {:?}",
+            names
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("IService.Compute")),
+            "Compute should be in surface: {:?}",
+            names
         );
     }
 }
