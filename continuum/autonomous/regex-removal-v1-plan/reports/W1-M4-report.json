@@ -4,7 +4,7 @@
   "wave": "1",
   "serial_position": "4 of 5",
   "result": "success",
-  "commit_sha": "PENDING",
+  "commit_sha": "9d2e3857174748088508cb92f0425c52642346ec",
   "depends_on_commits": [
     "2278a63 (W1-M1)",
     "61b2282 (W1-M2)",
