@@ -436,61 +436,14 @@ pub struct LanguagePatterns {
     pub sanitizers: Vec<(Regex, SanitizerType)>,
 }
 
-/// Concatenate multiple `LanguagePatterns` banks into a single one.
-///
-/// Used to compose framework-specific TypeScript pattern banks (Express,
-/// Next.js, Fastify, NestJS) into the unified `TYPESCRIPT_PATTERNS` exposed
-/// to [`get_patterns`]. Adding a new framework: define a `<NAME>_PATTERNS`
-/// `lazy_static!` and append `&<NAME>_PATTERNS` to the slice passed here.
-fn merge_patterns(banks: &[&LanguagePatterns]) -> LanguagePatterns {
-    let mut sources = Vec::new();
-    let mut sinks = Vec::new();
-    let mut sanitizers = Vec::new();
-    for b in banks {
-        sources.extend(b.sources.iter().cloned());
-        sinks.extend(b.sinks.iter().cloned());
-        sanitizers.extend(b.sanitizers.iter().cloned());
-    }
-    LanguagePatterns {
-        sources,
-        sinks,
-        sanitizers,
-    }
-}
-
 lazy_static! {
     /// Python-specific taint patterns.
     static ref PYTHON_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // UserInput: input() function
-            (Regex::new(r"\binput\s*\(").unwrap(), TaintSourceType::UserInput),
-            // HttpParam: request.args, request.form, request.values, request.cookies, request.headers
-            (Regex::new(r"request\.(args|form|json|data|values|cookies|headers)").unwrap(), TaintSourceType::HttpParam),
-            // HttpBody: request.get_json()
-            (Regex::new(r"request\.get_json\s*\(").unwrap(), TaintSourceType::HttpBody),
-            // Stdin: sys.stdin
-            (Regex::new(r"sys\.stdin").unwrap(), TaintSourceType::Stdin),
-            // EnvVar: os.environ, os.getenv
-            (Regex::new(r"os\.(environ|getenv)").unwrap(), TaintSourceType::EnvVar),
-            // FileRead: .read(), .readlines(), .readline()
-            (Regex::new(r"\.(read|readlines|readline)\s*\(").unwrap(), TaintSourceType::FileRead),
-        ],
-        sinks: vec![
-            // SqlQuery: .execute(), .executemany()
-            (Regex::new(r"\.(execute|executemany)\s*\(").unwrap(), TaintSinkType::SqlQuery),
-            // CodeEval: eval()
-            (Regex::new(r"\beval\s*\(").unwrap(), TaintSinkType::CodeEval),
-            // CodeExec: exec()
-            (Regex::new(r"\bexec\s*\(").unwrap(), TaintSinkType::CodeExec),
-            // CodeCompile: compile()
-            (Regex::new(r"\bcompile\s*\(").unwrap(), TaintSinkType::CodeCompile),
-            // ShellExec: subprocess.run, subprocess.call, subprocess.Popen, subprocess.check_output
-            (Regex::new(r"subprocess\.(run|call|Popen|check_output)\s*\(").unwrap(), TaintSinkType::ShellExec),
-            // ShellExec: os.system, os.popen, os.spawn*
-            (Regex::new(r"os\.(system|popen|spawn\w*)\s*\(").unwrap(), TaintSinkType::ShellExec),
-            // FileWrite: .write()
-            (Regex::new(r"\.write\s*\(").unwrap(), TaintSinkType::FileWrite),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M8): sources + sinks regex banks
+        // deleted; AST-based detection in detect_sources_ast/detect_sinks_ast
+        // is canonical. Sanitizer Vec is RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: int(), float(), bool()
             (Regex::new(r"\b(int|float|bool)\s*\(").unwrap(), SanitizerType::Numeric),
@@ -503,209 +456,37 @@ lazy_static! {
 }
 
 lazy_static! {
-    /// Express.js taint patterns (sub-bank of the unified TS pattern set).
+    /// Unified TypeScript / JavaScript taint patterns.
     ///
-    /// Matches the historical Express handler shape: `req.body`, `req.params`,
-    /// `req.query`, `req.cookies`, `req.headers`. Sinks are universal JS
-    /// (eval, child_process, innerHTML, document.write, .query/.execute).
-    static ref TYPESCRIPT_EXPRESS_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // HttpBody: req.body
-            (Regex::new(r"req\.body").unwrap(), TaintSourceType::HttpBody),
-            // HttpParam: req.params, req.query, req.cookies, req.headers
-            (Regex::new(r"req\.(params|query|cookies|headers)").unwrap(), TaintSourceType::HttpParam),
-            // EnvVar: process.env
-            (Regex::new(r"process\.env").unwrap(), TaintSourceType::EnvVar),
-            // Stdin: process.stdin
-            (Regex::new(r"process\.stdin").unwrap(), TaintSourceType::Stdin),
-            // UserInput: readline()
-            (Regex::new(r"readline\s*\(").unwrap(), TaintSourceType::UserInput),
-            // FileRead: .read(), .readFile
-            (Regex::new(r"\.(read|readFile)\s*\(").unwrap(), TaintSourceType::FileRead),
-        ],
-        sinks: vec![
-            // CodeEval: eval()
-            (Regex::new(r"\beval\s*\(").unwrap(), TaintSinkType::CodeEval),
-            // CodeEval: new Function()
-            (Regex::new(r"new\s+Function\s*\(").unwrap(), TaintSinkType::CodeEval),
-            // ShellExec: child_process.exec/spawn/execSync/execFile
-            (Regex::new(r"child_process\.(exec|spawn|execSync|execFile)\s*\(").unwrap(), TaintSinkType::ShellExec),
-            // ShellExec: execSync()
-            (Regex::new(r"\bexecSync\s*\(").unwrap(), TaintSinkType::ShellExec),
-            // FileWrite: innerHTML = (XSS)
-            (Regex::new(r"\.innerHTML\s*=").unwrap(), TaintSinkType::FileWrite),
-            // FileWrite: document.write (XSS)
-            (Regex::new(r"document\.write\s*\(").unwrap(), TaintSinkType::FileWrite),
-            // SqlQuery: .query(), .execute()
-            (Regex::new(r"\.(query|execute)\s*\(").unwrap(), TaintSinkType::SqlQuery),
-        ],
+    /// Wave-2-atomic (regex-removal-v1 M7): the four framework sub-banks
+    /// (TYPESCRIPT_EXPRESS_PATTERNS, NEXTJS_PATTERNS, FASTIFY_PATTERNS,
+    /// NESTJS_PATTERNS) and the `merge_patterns` helper that previously
+    /// composed them have been deleted along with their source+sink regex
+    /// entries. Source/sink detection is now exclusively AST-based via
+    /// `detect_sources_ast` / `detect_sinks_ast` in
+    /// `compute_taint_with_tree`. The sanitizer Vec is RETAINED across all
+    /// 4 sub-banks (sanitizer-removal is a future milestone).
+    static ref TYPESCRIPT_PATTERNS: LanguagePatterns = LanguagePatterns {
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
-            // Numeric: parseInt, Number, parseFloat
+            // Numeric: parseInt, Number, parseFloat (Express + universal JS)
             (Regex::new(r"\b(parseInt|Number|parseFloat)\s*\(").unwrap(), SanitizerType::Numeric),
-            // Html: encodeURIComponent, DOMPurify.sanitize
+            // Html: encodeURIComponent, DOMPurify.sanitize (Express + universal JS)
             (Regex::new(r"(encodeURIComponent|DOMPurify\.sanitize)\s*\(").unwrap(), SanitizerType::Html),
-        ],
-    };
-}
-
-lazy_static! {
-    /// Next.js (App Router + Pages Router) taint patterns.
-    ///
-    /// Sources: `request.json()`, `request.formData()`, `request.text()`,
-    /// `request.body` (Pages Router API routes), `request.headers`,
-    /// `request.cookies`, `request.nextUrl.searchParams`, `searchParams.get`.
-    /// Sinks: universal JS plus `dangerouslySetInnerHTML` (React XSS).
-    static ref NEXTJS_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // HttpBody: App Router request.json() / request.text() / request.formData()
-            (Regex::new(r"request\.(json|text|formData)\s*\(").unwrap(), TaintSourceType::HttpBody),
-            // HttpBody: Pages Router req.body shape
-            (Regex::new(r"\brequest\.body\b").unwrap(), TaintSourceType::HttpBody),
-            // HttpParam: request.headers / request.cookies (App Router)
-            (Regex::new(r"request\.(headers|cookies)\b").unwrap(), TaintSourceType::HttpParam),
-            // HttpParam: request.nextUrl.searchParams
-            (Regex::new(r"request\.nextUrl\.searchParams\b").unwrap(), TaintSourceType::HttpParam),
-            // HttpParam: searchParams.get / searchParams.getAll / searchParams.has
-            (Regex::new(r"\bsearchParams\.(get|getAll|has)\s*\(").unwrap(), TaintSourceType::HttpParam),
-            // HttpParam: headers().get / cookies().get (App Router server helpers)
-            (Regex::new(r"\b(headers|cookies)\s*\(\s*\)\.get\s*\(").unwrap(), TaintSourceType::HttpParam),
-        ],
-        sinks: vec![
-            // FileWrite: NextResponse.redirect(url), Response.redirect(url) (open redirect)
-            (Regex::new(r"\b(NextResponse|Response)\.redirect\s*\(").unwrap(), TaintSinkType::FileWrite),
-            // FileWrite: NextResponse.json(data) (reflected XSS via response body)
-            (Regex::new(r"\bNextResponse\.json\s*\(").unwrap(), TaintSinkType::FileWrite),
-            // FileWrite: redirect(url) — server-action helper
-            (Regex::new(r"\bredirect\s*\(").unwrap(), TaintSinkType::FileWrite),
-            // FileWrite: dangerouslySetInnerHTML (React XSS)
-            (Regex::new(r"dangerouslySetInnerHTML").unwrap(), TaintSinkType::FileWrite),
-        ],
-        sanitizers: vec![
-            // Zod schema validation: .parse() / .safeParse()
+            // Numeric: Zod .parse() / .safeParse() (Next.js)
             (Regex::new(r"\.(parse|safeParse)\s*\(").unwrap(), SanitizerType::Numeric),
         ],
     };
 }
 
 lazy_static! {
-    /// Fastify taint patterns.
-    ///
-    /// Fastify uses `request` (NOT `req`) and `reply` (NOT `res`). Sources
-    /// cover `request.body`, `request.params`, `request.query`,
-    /// `request.headers`, `request.cookies`, `request.raw`. Sinks cover
-    /// `reply.send`, `reply.redirect`, `reply.header`.
-    static ref FASTIFY_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // HttpBody: request.body (Fastify form, no 'req' prefix)
-            (Regex::new(r"request\.body\b").unwrap(), TaintSourceType::HttpBody),
-            // HttpParam: request.params / .query / .headers / .cookies
-            (Regex::new(r"request\.(params|query|headers|cookies)\b").unwrap(), TaintSourceType::HttpParam),
-            // HttpBody: request.raw (raw IncomingMessage)
-            (Regex::new(r"request\.raw\b").unwrap(), TaintSourceType::HttpBody),
-        ],
-        sinks: vec![
-            // FileWrite: reply.send(...) (reflected XSS / open redirect via response)
-            (Regex::new(r"\breply\.send\s*\(").unwrap(), TaintSinkType::FileWrite),
-            // FileWrite: reply.redirect(...) (open redirect)
-            (Regex::new(r"\breply\.redirect\s*\(").unwrap(), TaintSinkType::FileWrite),
-            // FileWrite: reply.header(...) (header injection)
-            (Regex::new(r"\breply\.header\s*\(").unwrap(), TaintSinkType::FileWrite),
-        ],
-        sanitizers: vec![],
-    };
-}
-
-lazy_static! {
-    /// NestJS taint patterns (decorator-based controllers).
-    ///
-    /// Sources cover the `@Body()`, `@Query()`, `@Param()`, `@Headers()`,
-    /// `@Req()` / `@Request()`, `@UploadedFile`/`@UploadedFiles` decorators on
-    /// parameter declaration lines, plus manual `request.body` access inside
-    /// `@Req()`-injected handlers. Sinks cover the Express-style `res.send` /
-    /// `res.redirect` / `res.json` and the `Response.send` / `Response.redirect`
-    /// / `Response.json` builder forms.
-    ///
-    /// Sanitizers are INTENTIONALLY EMPTY: `class-validator` decorators
-    /// (`@IsInt`, `@IsEmail`, `@IsUrl`, etc.) validate format but do NOT
-    /// escape — calling them sanitizers would mislead on security. CHANGELOG
-    /// must note: "NestJS taint patterns recognize sources/sinks but not
-    /// class-validator sanitizers — expect higher flow counts than Express."
-    ///
-    /// Known limitation: decorator-injected parameters `(@Body() body: T)` are
-    /// invisible to per-line regex when the body of the handler uses the
-    /// untainted local name `body`. Coverage focuses on the manual
-    /// `@Req() request: Request` style and `request.body` access.
-    static ref NESTJS_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // HttpBody: @Body() decorator (parameter declaration line)
-            (Regex::new(r"@Body\s*\(").unwrap(), TaintSourceType::HttpBody),
-            // HttpParam: @Query / @Param / @Headers / @Cookies decorators
-            (Regex::new(r"@(Query|Param|Headers|Cookies)\s*\(").unwrap(), TaintSourceType::HttpParam),
-            // HttpBody: @Req / @Request decorators (whole request object exposed)
-            (Regex::new(r"@(Req|Request)\s*\(").unwrap(), TaintSourceType::HttpBody),
-            // HttpBody: @UploadedFile / @UploadedFiles decorators
-            (Regex::new(r"@UploadedFiles?\s*\(").unwrap(), TaintSourceType::HttpBody),
-            // HttpBody: manual request.body access inside @Req()-injected handlers
-            (Regex::new(r"request\.body\b").unwrap(), TaintSourceType::HttpBody),
-        ],
-        sinks: vec![
-            // FileWrite: res.send / res.redirect / res.json (Express-style @Res())
-            (Regex::new(r"\bres\.(send|redirect|json)\s*\(").unwrap(), TaintSinkType::FileWrite),
-            // FileWrite: Response.send / Response.redirect / Response.json (builder form)
-            (Regex::new(r"\bResponse\.(send|redirect|json)\s*\(").unwrap(), TaintSinkType::FileWrite),
-            // FileWrite: response.send / .redirect / .json (lowercase Nest builder param convention).
-            // W1-M3 parity-add: AST var-extraction in detect_sinks_ast still reads regex bank to
-            // locate the call argument; without this entry, the AST member_pattern
-            // ("response","send") match would emit no sink. Wave 2 atomic removes this regex.
-            (Regex::new(r"\bresponse\.(send|redirect|json)\s*\(").unwrap(), TaintSinkType::FileWrite),
-        ],
-        sanitizers: vec![],
-    };
-}
-
-lazy_static! {
-    /// Unified TypeScript / JavaScript taint patterns.
-    ///
-    /// Composed of Express + Next.js + Fastify + NestJS sub-banks via
-    /// [`merge_patterns`]. Adding a new framework: define a `<NAME>_PATTERNS`
-    /// `lazy_static!` and append `&<NAME>_PATTERNS` to the slice below.
-    ///
-    /// `get_patterns(Language::TypeScript | Language::JavaScript)` returns a
-    /// reference to this static; the public signature is unchanged from before
-    /// the multi-framework expansion.
-    static ref TYPESCRIPT_PATTERNS: LanguagePatterns = merge_patterns(&[
-        &TYPESCRIPT_EXPRESS_PATTERNS,
-        &NEXTJS_PATTERNS,
-        &FASTIFY_PATTERNS,
-        &NESTJS_PATTERNS,
-    ]);
-}
-
-lazy_static! {
     /// Go taint patterns.
     static ref GO_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // UserInput: fmt.Scan*, bufio.NewReader, bufio.NewScanner
-            (Regex::new(r"(fmt\.Scan|bufio\.NewReader|bufio\.NewScanner)").unwrap(), TaintSourceType::UserInput),
-            // HttpParam: r.FormValue, r.PostFormValue, r.URL.Query(), .Query()
-            (Regex::new(r"(r\.(FormValue|PostFormValue|URL\.Query)\s*\(|\.Query\(\))").unwrap(), TaintSourceType::HttpParam),
-            // HttpBody: r.Body, .ReadAll(r.Body)
-            (Regex::new(r"(r\.Body|\.ReadAll\(r\.Body\))").unwrap(), TaintSourceType::HttpBody),
-            // EnvVar: os.Getenv
-            (Regex::new(r"os\.Getenv\s*\(").unwrap(), TaintSourceType::EnvVar),
-            // Stdin: os.Stdin
-            (Regex::new(r"os\.Stdin").unwrap(), TaintSourceType::Stdin),
-            // FileRead: os.Open, ioutil.ReadFile
-            (Regex::new(r"(os\.Open|ioutil\.ReadFile)\s*\(").unwrap(), TaintSourceType::FileRead),
-        ],
-        sinks: vec![
-            // ShellExec: exec.Command
-            (Regex::new(r"exec\.Command\s*\(").unwrap(), TaintSinkType::ShellExec),
-            // SqlQuery: db.Exec, db.Query, db.QueryRow
-            (Regex::new(r"db\.(Exec|Query|QueryRow)\s*\(").unwrap(), TaintSinkType::SqlQuery),
-            // FileWrite: template.HTML (XSS), fmt.Fprintf(w, ...)
-            (Regex::new(r"(template\.HTML\s*\(|fmt\.Fprintf\s*\()").unwrap(), TaintSinkType::FileWrite),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M9): sources + sinks regex banks
+        // deleted; AST detection canonical. Sanitizers RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: strconv.Atoi, strconv.ParseInt, strconv.ParseFloat
             (Regex::new(r"strconv\.(Atoi|ParseInt|ParseFloat)\s*\(").unwrap(), SanitizerType::Numeric),
@@ -718,26 +499,10 @@ lazy_static! {
 lazy_static! {
     /// Java taint patterns.
     static ref JAVA_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // Stdin: new Scanner(System.in)
-            (Regex::new(r"new\s+Scanner\s*\(System\.in\)").unwrap(), TaintSourceType::Stdin),
-            // UserInput: readLine(), new BufferedReader
-            (Regex::new(r"(readLine\s*\(|new\s+BufferedReader\s*\()").unwrap(), TaintSourceType::UserInput),
-            // HttpParam: request.getParameter, getQueryString
-            (Regex::new(r"(request\.getParameter\s*\(|getQueryString\s*\()").unwrap(), TaintSourceType::HttpParam),
-            // EnvVar: System.getenv
-            (Regex::new(r"System\.getenv\s*\(").unwrap(), TaintSourceType::EnvVar),
-            // FileRead: new FileReader, Files.readAllLines
-            (Regex::new(r"(new\s+FileReader|Files\.readAllLines)").unwrap(), TaintSourceType::FileRead),
-        ],
-        sinks: vec![
-            // ShellExec: Runtime.getRuntime().exec, ProcessBuilder
-            (Regex::new(r"(Runtime\.getRuntime\(\)\.exec\s*\(|ProcessBuilder\s*\()").unwrap(), TaintSinkType::ShellExec),
-            // SqlQuery: Statement/Connection.execute/executeQuery/executeUpdate
-            (Regex::new(r"\.(execute|executeQuery|executeUpdate)\s*\(").unwrap(), TaintSinkType::SqlQuery),
-            // CodeEval: Class.forName
-            (Regex::new(r"Class\.forName\s*\(").unwrap(), TaintSinkType::CodeEval),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M9): sources + sinks regex banks
+        // deleted; AST detection canonical. Sanitizers RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: Integer.parseInt, Long.parseLong, Double.parseDouble
             (Regex::new(r"(Integer\.parseInt|Long\.parseLong|Double\.parseDouble)\s*\(").unwrap(), SanitizerType::Numeric),
@@ -750,24 +515,10 @@ lazy_static! {
 lazy_static! {
     /// Rust taint patterns.
     static ref RUST_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // Stdin: std::io::stdin(), io::stdin()
-            (Regex::new(r"(std::)?io::stdin\s*\(").unwrap(), TaintSourceType::Stdin),
-            // EnvVar: std::env::var, std::env::args, env::var, env::args
-            (Regex::new(r"(std::)?env::var\s*\(").unwrap(), TaintSourceType::EnvVar),
-            // UserInput: std::env::args (command line args are user input)
-            (Regex::new(r"(std::)?env::args\s*\(").unwrap(), TaintSourceType::UserInput),
-            // FileRead: std::fs::read_to_string, fs::read_to_string, File::open
-            (Regex::new(r"((std::)?fs::read_to_string\s*\(|File::open)").unwrap(), TaintSourceType::FileRead),
-        ],
-        sinks: vec![
-            // ShellExec: Command::new, std::process::Command
-            (Regex::new(r"(Command::new\s*\(|std::process::Command)").unwrap(), TaintSinkType::ShellExec),
-            // CodeEval: unsafe block
-            (Regex::new(r"\bunsafe\s*\{").unwrap(), TaintSinkType::CodeEval),
-            // FileWrite: std::ptr::write, std::ptr::read
-            (Regex::new(r"std::ptr::(write|read)\s*\(").unwrap(), TaintSinkType::FileWrite),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M9): sources + sinks regex banks
+        // deleted; AST detection canonical. Sanitizers RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: .parse::<i32>(), etc.
             (Regex::new(r"\.parse::<(i32|i64|u32|u64|f32|f64|usize|isize)>\s*\(").unwrap(), SanitizerType::Numeric),
@@ -778,26 +529,10 @@ lazy_static! {
 lazy_static! {
     /// C taint patterns.
     static ref C_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // UserInput: scanf, fscanf, sscanf
-            (Regex::new(r"\b(scanf|fscanf|sscanf)\s*\(").unwrap(), TaintSourceType::UserInput),
-            // UserInput: fgets, gets, getchar
-            (Regex::new(r"\b(fgets|gets|getchar)\s*\(").unwrap(), TaintSourceType::UserInput),
-            // EnvVar: getenv
-            (Regex::new(r"\bgetenv\s*\(").unwrap(), TaintSourceType::EnvVar),
-            // FileRead: fread, fopen
-            (Regex::new(r"\b(fread|fopen)\s*\(").unwrap(), TaintSourceType::FileRead),
-            // UserInput: recv, recvfrom (network)
-            (Regex::new(r"\b(recv|recvfrom)\s*\(").unwrap(), TaintSourceType::UserInput),
-        ],
-        sinks: vec![
-            // ShellExec: system, popen, execl, execv, execvp
-            (Regex::new(r"\b(system|popen|execl|execv|execvp)\s*\(").unwrap(), TaintSinkType::ShellExec),
-            // ShellExec: sprintf, vsprintf (format string vuln)
-            (Regex::new(r"\b(sprintf|vsprintf)\s*\(").unwrap(), TaintSinkType::ShellExec),
-            // FileWrite: strcpy, strcat, strncpy (buffer overflow)
-            (Regex::new(r"\b(strcpy|strcat|strncpy)\s*\(").unwrap(), TaintSinkType::FileWrite),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M9): sources + sinks regex banks
+        // deleted; AST detection canonical. Sanitizers RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: atoi, atol, atof, strtol, strtoul, strtod
             (Regex::new(r"\b(atoi|atol|atof|strtol|strtoul|strtod)\s*\(").unwrap(), SanitizerType::Numeric),
@@ -810,22 +545,10 @@ lazy_static! {
 lazy_static! {
     /// C++ taint patterns.
     static ref CPP_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // UserInput: std::cin >>
-            (Regex::new(r"std::cin\s*>>").unwrap(), TaintSourceType::UserInput),
-            // UserInput: std::getline, getline
-            (Regex::new(r"(std::)?getline\s*\(").unwrap(), TaintSourceType::UserInput),
-            // EnvVar: getenv
-            (Regex::new(r"\bgetenv\s*\(").unwrap(), TaintSourceType::EnvVar),
-            // FileRead: std::ifstream, std::fstream
-            (Regex::new(r"std::(ifstream|fstream)").unwrap(), TaintSourceType::FileRead),
-        ],
-        sinks: vec![
-            // ShellExec: system, popen, std::system
-            (Regex::new(r"(\bsystem\s*\(|\bpopen\s*\(|std::system\s*\()").unwrap(), TaintSinkType::ShellExec),
-            // ShellExec: sprintf
-            (Regex::new(r"\bsprintf\s*\(").unwrap(), TaintSinkType::ShellExec),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M9): sources + sinks regex banks
+        // deleted; AST detection canonical. Sanitizers RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: std::stoi, std::stol, std::stoul, std::stoll, std::stof, std::stod
             (Regex::new(r"std::sto(i|l|ul|ll|f|d)\s*\(").unwrap(), SanitizerType::Numeric),
@@ -872,22 +595,10 @@ lazy_static! {
 lazy_static! {
     /// Kotlin taint patterns.
     static ref KOTLIN_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // UserInput: readLine(), readln()
-            (Regex::new(r"\b(readLine|readln)\s*\(\)").unwrap(), TaintSourceType::UserInput),
-            // EnvVar: System.getenv
-            (Regex::new(r"System\.getenv\s*\(").unwrap(), TaintSourceType::EnvVar),
-            // UserInput: BufferedReader
-            (Regex::new(r"BufferedReader\s*\(").unwrap(), TaintSourceType::UserInput),
-            // HttpParam: request.getParameter
-            (Regex::new(r"request\.getParameter\s*\(").unwrap(), TaintSourceType::HttpParam),
-        ],
-        sinks: vec![
-            // ShellExec: Runtime.getRuntime().exec, ProcessBuilder
-            (Regex::new(r"(Runtime\.getRuntime\(\)\.exec\s*\(|ProcessBuilder\s*\()").unwrap(), TaintSinkType::ShellExec),
-            // SqlQuery: .execute, .executeQuery, prepareStatement
-            (Regex::new(r"\.(execute|executeQuery)\s*\(|prepareStatement\s*\(").unwrap(), TaintSinkType::SqlQuery),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M9): sources + sinks regex banks
+        // deleted; AST detection canonical. Sanitizers RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: .toInt(), .toLong(), .toDouble(), .toFloat()
             (Regex::new(r"\.(toInt|toLong|toDouble|toFloat)\s*\(\)").unwrap(), SanitizerType::Numeric),
@@ -898,20 +609,10 @@ lazy_static! {
 lazy_static! {
     /// Swift taint patterns.
     static ref SWIFT_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // UserInput: readLine()
-            (Regex::new(r"\breadLine\s*\(\)").unwrap(), TaintSourceType::UserInput),
-            // EnvVar: ProcessInfo.processInfo.environment[
-            (Regex::new(r"ProcessInfo\.processInfo\.environment\[").unwrap(), TaintSourceType::EnvVar),
-            // FileRead: FileManager.default, URLSession
-            (Regex::new(r"(FileManager\.default|URLSession)").unwrap(), TaintSourceType::FileRead),
-        ],
-        sinks: vec![
-            // ShellExec: Process(), NSTask
-            (Regex::new(r"(Process\s*\(\)|NSTask)").unwrap(), TaintSinkType::ShellExec),
-            // SqlQuery: sqlite3_exec
-            (Regex::new(r"sqlite3_exec\s*\(").unwrap(), TaintSinkType::SqlQuery),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M9): sources + sinks regex banks
+        // deleted; AST detection canonical. Sanitizers RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: Int(), Double(), Float()
             (Regex::new(r"\b(Int|Double|Float)\s*\(").unwrap(), SanitizerType::Numeric),
@@ -924,24 +625,10 @@ lazy_static! {
 lazy_static! {
     /// C# taint patterns.
     static ref CSHARP_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // UserInput: Console.ReadLine()
-            (Regex::new(r"Console\.ReadLine\s*\(").unwrap(), TaintSourceType::UserInput),
-            // HttpParam: Request.QueryString[, Request.Form[
-            (Regex::new(r"Request\.(QueryString|Form)\[").unwrap(), TaintSourceType::HttpParam),
-            // EnvVar: Environment.GetEnvironmentVariable
-            (Regex::new(r"Environment\.GetEnvironmentVariable\s*\(").unwrap(), TaintSourceType::EnvVar),
-            // FileRead: File.ReadAllText, File.ReadAllLines, File.OpenRead, StreamReader
-            (Regex::new(r"(File\.(ReadAllText|ReadAllLines|OpenRead)\s*\(|StreamReader\s*\()").unwrap(), TaintSourceType::FileRead),
-        ],
-        sinks: vec![
-            // ShellExec: Process.Start
-            (Regex::new(r"Process\.Start\s*\(").unwrap(), TaintSinkType::ShellExec),
-            // SqlQuery: SqlCommand, .ExecuteNonQuery, .ExecuteReader
-            (Regex::new(r"(SqlCommand\s*\(|\.ExecuteNonQuery\s*\(|\.ExecuteReader\s*\()").unwrap(), TaintSinkType::SqlQuery),
-            // CodeEval: Activator.CreateInstance
-            (Regex::new(r"Activator\.CreateInstance\s*\(").unwrap(), TaintSinkType::CodeEval),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M9): sources + sinks regex banks
+        // deleted; AST detection canonical. Sanitizers RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: int.Parse, Convert.ToInt32, double.Parse
             (Regex::new(r"(int\.Parse|Convert\.ToInt32|double\.Parse)\s*\(").unwrap(), SanitizerType::Numeric),
@@ -954,20 +641,10 @@ lazy_static! {
 lazy_static! {
     /// Scala taint patterns.
     static ref SCALA_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // UserInput: StdIn.readLine, scala.io.StdIn
-            (Regex::new(r"(StdIn\.readLine\s*\(|scala\.io\.StdIn)").unwrap(), TaintSourceType::UserInput),
-            // EnvVar: System.getenv
-            (Regex::new(r"System\.getenv\s*\(").unwrap(), TaintSourceType::EnvVar),
-            // FileRead: Source.fromFile
-            (Regex::new(r"Source\.fromFile\s*\(").unwrap(), TaintSourceType::FileRead),
-        ],
-        sinks: vec![
-            // ShellExec: Runtime.getRuntime.exec, sys.process, Process()
-            (Regex::new(r"(Runtime\.getRuntime\.exec\s*\(|sys\.process|Process\s*\()").unwrap(), TaintSinkType::ShellExec),
-            // SqlQuery: stmt.execute, statement.execute, .executeQuery
-            (Regex::new(r"\.(execute|executeQuery)\s*\(").unwrap(), TaintSinkType::SqlQuery),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M9): sources + sinks regex banks
+        // deleted; AST detection canonical. Sanitizers RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: .toInt, .toLong, .toDouble
             (Regex::new(r"\.(toInt|toLong|toDouble)\b").unwrap(), SanitizerType::Numeric),
@@ -980,26 +657,10 @@ lazy_static! {
 lazy_static! {
     /// PHP taint patterns.
     static ref PHP_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // HttpParam: $_GET, $_REQUEST, $_COOKIE, $_SERVER
-            (Regex::new(r"\$_(GET|REQUEST|COOKIE|SERVER)\[").unwrap(), TaintSourceType::HttpParam),
-            // HttpBody: $_POST
-            (Regex::new(r"\$_POST\[").unwrap(), TaintSourceType::HttpBody),
-            // UserInput: fgets
-            (Regex::new(r"\bfgets\s*\(").unwrap(), TaintSourceType::UserInput),
-            // FileRead: file_get_contents
-            (Regex::new(r"file_get_contents\s*\(").unwrap(), TaintSourceType::FileRead),
-            // EnvVar: getenv, $_ENV
-            (Regex::new(r"(getenv\s*\(|\$_ENV\[)").unwrap(), TaintSourceType::EnvVar),
-        ],
-        sinks: vec![
-            // CodeEval: eval
-            (Regex::new(r"\beval\s*\(").unwrap(), TaintSinkType::CodeEval),
-            // ShellExec: exec, system, passthru, shell_exec, popen, proc_open
-            (Regex::new(r"\b(exec|system|passthru|shell_exec|popen|proc_open)\s*\(").unwrap(), TaintSinkType::ShellExec),
-            // SqlQuery: mysqli_query, ->query
-            (Regex::new(r"(mysqli_query\s*\(|->query\s*\()").unwrap(), TaintSinkType::SqlQuery),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M9): sources + sinks regex banks
+        // deleted; AST detection canonical. Sanitizers RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: intval, floatval, (int), (float)
             (Regex::new(r"(\b(intval|floatval)\s*\(|\(int\)|\(float\))").unwrap(), SanitizerType::Numeric),
@@ -1014,22 +675,10 @@ lazy_static! {
 lazy_static! {
     /// Lua/Luau taint patterns.
     static ref LUA_PATTERNS: LanguagePatterns = LanguagePatterns {
-        sources: vec![
-            // UserInput: io.read
-            (Regex::new(r"io\.read\s*\(").unwrap(), TaintSourceType::UserInput),
-            // EnvVar: os.getenv
-            (Regex::new(r"os\.getenv\s*\(").unwrap(), TaintSourceType::EnvVar),
-            // FileRead: io.open
-            (Regex::new(r"io\.open\s*\(").unwrap(), TaintSourceType::FileRead),
-        ],
-        sinks: vec![
-            // ShellExec: os.execute
-            (Regex::new(r"os\.execute\s*\(").unwrap(), TaintSinkType::ShellExec),
-            // ShellExec: io.popen
-            (Regex::new(r"io\.popen\s*\(").unwrap(), TaintSinkType::ShellExec),
-            // CodeEval: loadstring, load, dofile, loadfile
-            (Regex::new(r"\b(loadstring|load|dofile|loadfile)\s*\(").unwrap(), TaintSinkType::CodeEval),
-        ],
+        // Wave-2-atomic (regex-removal-v1 M9): sources + sinks regex banks
+        // deleted; AST detection canonical. Sanitizers RETAINED.
+        sources: vec![],
+        sinks: vec![],
         sanitizers: vec![
             // Numeric: tonumber
             (Regex::new(r"\btonumber\s*\(").unwrap(), SanitizerType::Numeric),
@@ -1860,10 +1509,6 @@ pub fn is_orm_safe_pattern(statement: &str) -> bool {
     }
     ORM_SAFE.is_match(statement)
 }
-
-// Aliases for test compatibility (tests use different naming)
-pub use detect_sinks as find_sinks_in_statement;
-pub use detect_sources as find_sources_in_statement;
 
 // =============================================================================
 // AST-Based Detection - Phase 9
@@ -4208,206 +3853,41 @@ pub fn compute_taint(
     statements: &HashMap<u32, String>,
     language: Language,
 ) -> Result<TaintInfo, TldrError> {
-    // Validate CFG
-    validate_cfg(cfg)?;
-
-    let mut result = TaintInfo::new(&cfg.function);
-
-    // Build helper maps
-    let predecessors = build_predecessors(cfg);
-    let successors = build_successors(cfg);
-    let line_to_block = build_line_to_block(cfg);
-    let refs_by_block = build_refs_by_block(refs, &line_to_block);
-
-    // Detect sources and sinks from statements
+    // Wave-2-atomic (regex-removal-v1 M11): legacy entry refactored to
+    // internal-parse-and-delegate. Public signature is preserved; internally,
+    // we reconstruct the source text from the line-keyed `statements` map,
+    // parse it via `tldr_core::ast::parser::parse`, and delegate to
+    // `compute_taint_with_tree` which performs AST-based detection. On parse
+    // failure, we degrade gracefully to an empty `TaintInfo::default()` so
+    // callers that previously got a successful regex-only response receive a
+    // benign empty result instead of an error.
+    //
+    // Rationale: detect_sources / detect_sinks regex banks are deleted for
+    // 13 GO languages in this same commit. The AST detection path (via
+    // detect_sources_ast / detect_sinks_ast inside compute_taint_with_tree)
+    // is the canonical pattern source going forward. Ruby / Elixir / OCaml
+    // banks remain populated as a HOLD until field_access_info-extension-v1.
+    let max_line = statements.keys().copied().max().unwrap_or(0) as usize;
+    let mut lines: Vec<String> = vec![String::new(); max_line];
     for (&line, stmt) in statements {
-        for source in detect_sources(stmt, line, language) {
-            result.sources.push(source);
-        }
-        for sink in detect_sinks(stmt, line, language) {
-            result.sinks.push(sink);
+        if line >= 1 && (line as usize) <= lines.len() {
+            lines[(line - 1) as usize] = stmt.clone();
         }
     }
+    let src = lines.join("\n");
 
-    // Initialize taint sets per block
-    let block_ids: Vec<usize> = cfg.blocks.iter().map(|b| b.id).collect();
-    let mut tainted: HashMap<usize, HashSet<String>> = HashMap::new();
-    for &bid in &block_ids {
-        tainted.insert(bid, HashSet::new());
-    }
-
-    // Initialize all blocks with their respective source variables
-    for source in &result.sources {
-        if let Some(&block_id) = line_to_block.get(&source.line) {
-            tainted
-                .entry(block_id)
-                .or_default()
-                .insert(source.var.clone());
-        }
-    }
-
-    // Worklist iteration
-    // Max iterations bounded by O(blocks * vars) with hard cap to guarantee termination
-    let unique_vars: HashSet<&str> = refs.iter().map(|r| r.name.as_str()).collect();
-    let computed_max = block_ids.len() * unique_vars.len().max(1) + 10;
-    let max_iterations = computed_max.min(MAX_TAINT_ITERATIONS);
-    let mut worklist: VecDeque<usize> = block_ids.iter().cloned().collect();
-    let mut iterations = 0;
-    let mut iteration_limit_reached = false;
-
-    // Build a map of source variables by block for initialization
-    let mut source_vars_by_block: HashMap<usize, HashSet<String>> = HashMap::new();
-    for source in &result.sources {
-        if let Some(&block_id) = line_to_block.get(&source.line) {
-            source_vars_by_block
-                .entry(block_id)
-                .or_default()
-                .insert(source.var.clone());
-        }
-    }
-
-    // Per-line source-var index used by process_block to preserve taint at
-    // source-defining lines under VarRef semantics (v0.3.0 M1a VAL-001a).
-    // See compute_taint_with_tree for the full rationale.
-    let mut sources_by_line: HashMap<u32, HashSet<String>> = HashMap::new();
-    for source in &result.sources {
-        sources_by_line
-            .entry(source.line)
-            .or_default()
-            .insert(source.var.clone());
-    }
-
-    while let Some(block_id) = worklist.pop_front() {
-        if iterations >= max_iterations {
-            iteration_limit_reached = true;
-            break; // Safety bound to prevent infinite loops
-        }
-        iterations += 1;
-
-        // Compute taint_in = union of predecessors' taint_out
-        let mut taint_in: HashSet<String> = predecessors
-            .get(&block_id)
-            .map(|preds| {
-                preds
-                    .iter()
-                    .flat_map(|p| tainted.get(p).cloned().unwrap_or_default())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Add source variables that originate in this block
-        if let Some(source_vars) = source_vars_by_block.get(&block_id) {
-            taint_in.extend(source_vars.clone());
-        }
-
-        // Process block: propagate taint through assignments
-        let taint_out = process_block(
-            block_id,
-            taint_in,
-            &refs_by_block,
+    match crate::ast::parser::parse(&src, language) {
+        Ok(tree) => compute_taint_with_tree(
+            cfg,
+            refs,
             statements,
-            &line_to_block,
-            &sources_by_line,
-            &mut result.sanitized_vars,
+            Some(&tree),
+            Some(src.as_bytes()),
             language,
-        );
-
-        // If changed, add successors to worklist
-        let old_taint = tainted.get(&block_id).cloned().unwrap_or_default();
-        if taint_out != old_taint {
-            tainted.insert(block_id, taint_out);
-            if let Some(succs) = successors.get(&block_id) {
-                for &s in succs {
-                    if !worklist.contains(&s) {
-                        worklist.push_back(s);
-                    }
-                }
-            }
-        }
+            None,
+        ),
+        Err(_) => Ok(TaintInfo::default()),
     }
-
-    if iteration_limit_reached {
-        result.convergence = Some("iteration_limit_reached".to_string());
-    }
-
-    result.tainted_vars = tainted.clone();
-
-    // =========================================================================
-    // Phase 5: Detect vulnerabilities (source -> sink flows)
-    // =========================================================================
-    // For each sink, check if its variable is tainted at that block.
-    // If tainted, find the source(s) that caused it and record the flow.
-
-    for sink in &mut result.sinks {
-        // Get block containing this sink
-        if let Some(&sink_block) = line_to_block.get(&sink.line) {
-            // Check if sink variable is tainted at this point
-            if let Some(tainted_at_block) = tainted.get(&sink_block) {
-                if tainted_at_block.contains(&sink.var) {
-                    sink.tainted = true;
-                }
-            }
-        }
-    }
-
-    // Now create flows for tainted sinks
-    // We need to iterate over sinks again with immutable access to sources
-    let sources_clone = result.sources.clone();
-    let sinks_snapshot: Vec<(String, u32, TaintSinkType, bool, Option<String>)> = result
-        .sinks
-        .iter()
-        .map(|s| {
-            (
-                s.var.clone(),
-                s.line,
-                s.sink_type,
-                s.tainted,
-                s.statement.clone(),
-            )
-        })
-        .collect();
-
-    for (sink_var, sink_line, sink_type, sink_tainted, sink_statement) in sinks_snapshot {
-        if !sink_tainted {
-            continue;
-        }
-
-        // Get block containing this sink
-        if let Some(&sink_block) = line_to_block.get(&sink_line) {
-            // Find which source(s) caused this taint
-            for source in &sources_clone {
-                // Get block containing this source
-                if let Some(&source_block) = line_to_block.get(&source.line) {
-                    // Check if source variable flows to sink variable
-                    if flows_to(&source.var, &sink_var, &tainted, &predecessors, sink_block) {
-                        // Check if the sink variable was sanitized
-                        let is_sanitized = result.sanitized_vars.contains(&sink_var);
-
-                        // Only record if NOT sanitized
-                        if !is_sanitized {
-                            let path = compute_flow_path(source_block, sink_block, &successors);
-
-                            let flow = TaintFlow {
-                                source: source.clone(),
-                                sink: TaintSink {
-                                    var: sink_var.clone(),
-                                    line: sink_line,
-                                    sink_type,
-                                    tainted: true,
-                                    statement: sink_statement.clone(),
-                                },
-                                path,
-                            };
-
-                            result.flows.push(flow);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(result)
 }
 
 /// Process a single block for taint propagation.

@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use tldr_core::security::ast_utils::{assignment_node_kinds, call_node_kinds, string_node_kinds};
 use tldr_core::security::taint::{
     build_line_to_block, build_predecessors, build_successors, compute_taint, detect_sanitizer,
-    detect_sinks, detect_sources, validate_cfg, SanitizerType, TaintInfo, TaintSink, TaintSinkType,
+    detect_sources, validate_cfg, SanitizerType, TaintInfo, TaintSink, TaintSinkType,
     TaintSourceType,
 };
 use tldr_core::security::{
@@ -379,76 +379,6 @@ fn test_taint_info_get_vulnerabilities() {
     assert_eq!(vulns.len(), 1);
     assert_eq!(vulns[0].var, "query");
 }
-
-#[test]
-fn test_detect_sources_python_input() {
-    let sources = detect_sources("user_input = input()", 1, Language::Python);
-
-    assert_eq!(sources.len(), 1);
-    assert_eq!(sources[0].var, "user_input");
-    assert!(matches!(sources[0].source_type, TaintSourceType::UserInput));
-}
-
-#[test]
-fn test_detect_sources_python_request_args() {
-    let sources = detect_sources("user_id = request.args.get('id')", 1, Language::Python);
-
-    assert!(!sources.is_empty());
-    assert!(sources
-        .iter()
-        .any(|s| matches!(s.source_type, TaintSourceType::HttpParam)));
-}
-
-#[test]
-fn test_detect_sources_python_os_environ() {
-    let sources = detect_sources("value = os.environ['SECRET']", 1, Language::Python);
-
-    assert!(!sources.is_empty());
-    assert!(sources
-        .iter()
-        .any(|s| matches!(s.source_type, TaintSourceType::EnvVar)));
-}
-
-#[test]
-fn test_detect_sinks_python_sql_execute() {
-    let sinks = detect_sinks("cursor.execute(query)", 5, Language::Python);
-
-    assert!(!sinks.is_empty());
-    assert!(sinks
-        .iter()
-        .any(|s| matches!(s.sink_type, TaintSinkType::SqlQuery)));
-}
-
-#[test]
-fn test_detect_sinks_python_eval() {
-    let sinks = detect_sinks("result = eval(user_code)", 10, Language::Python);
-
-    assert!(!sinks.is_empty());
-    assert!(sinks
-        .iter()
-        .any(|s| matches!(s.sink_type, TaintSinkType::CodeEval)));
-}
-
-#[test]
-fn test_detect_sinks_python_exec() {
-    let sinks = detect_sinks("exec(dynamic_code)", 10, Language::Python);
-
-    assert!(!sinks.is_empty());
-    assert!(sinks
-        .iter()
-        .any(|s| matches!(s.sink_type, TaintSinkType::CodeExec)));
-}
-
-#[test]
-fn test_detect_sinks_python_subprocess() {
-    let sinks = detect_sinks("subprocess.run(cmd, shell=True)", 15, Language::Python);
-
-    assert!(!sinks.is_empty());
-    assert!(sinks
-        .iter()
-        .any(|s| matches!(s.sink_type, TaintSinkType::ShellExec)));
-}
-
 #[test]
 fn test_detect_sanitizer_python_int() {
     let sanitizer = detect_sanitizer("safe_id = int(user_id)", Language::Python);
@@ -737,28 +667,6 @@ fn test_assignment_node_kinds() {
 // =============================================================================
 // Language-Specific Pattern Tests
 // =============================================================================
-
-#[test]
-fn test_detect_sources_typescript() {
-    // req.body -> HttpBody
-    let sources = detect_sources("const data = req.body", 1, Language::TypeScript);
-    let _ = sources;
-}
-
-#[test]
-fn test_detect_sources_go() {
-    // r.FormValue -> HttpParam
-    let sources = detect_sources("name := r.FormValue(\"name\")", 1, Language::Go);
-    let _ = sources;
-}
-
-#[test]
-fn test_detect_sinks_typescript() {
-    // eval() -> CodeEval
-    let sinks = detect_sinks("eval(userInput)", 1, Language::TypeScript);
-    let _ = sinks;
-}
-
 #[test]
 fn test_detect_sanitizer_typescript() {
     let sanitizer = detect_sanitizer("parseInt(val)", Language::TypeScript);
