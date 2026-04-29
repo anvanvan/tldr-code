@@ -653,6 +653,11 @@ lazy_static! {
             (Regex::new(r"\bres\.(send|redirect|json)\s*\(").unwrap(), TaintSinkType::FileWrite),
             // FileWrite: Response.send / Response.redirect / Response.json (builder form)
             (Regex::new(r"\bResponse\.(send|redirect|json)\s*\(").unwrap(), TaintSinkType::FileWrite),
+            // FileWrite: response.send / .redirect / .json (lowercase Nest builder param convention).
+            // W1-M3 parity-add: AST var-extraction in detect_sinks_ast still reads regex bank to
+            // locate the call argument; without this entry, the AST member_pattern
+            // ("response","send") match would emit no sink. Wave 2 atomic removes this regex.
+            (Regex::new(r"\bresponse\.(send|redirect|json)\s*\(").unwrap(), TaintSinkType::FileWrite),
         ],
         sanitizers: vec![],
     };
@@ -2152,6 +2157,32 @@ static TYPESCRIPT_AST_SINKS: &[AstSinkPattern] = &[
             ("reply", "send"),
             ("reply", "redirect"),
             ("reply", "header"),
+        ],
+        sink_type: TaintSinkType::FileWrite,
+    },
+    // W1-M3: NestJS framework sinks (parity-add for Wave 2 regex deletion).
+    // NestJS controllers expose two response shapes:
+    //   * Express-style `res.send|redirect|json(...)` — historically caught
+    //     ONLY by the NESTJS_PATTERNS regex; not present in the AST bank
+    //     until this milestone.
+    //   * `Response`-builder form (the NestJS docs `@Res() response: Response`
+    //     pattern). Real-world usage capitalizes the type but conventionally
+    //     uses lowercase `response` as the parameter name; we wire BOTH
+    //     receiver casings since member_patterns matches structurally on the
+    //     identifier text. `('Response','redirect')` was already added in
+    //     W1-M1's NextJS block (it doubles as the bare-`Response` App Router
+    //     alias); the remaining methods are added here for completeness.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("res", "send"),
+            ("res", "redirect"),
+            ("res", "json"),
+            ("Response", "send"),
+            ("Response", "json"),
+            ("response", "send"),
+            ("response", "redirect"),
+            ("response", "json"),
         ],
         sink_type: TaintSinkType::FileWrite,
     },

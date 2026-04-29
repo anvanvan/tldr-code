@@ -14,6 +14,8 @@
 //! Milestone scope:
 //! * W1-M1 — NextJS sink AST entries (this file's first 4 tests).
 //! * W1-M2 — Fastify sink AST entries (`reply.send` / `.redirect` / `.header`).
+//! * W1-M3 — NestJS sink AST entries (`res.send|redirect|json` +
+//!   `Response.send|redirect|json` builder forms).
 
 use std::collections::HashMap;
 
@@ -246,6 +248,118 @@ async function setHeader(request, reply) {
     assert!(
         !sink_lines.is_empty(),
         "expected at least one FileWrite sink for reply.header; \
+         got sinks={:?}",
+        result.sinks
+    );
+}
+
+// ---------- W1-M3: NestJS sinks ----------
+
+/// W1-M3 #1 — `res.send(v)` reflects `req.body.v` — reflected XSS via the
+/// Express-style `res` parameter NestJS controllers also expose. Pre-W1-M3:
+/// AST bank lacks `('res','send')` (Express never wired it as a structural
+/// entry); regex bank's `NESTJS_PATTERNS` sink `\bres\.(send|redirect|json)\s*\(`
+/// catches it. Post-W1-M3: matches via `TYPESCRIPT_AST_SINKS` member_pattern.
+#[test]
+fn nestjs_res_send_reflected_via_compute_taint() {
+    let src = "\
+async function handler(req, res) {
+    const v = req.body.v;
+    res.send(v);
+}
+";
+    let result = analyze_with_ssa(src, Language::TypeScript, "handler", /* use_ssa */ false);
+    let sink_lines: Vec<_> = result
+        .sinks
+        .iter()
+        .filter(|s| matches!(s.sink_type, TaintSinkType::FileWrite))
+        .map(|s| s.line)
+        .collect();
+    assert!(
+        !sink_lines.is_empty(),
+        "expected at least one FileWrite sink for res.send; \
+         got sinks={:?}",
+        result.sinks
+    );
+}
+
+/// W1-M3 #2 — `res.redirect(next)` with `next` reflected from `req.query.next`
+/// — open redirect via NestJS Express-style `res`.
+#[test]
+fn nestjs_res_redirect_open_redirect_via_compute_taint() {
+    let src = "\
+async function handler(req, res) {
+    const next = req.query.next;
+    res.redirect(next);
+}
+";
+    let result = analyze_with_ssa(src, Language::TypeScript, "handler", /* use_ssa */ false);
+    let sink_lines: Vec<_> = result
+        .sinks
+        .iter()
+        .filter(|s| matches!(s.sink_type, TaintSinkType::FileWrite))
+        .map(|s| s.line)
+        .collect();
+    assert!(
+        !sink_lines.is_empty(),
+        "expected at least one FileWrite sink for res.redirect; \
+         got sinks={:?}",
+        result.sinks
+    );
+}
+
+/// W1-M3 #3 — NestJS `Response`-builder form: `response.send(v)` where the
+/// parameter is named `response` (capitalized-builder convention noted in the
+/// dispatch contract). The receiver identifier `response` differs from the
+/// Express-style `res`; covered post-W1-M3 by adding `('Response','send')` to
+/// `TYPESCRIPT_AST_SINKS` (matched case-insensitively as a member pattern).
+#[test]
+fn nestjs_response_builder_send_via_compute_taint() {
+    let src = "\
+async function handler(req, response) {
+    const v = req.body.v;
+    response.send(v);
+}
+";
+    let result = analyze_with_ssa(src, Language::TypeScript, "handler", /* use_ssa */ false);
+    let sink_lines: Vec<_> = result
+        .sinks
+        .iter()
+        .filter(|s| matches!(s.sink_type, TaintSinkType::FileWrite))
+        .map(|s| s.line)
+        .collect();
+    assert!(
+        !sink_lines.is_empty(),
+        "expected at least one FileWrite sink for Response.send (builder); \
+         got sinks={:?}",
+        result.sinks
+    );
+}
+
+/// W1-M3 #4 — NestJS `Response`-builder form: `Response.redirect(next)` where
+/// the parameter is named `Response` (capitalized identifier). This is
+/// distinct from `NextResponse.redirect` (W1-M1) — NestJS docs use the
+/// capitalized builder identifier. Post-W1-M3: covered via `('Response',
+/// 'redirect')` in `TYPESCRIPT_AST_SINKS` (already added in W1-M1's NextJS
+/// block; this test exercises that entry through a NestJS-shape fixture).
+#[test]
+fn nestjs_response_builder_redirect_via_compute_taint() {
+    let src = "\
+async function handler(req, Response) {
+    const next = req.query.url;
+    Response.redirect(next);
+}
+";
+    let result = analyze_with_ssa(src, Language::TypeScript, "handler", /* use_ssa */ false);
+    let sink_lines: Vec<_> = result
+        .sinks
+        .iter()
+        .filter(|s| matches!(s.sink_type, TaintSinkType::FileWrite))
+        .map(|s| s.line)
+        .collect();
+    assert!(
+        !sink_lines.is_empty(),
+        "expected at least one FileWrite sink for Response.redirect (builder); \
          got sinks={:?}",
         result.sinks
     );
