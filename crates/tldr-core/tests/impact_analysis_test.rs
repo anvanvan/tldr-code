@@ -466,3 +466,171 @@ fn test_impact_finds_callers_in_pnpm_monorepo() {
         note,
     );
 }
+
+// =============================================================================
+// v031-issue-7: FuncIndex collision + impact.rs ends_with fuzzy match
+// =============================================================================
+
+/// FuncIndex simple_module alias overwrite — primary issue-7 reproducer.
+///
+/// FIXTURE
+///   pkg1/foo.py defines `def process()` → module `pkg1.foo`, simple alias `foo`.
+///   pkg2/foo.py defines `def process()` → module `pkg2.foo`, simple alias `foo`.
+///
+/// ROOT CAUSE
+///   builder_v2 inserts each definition into func_index TWICE:
+///     1) under the canonical full-module key (`pkg1.foo`, `process`)
+///     2) under the simple_module alias key  (`foo`, `process`)
+///   Step (2) is a HashMap::insert with no collision detection, so the
+///   second writer silently overwrites the first under `("foo", "process")`.
+///   The surviving entry depends on rayon's parallel processing order —
+///   non-deterministic across builds.
+///
+/// POST-FIX INVARIANT (locked here)
+///   builder_v2 must NOT silently overwrite the simple_module alias slot
+///   when the existing entry points at a DIFFERENT file. Each definition
+///   stays addressable under its canonical full-module key
+///   (`pkg1.foo`, `process`) and (`pkg2.foo`, `process`); the simple alias
+///   slot is no longer a single-entry race condition that hides one of
+///   the two definitions.
+///
+/// VERIFICATION
+///   After the build, `tldr impact process` (no file filter) must surface
+///   BOTH defining files via either the call-graph edges or the AST
+///   fallback path that impact_analysis_with_ast_fallback exposes. Today,
+///   pre-fix, the simple_module overwrite collapses both edges to a single
+///   dst_file. Post-fix, the canonical full-module entries remain
+///   addressable and the resolver yields edges to BOTH files, so impact
+///   analysis surfaces TWO distinct (dst_file, dst_func) targets.
+#[test]
+fn test_impact_distinguishes_same_name_in_different_modules() {
+    use tldr_core::analysis::impact_analysis_with_ast_fallback;
+    use tldr_core::callgraph::build_project_call_graph;
+    use tldr_core::Language;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    let pkg1 = root.join("pkg1");
+    let pkg2 = root.join("pkg2");
+    std::fs::create_dir_all(&pkg1).unwrap();
+    std::fs::create_dir_all(&pkg2).unwrap();
+
+    std::fs::write(pkg1.join("foo.py"), "def process():\n    return 1\n").unwrap();
+    std::fs::write(pkg2.join("foo.py"), "def process():\n    return 2\n").unwrap();
+
+    let graph = build_project_call_graph(root, Language::Python, None, true)
+        .expect("callgraph build should succeed");
+
+    // Even with no callers (impact_analysis_with_ast_fallback should kick
+    // in via AST search), both pkg1/foo.py and pkg2/foo.py must be
+    // surfaced as distinct targets — the FuncIndex collision must NOT
+    // collapse them into one.
+    let report =
+        impact_analysis_with_ast_fallback(&graph, "process", 3, None, root, Language::Python)
+            .expect("impact_analysis_with_ast_fallback should find process");
+
+    let target_files: std::collections::HashSet<_> = report
+        .targets
+        .values()
+        .map(|t| t.file.to_string_lossy().replace('\\', "/"))
+        .collect();
+
+    assert_eq!(
+        report.total_targets, 2,
+        "expected 2 distinct `process` targets (one per file); got {} — cross-module bleed via FuncIndex overwrite. target_files={:?}",
+        report.total_targets,
+        target_files,
+    );
+
+    assert!(
+        target_files
+            .iter()
+            .any(|f| f.ends_with("pkg1/foo.py") || f.contains("/pkg1/foo.py")),
+        "expected target file pkg1/foo.py; got targets: {:?}",
+        target_files,
+    );
+    assert!(
+        target_files
+            .iter()
+            .any(|f| f.ends_with("pkg2/foo.py") || f.contains("/pkg2/foo.py")),
+        "expected target file pkg2/foo.py; got targets: {:?}",
+        target_files,
+    );
+}
+
+/// Locks the FuncIndex API contract: inserting two entries with DISTINCT
+/// (module, name) keys preserves both lookups (both `pkg1.foo::process`
+/// AND `pkg2.foo::process` resolvable). This is existing-good behavior we
+/// guard against regression of the simple_module aliasing fix accidentally
+/// disabling all aliasing.
+#[test]
+fn test_func_index_preserves_distinct_modules_with_same_simple_name() {
+    use tldr_core::callgraph::{FuncEntry, FuncIndex};
+
+    let mut idx = FuncIndex::new();
+
+    let entry_a = FuncEntry::function(PathBuf::from("pkg1/foo.py"), 1, 2);
+    let entry_b = FuncEntry::function(PathBuf::from("pkg2/foo.py"), 1, 2);
+
+    idx.insert("pkg1.foo", "process", entry_a.clone());
+    idx.insert("pkg2.foo", "process", entry_b.clone());
+
+    let resolved_a = idx
+        .get("pkg1.foo", "process")
+        .expect("pkg1.foo::process must resolve");
+    assert_eq!(
+        resolved_a.file_path,
+        PathBuf::from("pkg1/foo.py"),
+        "pkg1.foo::process must resolve to pkg1/foo.py"
+    );
+
+    let resolved_b = idx
+        .get("pkg2.foo", "process")
+        .expect("pkg2.foo::process must resolve");
+    assert_eq!(
+        resolved_b.file_path,
+        PathBuf::from("pkg2/foo.py"),
+        "pkg2.foo::process must resolve to pkg2/foo.py — overwrite regression"
+    );
+}
+
+/// Guards the impact.rs:54 `ends_with(".target")` fuzzy bug under the
+/// target_file filter. Two functions, `helper` (in `helpers.py`) and
+/// `data_helper` (in `data_helpers.py`). Filtering by target_file
+/// `"helpers.py"` must NOT match `data_helpers.py` (which fuzzy-ends-with
+/// `helpers.py`) — the path filter must respect segment boundaries.
+#[test]
+fn test_impact_file_filter_respects_segment_boundary() {
+    let mut graph = ProjectCallGraph::new();
+
+    graph.add_edge(CallEdge {
+        src_file: PathBuf::from("app.py"),
+        src_func: "main".to_string(),
+        dst_file: PathBuf::from("helpers.py"),
+        dst_func: "helper".to_string(),
+    });
+
+    graph.add_edge(CallEdge {
+        src_file: PathBuf::from("data_app.py"),
+        src_func: "main_d".to_string(),
+        dst_file: PathBuf::from("data_helpers.py"),
+        dst_func: "helper".to_string(),
+    });
+
+    let report = impact_analysis(&graph, "helper", 3, Some(&PathBuf::from("helpers.py")))
+        .expect("filter by helpers.py should find helper in helpers.py");
+
+    assert_eq!(
+        report.total_targets, 1,
+        "filter `helpers.py` must resolve to exactly 1 target (helpers.py only — data_helpers.py is a segment-boundary false positive)"
+    );
+
+    let tree = report.targets.values().next().unwrap();
+    let file_str = tree.file.to_string_lossy().replace('\\', "/");
+    assert_eq!(
+        file_str, "helpers.py",
+        "filter must select helpers.py exactly, not data_helpers.py; got {}",
+        file_str,
+    );
+}

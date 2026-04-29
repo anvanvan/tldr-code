@@ -160,8 +160,21 @@ pub fn build_indices_parallel(
             // BUG FIX 2: Index BOTH simple AND full module name (CROSSFILE_SPEC.md Section 2.2)
             // When resolving `from core import my_function`, we need to find it under both
             // "pkg.core" (full path) and "core" (simple name). Previously only full path was indexed.
+            //
+            // v031-issue-7: simple_module aliasing must NOT silently overwrite an existing
+            // entry pointing at a different file. When two distinct modules share the same
+            // simple_module suffix (e.g., `pkg1.foo` and `pkg2.foo`), `HashMap::insert`
+            // would let the second writer clobber the first under `(simple_module, name)` —
+            // closing the only path by which the losing file's definition could be looked
+            // up via PYTHONPATH-style `from <simple> import <name>`. Suppress the alias
+            // insert when collision detected (first-writer-wins, deterministic).
             let simple_module = module.split('.').next_back().unwrap_or(&module);
-            if simple_module != module {
+            if simple_module != module
+                && func_index
+                    .get(simple_module, &func.name)
+                    .map(|e| e.file_path == relative_path)
+                    .unwrap_or(true)
+            {
                 func_index.insert(simple_module, &func.name, entry);
             }
 
@@ -175,8 +188,13 @@ pub fn build_indices_parallel(
                     class_name.clone(),
                 );
                 func_index.insert(&module, &qualified, method_entry.clone());
-                // Also index method under simple module name
-                if simple_module != module {
+                // v031-issue-7: same first-writer-wins guard for the qualified alias.
+                if simple_module != module
+                    && func_index
+                        .get(simple_module, &qualified)
+                        .map(|e| e.file_path == relative_path)
+                        .unwrap_or(true)
+                {
                     func_index.insert(simple_module, &qualified, method_entry);
                 }
             }
@@ -686,6 +704,10 @@ pub fn build_project_call_graph_v2(
             // BUG FIX 2: Index BOTH simple AND full module name (CROSSFILE_SPEC.md Section 2.2)
             // Only for Python-style dot-separated modules (e.g., "pkg.helper" -> also index as "helper")
             // TS/JS use ./ prefix (not dot-separated), Go uses /, Rust uses ::
+            //
+            // v031-issue-7: see build_indices_parallel above — first-writer-wins on the
+            // simple_module alias slot prevents silent overwrite when two distinct
+            // modules share the same suffix (`pkg1.foo` vs `pkg2.foo`).
             let is_python_style = !module.starts_with("./")
                 && !module.starts_with("crate::")
                 && !module.contains('/');
@@ -694,7 +716,13 @@ pub fn build_project_call_graph_v2(
             } else {
                 &module // No simple alias for non-Python languages
             };
-            if is_python_style && simple_module != module.as_str() {
+            if is_python_style
+                && simple_module != module.as_str()
+                && func_index
+                    .get(simple_module, &func.name)
+                    .map(|e| e.file_path == *file_path)
+                    .unwrap_or(true)
+            {
                 func_index.insert(simple_module, &func.name, entry);
             }
 
@@ -708,8 +736,14 @@ pub fn build_project_call_graph_v2(
                     class_name.clone(),
                 );
                 func_index.insert(&module, &qualified, method_entry.clone());
-                // Also index method under simple module name (Python only)
-                if is_python_style && simple_module != module.as_str() {
+                // v031-issue-7: same first-writer-wins guard for the qualified alias.
+                if is_python_style
+                    && simple_module != module.as_str()
+                    && func_index
+                        .get(simple_module, &qualified)
+                        .map(|e| e.file_path == *file_path)
+                        .unwrap_or(true)
+                {
                     func_index.insert(simple_module, &qualified, method_entry);
                 }
             }

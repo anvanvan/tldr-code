@@ -25,6 +25,30 @@ use crate::fs::tree::{collect_files, get_file_tree};
 use crate::types::{CallerTree, ImpactReport, ProjectCallGraph, WorkspaceConfig};
 use crate::{Language, TldrResult};
 
+/// Strict last-segment compare for qualified function names.
+///
+/// Splits on `.` and `::` separators and returns the trailing segment
+/// (e.g. `"Class.method"` -> `"method"`, `"a::b::c"` -> `"c"`,
+/// `"plain"` -> `"plain"`). This anchors the qualified-name match in
+/// `impact_analysis` to a real segment boundary, replacing the
+/// historic `ends_with(&format!(".{}", target_func))` form which would
+/// match across non-separator boundaries in pathological cases.
+fn last_segment(qualified: &str) -> &str {
+    // Prefer the deepest separator that actually appears.
+    let dot_idx = qualified.rfind('.');
+    let coloncolon_idx = qualified.rfind("::").map(|i| i + 1); // position of last ':'
+    let cut = match (dot_idx, coloncolon_idx) {
+        (Some(d), Some(c)) => Some(d.max(c)),
+        (Some(d), None) => Some(d),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
+    match cut {
+        Some(i) if i < qualified.len() => &qualified[i + 1..],
+        _ => qualified,
+    }
+}
+
 /// Analyze impact of changing a function.
 ///
 /// # Arguments
@@ -50,8 +74,11 @@ pub fn impact_analysis(
     let mut found_any = false;
 
     for edge in call_graph.edges() {
-        // Check if this edge points to our target function
-        if edge.dst_func == target_func || edge.dst_func.ends_with(&format!(".{}", target_func)) {
+        // v031-issue-7: replace the legacy `dst_func.ends_with(&format!(".{}", target_func))`
+        // with a strict last-segment compare anchored on `.` / `::` separators. The
+        // legacy form happens to be equivalent for most inputs but the explicit segment
+        // compare avoids any future regression where a non-separator suffix sneaks in.
+        if edge.dst_func == target_func || last_segment(&edge.dst_func) == target_func {
             // Apply file filter if provided
             if let Some(filter) = target_file {
                 if !edge.dst_file.ends_with(filter) && edge.dst_file != filter {
@@ -72,8 +99,7 @@ pub fn impact_analysis(
     if !found_any {
         // Look for the function as a source in any edge
         for edge in call_graph.edges() {
-            if edge.src_func == target_func || edge.src_func.ends_with(&format!(".{}", target_func))
-            {
+            if edge.src_func == target_func || last_segment(&edge.src_func) == target_func {
                 if let Some(filter) = target_file {
                     if !edge.src_file.ends_with(filter) && edge.src_file != filter {
                         continue;
@@ -133,7 +159,55 @@ pub fn impact_analysis_with_ast_fallback(
 ) -> TldrResult<ImpactReport> {
     // Try normal call-graph-based analysis first
     match impact_analysis(call_graph, target_func, max_depth, target_file) {
-        Ok(report) => Ok(report),
+        Ok(mut report) => {
+            // v031-issue-7: enrich the call-graph report with AST-discovered
+            // definitions whose dst_file is NOT already represented as a
+            // target. When two distinct files define the same simple-named
+            // function and the FuncIndex simple_module alias collapsed both
+            // resolved-edges' dst_file onto a single survivor, the call
+            // graph alone reports a single target — the second defining
+            // file is invisible. Augment with AST scan so impact analysis
+            // surfaces ALL real definitions of `target_func`.
+            if let Some(locations) =
+                find_function_in_ast(project_root, target_func, target_file, language)
+            {
+                // Compare via canonicalized paths so AST-discovered absolute
+                // paths and call-graph relative paths reconcile correctly.
+                fn normalize(p: &Path, root: &Path) -> PathBuf {
+                    p.canonicalize()
+                        .or_else(|_| root.join(p).canonicalize())
+                        .unwrap_or_else(|_| p.to_path_buf())
+                }
+                let known_files: std::collections::HashSet<PathBuf> = report
+                    .targets
+                    .values()
+                    .map(|t| normalize(&t.file, project_root))
+                    .collect();
+                for (func_name, func_file) in &locations {
+                    // Match by canonical file path; AST may emit qualified
+                    // names (Class.method) — only enrich for definitions
+                    // whose file is not already a target.
+                    if known_files.contains(&normalize(func_file, project_root)) {
+                        continue;
+                    }
+                    let key = format!("{}:{}", func_file.display(), func_name);
+                    report.targets.entry(key).or_insert_with(|| CallerTree {
+                        function: func_name.clone(),
+                        file: func_file.clone(),
+                        caller_count: 0,
+                        callers: vec![],
+                        truncated: false,
+                        note: Some(
+                            "Defined in this file but no resolved callers in call graph (FuncIndex alias collision suppressed cross-file resolution)".to_string(),
+                        ),
+                        confidence: None,
+                        receiver_type: None,
+                    });
+                }
+                report.total_targets = report.targets.len();
+            }
+            Ok(report)
+        }
         Err(TldrError::FunctionNotFound {
             name,
             file,
