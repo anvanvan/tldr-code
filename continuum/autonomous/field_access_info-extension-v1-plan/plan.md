@@ -18,10 +18,10 @@ Investigation reveals this is **NOT actually the gap**, because:
 
 1. `extract_call_name` (`ast_utils.rs:617`) already returns the dotted form `"IO.popen"` / `"System.cmd"` / `"Sys.command"` for Ruby/Elixir/OCaml call nodes (verified at `ast_utils.rs:707-728`, `:789-795`, `:797-801`).
 2. `member_patterns_match` (`taint.rs:2948`) already has a **W2-pre call-shape path** at `taint.rs:2989-3009` that splits dotted call names on `rfind('.')` to reconstruct `(receiver, field)` tuples and matches them against `member_patterns`. This is the same path that closes the gap for Java `request.getParameter`, TypeScript framework calls, etc.
-3. The 18-19 retain entries in `RUBY_AST_*` / `ELIXIR_AST_*` / `OCAML_AST_*` use the **raw-substring fallback shape** `("", "IO.popen")` (empty receiver) instead of the **structured shape** `("IO", "popen")`. The W2-pre call-shape path explicitly skips entries with empty receiver (`taint.rs:2996-2998`).
+3. The **19 retain entries** in `RUBY_AST_*` / `ELIXIR_AST_*` / `OCAML_AST_*` (6 + 7 + 6, source-verified at HEAD 8099a5d — see §1 table) use the **raw-substring fallback shape** `("", "IO.popen")` (empty receiver) instead of the **structured shape** `("IO", "popen")`. The W2-pre call-shape path explicitly skips entries with empty receiver (`taint.rs:2996-2998`).
 4. Therefore: the missing piece is **NOT a new helper or `field_access_info` extension** — it is a **mechanical rewrite of those AST-pattern entries from raw-substring shape to structured shape**.
 
-**Implication for scope:** This milestone is significantly smaller than originally framed. The work is: (a) rewrite ~18-19 AST-pattern tuples; (b) write integration tests proving structural matching works; (c) delete the regex-bank parity backups in `RUBY_PATTERNS` / `ELIXIR_PATTERNS` / `OCAML_PATTERNS` once integration tests are GREEN.
+**Implication for scope:** This milestone is significantly smaller than originally framed. The work is: (a) rewrite 19 AST-pattern tuples; (b) write integration tests proving structural matching works; (c) delete the regex-bank parity backups in `RUBY_PATTERNS` / `ELIXIR_PATTERNS` / `OCAML_PATTERNS` once integration tests are GREEN.
 
 **`field_access_info` itself remains untouched.** Its docstring at `ast_utils.rs:520-532` correctly documents that Module-call shapes are NOT field-access nodes; they are call nodes, and the call-shape path in `member_patterns_match` is the canonical handler for them.
 
@@ -51,10 +51,15 @@ ALL must be GREEN against the post-milestone `taint.rs` (regex banks deleted, st
 |----------|----------|--------|----------------------|---------------------|
 | Ruby     | EXTEND-AST + DELETE-REGEX | Rewrite 6 raw-substring `("", "X.y")` entries to structured `("X", "y")` shape; delete `RUBY_PATTERNS` source+sink Vec entries | RUBY_AST_SOURCES (3 STDIN + 2 File), RUBY_AST_SINKS (1 IO.popen) | RUBY_PATTERNS sources (5) + sinks (4) deletable; sanitizers (2) RETAINED |
 | Elixir   | EXTEND-AST + DELETE-REGEX | Rewrite 6-7 raw-substring entries to structured shape | ELIXIR_AST_SOURCES (IO.gets + System.get_env + 2× File), ELIXIR_AST_SINKS (System.cmd + Code.eval_string + Ecto.Adapters.SQL.query) | ELIXIR_PATTERNS sources (3) + sinks (3) deletable; sanitizers (2) RETAINED |
-| OCaml    | EXTEND-AST + DELETE-REGEX | Rewrite 5 raw-substring entries to structured shape | OCAML_AST_SOURCES (Sys.getenv + 2× In_channel), OCAML_AST_SINKS (Sys.command + Unix.execvp + Sqlite3.exec) | OCAML_PATTERNS sources (4) + sinks (3) deletable; sanitizers (1) RETAINED |
+| OCaml    | EXTEND-AST + DELETE-REGEX | Rewrite 6 raw-substring entries to structured shape (3 sources + 3 sinks) | OCAML_AST_SOURCES (Sys.getenv + In_channel.read_all + In_channel.input_all = 3), OCAML_AST_SINKS (Sys.command + Unix.execvp + Sqlite3.exec = 3) | OCAML_PATTERNS sources (4) + sinks (3) deletable; sanitizers (1) RETAINED |
 | ALL      | RETAIN sanitizer regex | unchanged from regex-removal-v1 W3 T1 | n/a | All 16 sanitizer banks RETAINED |
 
-**Total AST-pattern entries migrated:** 18 (6 Ruby + 7 Elixir + 5 OCaml) — matches the "19" in the original framing modulo a +1/-1 rounding around how `Ecto.Adapters.SQL.query` is counted (one entry but two dots).
+**Total AST-pattern entries migrated:** **19** (6 Ruby + 7 Elixir + 6 OCaml). Source-verified at HEAD `8099a5d` via the discriminative premortem (`reports/premortem.json`):
+- Ruby = 5 sources (STDIN.read, STDIN.gets, STDIN.readline, File.read, File.open) + 1 sink (IO.popen) = **6**
+- Elixir = 4 sources (IO.gets, System.get_env, File.read, File.read!) + 3 sinks (System.cmd, Code.eval_string, Ecto.Adapters.SQL.query) = **7**
+- OCaml = 3 sources (Sys.getenv, In_channel.read_all, In_channel.input_all) + 3 sinks (Sys.command, Unix.execvp, Sqlite3.exec) = **6**
+
+The earlier draft of this section said "18 (6 + 7 + 5)" — that undercounted OCaml by one. M4 itemization (§2 below) was already correct at 6 entries; only this summary and the dispatch-contract `investigation_findings.exact_retain_entry_count` were stale. Amended to 19 for paper-trail integrity.
 
 **Two AST-pattern entries that STAY raw-substring** (NOT Module.function-shaped, so structured rewrite does not apply):
 - Ruby `("", "params[")` — subscript expression, not a call
@@ -88,26 +93,70 @@ After regex-removal-v1, the 3 HOLD languages were the only remaining `LanguagePa
 
 ```mermaid
 graph TD
-  M1[M1: Investigate + author RED tests] --> M2
-  M2[M2: Rewrite Ruby AST patterns] --> M5
-  M3[M3: Rewrite Elixir AST patterns] --> M5
+  M1[M1: Investigate + author RED tests + AST-only harness] --> M2
+  M2[M2: Rewrite Ruby AST patterns] --> M3
+  M3[M3: Rewrite Elixir AST patterns] --> M4
   M4[M4: Rewrite OCaml AST patterns] --> M5
-  M5[M5: Delete regex banks for 3 langs + flip dispatch] --> M6
+  M5[M5: Delete regex banks + raw-fallback dups + 6 obsolete tests] --> M6
   M6[M6: CHANGELOG entry + local tag]
 ```
 
-M2/M3/M4 are independent and can be parallelised; the ATOMIC commit is M5 alone (deletion of regex banks). The structured-shape rewrites in M2/M3/M4 are individually safe because dispatch stays additive (regex still active until M5).
+**SERIALIZED: M2 → M3 → M4 (NOT parallel).** All three milestones edit the same file (`crates/tldr-core/src/security/taint.rs`) at non-overlapping but adjacent line ranges (RUBY_AST_* L2298+, ELIXIR_AST_* L2726+, OCAML_AST_* L2779+). Naive parallelisation would race on the same file. Each is +15-21 LOC; serial execution adds <5 minutes total. The ATOMIC commit is M5 alone (deletion of regex banks + raw-fallback duplicates + 6 obsolete unit tests). The structured-shape rewrites in M2/M3/M4 are individually safe because dispatch stays additive (regex still active until M5).
 
-### M1: Investigate + author RED integration tests
+**Earlier draft note:** The pre-amendment plan said M2/M3/M4 "can be parallelised". The premortem flagged this as misleading because all three edit the same file. Amended to serial; see dispatch-contract `validator_mandates.m2_m3_m4_serial`.
+
+### M1: Investigate + author RED integration tests + AST-only harness
 
 - **Pre-investigation already done in this plan** (see §3, §4). Sub-tasks remaining for an executor:
-  - Author `crates/tldr-core/tests/rr_module_function_integ_test.rs` covering all 18 retain entries (see §4 for fixtures).
+  - Author `crates/tldr-core/tests/rr_module_function_integ_test.rs` covering all 19 retain entries (see §4 for fixtures).
   - Augment `rr_baseline_per_language_test.rs` with explicit Ruby/Elixir/OCaml Module.function cases (one per language minimum).
-- **RED criterion**: With current HEAD (`a0b422b`), tests using regex-bank-deleted dispatch (i.e., simulated by temporarily forcing `get_patterns(Ruby).sources = vec![]` in a doctest harness) FAIL because raw-substring fallback in `member_patterns_match` matches the descendant text, but the descendant_text passed in is the literal-call substring like `IO.popen(`. Verify the existing fallback DOES fire today — if it already passes, then M1 RED is satisfied differently: tests fire only against the *structured* match path, with the raw-substring entries scrubbed and the regex banks deleted.
+  - **NEW (per premortem amendment A3):** scaffold the **AST-only-mode simulation harness** as a first-class M1 artifact (described below).
+
+#### M1 RED-first harness (Option A — transient bank-empty)
+
+The premortem (E3) flagged that with regex banks still active at HEAD, the 24 new fixtures will likely PASS via the regex bank without M2/M3/M4 having shipped — defeating TDD. Resolution: M1 ships a **transient-bank-empty harness** that mirrors the proven W2-pre "AST-only mode simulation" (see `continuum/autonomous/regex-removal-v1-plan/reports/W2-pre-report.json` line 45 — 34/34 tests passed under AST-only dispatch confirming Wave-2-atomic safety).
+
+**Harness shape** (in `rr_module_function_integ_test.rs`):
+
+```rust
+/// Regular dispatch — exercises both AST and regex banks.
+fn analyze(src: &str, lang: Language, fn_name: &str) -> TaintInfo {
+    // mirrors val002_member_access_structural_test.rs::analyze
+    compute_taint_with_tree(src, lang, fn_name, /* default patterns */)
+}
+
+/// AST-only dispatch — clones the LanguagePatterns for `lang`, forces
+/// `.sources = vec![]` and `.sinks = vec![]` (sanitizers retained), then
+/// runs compute_taint_with_tree against the modified bank. This isolates
+/// the AST-side member_patterns path so a fixture only passes if the
+/// structured shape matches.
+fn analyze_ast_only(src: &str, lang: Language, fn_name: &str) -> TaintInfo {
+    let mut patterns = get_patterns(lang).clone();
+    patterns.sources.clear();
+    patterns.sinks.clear();
+    compute_taint_with_tree_with_patterns(src, lang, fn_name, patterns)
+}
+```
+
+If `compute_taint_with_tree_with_patterns` does not exist as a public seam, M1 adds it as a `pub(crate)` test-only constructor that takes an explicit `LanguagePatterns` instead of going through `get_patterns(lang)`. This is **+~25 LOC** in the test helper plus a small visibility tweak — no behavior change to the production dispatch path.
+
+**Each of the 19 Module.function fixtures asserts both paths:**
+
+| Path | Pre-M2/M3/M4 (HEAD 8099a5d) | Post-M5 |
+|------|------------------------------|---------|
+| `analyze(...)` | PASSES — regex bank still catches it | PASSES — structured AST entry catches it |
+| `analyze_ast_only(...)` | **FAILS** — raw-substring entries skipped on structural+call-shape paths; regex bank bypassed (RED gate) | PASSES — structured AST entry catches it |
+
+The `analyze_ast_only` path is the **discriminative RED gate** for M2/M3/M4: when each language's structured rewrite lands, the corresponding 6/7/6 fixtures transition from FAIL→PASS under `analyze_ast_only`. After M5 deletes the regex banks, the regular `analyze` path collapses to the same behavior as `analyze_ast_only` — the deletion is safe because the AST-only path already covers all 19 fixtures.
+
 - **Risk**: The structured-shape rewrite must NOT regress the existing raw-substring fallback path. Concretely: if an `("IO", "popen")` structured entry is added but the raw-fallback `("", "IO.popen")` entry is NOT removed in the same commit, both paths can match the same descendant — that is harmless (idempotent), but produces no behavior change. If the raw-fallback entry IS removed but the structured entry is wrong (e.g., grammar quirk), the test goes RED. M2/M3/M4 below mitigate by keeping raw-fallback alongside structured during parity, then M5 atomically removes both raw-fallback duplicates AND regex banks.
-- **Atomic**: standalone commit OK (test-only, no source change in this milestone)
-- **LOC**: ~80-120 (depending on fixture density)
-- **STOP threshold**: tests compile; tests against post-M5 simulation pass
+- **Atomic**: standalone commit OK (test-only, no source change to taint.rs in this milestone; only the test helper + a `pub(crate)` seam if needed)
+- **LOC**: ~120-145 (24 fixtures + harness helper + per-language baseline + regression guards)
+- **STOP threshold (amended per A3)**:
+  - All 24 tests compile
+  - Each of the 19 Module.function fixtures asserts under BOTH `analyze` AND `analyze_ast_only`
+  - At HEAD pre-M2/M3/M4: `analyze` PASSES for all 19 (regex bank covers); `analyze_ast_only` FAILS for all 19 (RED gate confirmed)
+  - 3 string-literal regression guards + 3 per-language baselines PASS under `analyze` at HEAD
 - **Depends**: none
 
 ### M2: Rewrite Ruby AST patterns to structured shape
@@ -126,7 +175,7 @@ M2/M3/M4 are independent and can be parallelised; the ATOMIC commit is M5 alone 
 - **Update partial-coverage comment** at L2293-2297 to document that Module.function shapes are now structurally matched via the W2-pre call-shape path.
 - **LOC**: ~12 lines changed, ~6 lines added (3 rewrites in sources + 1 in sinks); comment update ~6 lines
 - **Atomic**: standalone commit OK (additive, regex still active)
-- **STOP threshold**: cargo check passes; M1 Ruby tests transition RED→GREEN against structured path; existing val002/val003/taint_tests.rs remain GREEN
+- **STOP threshold**: cargo check passes; the 6 Ruby M1 fixtures transition RED→GREEN under `analyze_ast_only` harness (regex bank still active for `analyze`); existing val002/val003/taint_tests.rs remain GREEN
 - **Depends**: M1 (RED tests must exist)
 
 ### M3: Rewrite Elixir AST patterns to structured shape
@@ -145,8 +194,8 @@ M2/M3/M4 are independent and can be parallelised; the ATOMIC commit is M5 alone 
 - **Risk**: Elixir tree-sitter `call` node target field — verify it produces `"Ecto.Adapters.SQL.query"` for the deeply-nested case. See §3 Elixir risk register.
 - **LOC**: ~14 changed, ~7 added
 - **Atomic**: standalone commit OK
-- **STOP threshold**: cargo check passes; M1 Elixir tests transition RED→GREEN
-- **Depends**: M1
+- **STOP threshold**: cargo check passes; the 7 Elixir M1 fixtures transition RED→GREEN under `analyze_ast_only` harness
+- **Depends**: M2 (serialized — both edit `taint.rs`)
 
 ### M4: Rewrite OCaml AST patterns to structured shape
 
@@ -163,10 +212,10 @@ M2/M3/M4 are independent and can be parallelised; the ATOMIC commit is M5 alone 
 - **Risk**: OCaml `application_expression` — verify `extract_call_name_ocaml` returns the dotted module path for `Sys.command(x)`. The OCaml grammar wraps qualified calls in a `value_path` node containing `module_path` + `value_name`. See §3 OCaml risk register.
 - **LOC**: ~10 changed, ~5 added
 - **Atomic**: standalone commit OK
-- **STOP threshold**: cargo check passes; M1 OCaml tests transition RED→GREEN
-- **Depends**: M1
+- **STOP threshold**: cargo check passes; the 5 OCaml M1 fixtures (covering 6 OCaml structured entries — 3 sources + 3 sinks) transition RED→GREEN under `analyze_ast_only` harness
+- **Depends**: M3 (serialized — all of M2/M3/M4 edit `taint.rs`)
 
-### M5: Delete regex banks + raw-fallback duplicates (ATOMIC)
+### M5: Delete regex banks + raw-fallback duplicates + 6 obsolete unit tests (ATOMIC)
 
 - **GREEN files**: `crates/tldr-core/src/security/taint.rs`
   - **Delete** source+sink Vec entries from `RUBY_PATTERNS` (L564-585) — KEEP sanitizer entries:
@@ -184,12 +233,30 @@ M2/M3/M4 are independent and can be parallelised; the ATOMIC commit is M5 alone 
     - OCAML_AST_SINKS: remove `("", "Sys.command")`, `("", "Unix.execvp")`, `("", "Sqlite3.exec")`
   - **KEEP**: `("", "params[")`, `("", "ENV[")` in RUBY_AST_SOURCES (subscripts, NOT Module.function-shaped).
 - **Update** dispatch comment at `taint.rs:3869` ("regex banks remain populated as a HOLD until field_access_info-extension-v1") to remove the HOLD reference.
-- **LOC**: -50 to -65 (delete 9 Ruby + 6 Elixir + 7 OCaml regex entries + matching raw-fallback duplicates + a few comment lines)
-- **Atomic-commit YES**: deletion of regex banks must coincide with raw-fallback duplicate removal so dispatch stays consistent. Without atomicity, any descendant text that slipped through structured matching could regress (raw-fallback handled it before, regex bank handled it before — both gone now, structured matching MUST cover it).
-- **STOP threshold**:
+#### M5 obsolete-test cleanup (amended per premortem A1)
+
+The premortem flagged that M5 was originally scoped to delete only 3 obsolete unit tests (the `detect_sinks` ones for Ruby/Elixir/OCaml). However, **6 tests** become obsolete after M5's regex-bank Vec-emptying because all 6 call `detect_sources()` / `detect_sinks()` which iterate `patterns.sources` / `patterns.sinks` — the very Vecs M5 empties. Without all 6 deletions, `cargo test --workspace` fails deterministically at the M5 verification gate.
+
+**6 obsolete tests to delete from `crates/tldr-core/src/security/taint_tests.rs`** (line numbers verified at HEAD `8099a5d`/`d1c0ecf`):
+
+| # | Test | File:Line | Why obsolete |
+|---|------|-----------|--------------|
+| 1 | `test_ruby_detect_sources` | `crates/tldr-core/src/security/taint_tests.rs:1123` | calls `detect_sources()` → iterates `RUBY_PATTERNS.sources`; M5 empties that Vec; `assert!(!sources.is_empty())` fails |
+| 2 | `test_ruby_detect_sinks` | `crates/tldr-core/src/security/taint_tests.rs:1196` | analogous; `RUBY_PATTERNS.sinks` emptied |
+| 3 | `test_elixir_detect_sources` | `crates/tldr-core/src/security/taint_tests.rs:1432` | analogous; `ELIXIR_PATTERNS.sources` emptied |
+| 4 | `test_elixir_detect_sinks` | `crates/tldr-core/src/security/taint_tests.rs:1477` | analogous; `ELIXIR_PATTERNS.sinks` emptied |
+| 5 | `test_ocaml_detect_sources` | `crates/tldr-core/src/security/taint_tests.rs:1536` | analogous; `OCAML_PATTERNS.sources` emptied |
+| 6 | `test_ocaml_detect_sinks` | `crates/tldr-core/src/security/taint_tests.rs:1595` | analogous; `OCAML_PATTERNS.sinks` emptied |
+
+**KEEP** the sanitizer-touching tests at L1253 (Ruby), L1518 (Elixir), L1638 (OCaml) — sanitizer banks are RETAINED per W3 T1 carry-forward. Test count after M5: existing taint_tests.rs minus these 6 + the M1 integration suite still GREEN.
+
+- **LOC**: ~ -215 (delete 9 Ruby + 6 Elixir + 7 OCaml regex entries + 19 raw-fallback duplicates + 6 unit tests at ~30 LOC avg + a few comment lines).
+- **Atomic-commit YES**: deletion of regex banks must coincide with raw-fallback duplicate removal AND the 6-test cleanup so dispatch stays consistent. Without atomicity, any descendant text that slipped through structured matching could regress, and `cargo test` would fail mid-rebase.
+- **STOP threshold (amended per A1)**:
+  - **All 6 obsolete unit tests deleted** (test_ruby_detect_sources, test_ruby_detect_sinks, test_elixir_detect_sources, test_elixir_detect_sinks, test_ocaml_detect_sources, test_ocaml_detect_sinks). 6-test cleanup is GATING.
   - cargo check passes
   - cargo clippy --all-targets --workspace -- -D warnings PASS (no dead_code from unused regex variants, no unused imports)
-  - cargo test --workspace PASS — all M1 integration tests + val001a + val001b + val002 + val003 + remaining taint_tests.rs (Ruby/Elixir/OCaml `detect_sinks` unit tests, which were KEPT in regex-removal-v1 W2-M10 per `release_constraints.ruby_elixir_ocaml_retained` — these MUST be deleted in M5 too because the regex bank is gone)
+  - cargo test --workspace PASS — all M1 integration tests (under both `analyze` and `analyze_ast_only` harnesses) + val001a + val001b + val002 + val003 + remaining taint_tests.rs minus the 6 deleted tests
   - tldr taint smoke test on canonical Ruby/Elixir/OCaml tainted fixtures: ≥1 source, ≥1 sink, ≥1 flow; on string-literal `"IO.popen"` substring: 0 sources/sinks (regression guard for closes-#24 generalised to 3 langs)
 - **Depends**: M2, M3, M4
 
@@ -404,7 +471,7 @@ The migration from `("", "X.y")` to `("X", "y")` simply causes the entries to by
   for Java/TS/Go) now handles `Module.function(...)` calls in these three
   languages via `(receiver, field)` tuple match instead of raw-substring
   fallback.
-- 18 AST-pattern entries in `RUBY_AST_*` / `ELIXIR_AST_*` / `OCAML_AST_*`
+- 19 AST-pattern entries in `RUBY_AST_*` (6) / `ELIXIR_AST_*` (7) / `OCAML_AST_*` (6)
   migrated from raw-substring shape `("", "Module.fn")` to structured shape
   `("Module", "fn")`.
 
@@ -415,8 +482,10 @@ The migration from `("", "X.y")` to `("X", "y")` simply causes the entries to by
   RETAINED.
 - `OCAML_PATTERNS` source+sink Vec entries (4 sources, 3 sinks) — sanitizers
   RETAINED.
-- `taint_tests.rs` regex `detect_sinks` unit tests for Ruby, Elixir, OCaml
-  (kept in regex-removal-v1 W2-M10; now obsolete).
+- `taint_tests.rs` regex `detect_sources` AND `detect_sinks` unit tests for
+  Ruby, Elixir, OCaml — 6 tests total at L1123/1196/1432/1477/1536/1595
+  (kept in regex-removal-v1 W2-M10; now obsolete because their backing
+  patterns.sources/sinks Vecs are emptied for these 3 languages).
 
 ### Retained
 - All 16 sanitizer regex banks (deferred to `sanitizer-removal-v1`).
@@ -469,9 +538,9 @@ The "post-milestone cleanup" mentioned in the prompt's framing is **integrated i
 | `crates/tldr-core/src/security/taint.rs` | `RUBY_AST_SOURCES`/`SINKS` raw-fallback dups | 2298-2350 | 6 raw-fallback `("", "X.y")` tuples superseded by structured rewrites |
 | `crates/tldr-core/src/security/taint.rs` | `ELIXIR_AST_SOURCES`/`SINKS` raw-fallback dups | 2726-2760 | 7 raw-fallback `("", "X.y")` tuples superseded |
 | `crates/tldr-core/src/security/taint.rs` | `OCAML_AST_SOURCES`/`SINKS` raw-fallback dups | 2779-2818 | 5 raw-fallback `("", "X.y")` tuples superseded |
-| `crates/tldr-core/src/security/taint_tests.rs` | Ruby/Elixir/OCaml `detect_sinks` regex unit tests | (TBD by executor) | 3 tests |
+| `crates/tldr-core/src/security/taint_tests.rs` | Ruby/Elixir/OCaml `detect_sources` + `detect_sinks` regex unit tests | L1123, L1196, L1432, L1477, L1536, L1595 | **6 tests** (3 detect_sources + 3 detect_sinks; verified at HEAD 8099a5d) |
 
-**Total deletable: 22 regex Vec entries + 18 raw-fallback AST entries + 3 unit tests** ≈ -50 to -65 LOC. (The "19" in the prompt's framing falls within this band; the exact number depends on whether subscripts are counted and how multi-fn regex patterns expand.)
+**Total deletable: 22 regex Vec entries + 19 raw-fallback AST entries + 6 unit tests** ≈ **-215 LOC** (post-amendment). The earlier estimate of -50 to -65 undercounted because (a) it assumed 3 unit tests instead of the verified 6, (b) it counted 18 raw-fallback entries instead of the verified 19. The 6 tests at lines 1123/1196/1432/1477/1536/1595 of `taint_tests.rs` average ~30 LOC each.
 
 ---
 
@@ -492,10 +561,22 @@ The "post-milestone cleanup" mentioned in the prompt's framing is **integrated i
 - **Impact**: high — for nested partial application like `(Sys.command) cmd`, the first child may be a `parenthesized_expression`, not the path directly. `node_text` of the parenthesized_expression returns `"(Sys.command)"` — `rfind('.')` finds the `.`, split yields `("(Sys", "command)")`. Structured match fails (extra parens).
 - **Mitigation**: M1 RED tests cover only direct `Sys.command cmd` form. If parenthesised forms surface, a future hardening pass walks past parens. Document as known limitation.
 
-### Risk 4: regex-removal-v1's W2-M10 KEPT Ruby/Elixir/OCaml `detect_sinks` regex unit tests in `taint_tests.rs`. M5 deletes them
+### Risk 4 (MITIGATED per premortem A1): regex-removal-v1's W2-M10 KEPT Ruby/Elixir/OCaml `detect_sinks` AND `detect_sources` regex unit tests in `taint_tests.rs`. M5 deletes all 6.
 - **Likelihood**: certain (architectural)
-- **Impact**: low — those tests test a function (`detect_sinks` regex path) that becomes dead after M5 deletion of the source/sink Vec entries (the helper itself remains for sanitizers, but with empty source/sink Vecs it always returns no findings for those types). Removing the 3 retained Ruby/Elixir/OCaml `detect_sinks` regex tests is mandatory for cargo test to stay GREEN.
-- **Mitigation**: M5's STOP threshold explicitly includes "delete Ruby/Elixir/OCaml `detect_sinks` regex unit tests in `taint_tests.rs`". Executor MUST grep for them and delete in the same atomic commit.
+- **Impact**: low (after amendment) — those tests test functions (`detect_sources` / `detect_sinks` regex paths) that become dead after M5 deletion of the source/sink Vec entries. The helper itself remains for sanitizers but with empty source/sink Vecs always returns no findings for those types. Removing all 6 retained Ruby/Elixir/OCaml `detect_sources`+`detect_sinks` regex tests is mandatory for cargo test to stay GREEN.
+- **Premortem context**: The pre-amendment plan only listed 3 detect_sinks tests. The discriminative premortem (`reports/premortem.json` BLOCKER-1) flagged that 3 detect_sources tests at lines 1123/1432/1536 ALSO call `detect_sources()` against the same Vec M5 empties — they would have hard-failed cargo test post-M5 atomic commit. Plan amended; M5 cleanup now lists all 6 tests with file:line.
+- **Mitigation**: M5's STOP threshold (above, in §M5) explicitly enumerates all 6 obsolete tests with file:line. Cleanup is GATING for the M5 atomic commit. dispatch-contract `validator_mandates.m5_taint_tests_cleanup` carries the same 6-test list verbatim.
+
+### Risk 8 (MITIGATED per premortem A3): M1 RED protocol was observational, not gating
+- **Likelihood**: high (in pre-amendment plan)
+- **Impact**: medium — without a concrete RED-validation harness, M2/M3/M4 could ship "rewrites" that don't actually change behavior because the regex bank still independently catches the same fixtures (no test would fail; no test would gate the rewrite).
+- **Premortem context**: The pre-amendment plan's M1 RED criterion was "tests run RED against current dispatch (regex bank still active masks them as PASS — that's expected; RED criterion is satisfied via M5-simulation harness OR by transient bank-empty state)". Neither path was concretely scaffolded.
+- **Mitigation**: M1 now ships a first-class `analyze_ast_only(...)` harness (Option A — transient-bank-empty, mirroring the W2-pre AST-only simulation pattern). Each of the 19 Module.function fixtures asserts under BOTH `analyze` (regex bank active) and `analyze_ast_only` (regex bank cleared). The `analyze_ast_only` path provides the discriminative RED gate for M2/M3/M4. See §M1 above for full harness shape and dispatch-contract `validator_mandates.m1_red_harness_spec`.
+
+### Risk 9 (MITIGATED per premortem A4): M2/M3/M4 file-overlap on taint.rs
+- **Likelihood**: high (if naively parallelised)
+- **Impact**: medium — M2 (RUBY_AST_*), M3 (ELIXIR_AST_*), M4 (OCAML_AST_*) all edit `crates/tldr-core/src/security/taint.rs` at non-overlapping but adjacent line ranges (L2298+, L2726+, L2779+). Parallel workers would race on the same file.
+- **Mitigation**: Plan amended to **serialize M2 → M3 → M4** (M3 depends on M2; M4 depends on M3). Each is +15-21 LOC; serial execution adds <5 minutes total. dispatch-contract `validator_mandates.m2_m3_m4_serial` carries the same constraint. The §2 Mermaid diagram and the M3/M4 `Depends:` lines reflect the serial chain.
 
 ### Risk 5: The W2-pre call-shape path may interact badly with the wildcard `("*", "send")` pattern
 - **Likelihood**: low
@@ -527,7 +608,9 @@ Self-assessed validator verdict: **PASS** (with conditional mandates below).
 
 **Validator mandates for executor:**
 - M1 RED tests MUST land before M2/M3/M4 (TDD discipline)
-- M5 atomic commit MUST delete `taint_tests.rs` Ruby/Elixir/OCaml `detect_sinks` regex unit tests
+- M1 MUST include the `analyze_ast_only(...)` harness; each of the 19 Module.function fixtures MUST assert under BOTH paths (regex active and AST-only) — see §M1 RED-first harness section
+- M2 → M3 → M4 MUST be serialized (all three edit `taint.rs`)
+- M5 atomic commit MUST delete all **6** obsolete unit tests in `taint_tests.rs` (test_ruby_detect_sources L1123, test_ruby_detect_sinks L1196, test_elixir_detect_sources L1432, test_elixir_detect_sinks L1477, test_ocaml_detect_sources L1536, test_ocaml_detect_sinks L1595) — not just the 3 detect_sinks tests
 - M5 STOP threshold MUST include subscript-shape regression test (params[, ENV[)
 - M6 CHANGELOG MUST cite that NO `field_access_info` source change occurred (avoid future confusion)
 
@@ -546,15 +629,19 @@ Self-assessed validator verdict: **PASS** (with conditional mandates below).
 
 ## 12. /autonomous-readiness
 
-**Recommendation: /autonomous-ready** with the caveats below.
+**Recommendation: /autonomous-ready (post-amendment).** Discriminative premortem CONDITIONAL-PASS resolved by amendments A1–A4 (this commit).
 
 This plan is suitable for `/autonomous` consumption because:
 - Each sub-milestone has explicit anchor lines, RED tests, GREEN file edits, LOC estimates, and STOP thresholds.
-- M5 atomicity is bounded and verifiable.
+- M5 atomicity is bounded and verifiable; the 6-test cleanup is enumerated with file:line.
+- M1's RED-first harness (`analyze_ast_only`) is concretely scaffolded — no longer observational.
+- M2 → M3 → M4 are serialized (all edit `taint.rs`); no naive-parallel race.
 - No source-code investigation remaining for the executor (architectural reframe in §0 done).
-- Risks are enumerated with mitigations.
+- Risks are enumerated with mitigations; premortem-flagged blockers are converted to mitigated entries (Risks 4, 8, 9).
 
-**Caveats requiring orchestrator attention:**
-- Risk 4: M5 must delete `taint_tests.rs` regex unit tests. Add explicit grep step to M5's executor instructions: `grep -n "fn ruby_detect_sinks\|fn elixir_detect_sinks\|fn ocaml_detect_sinks" crates/tldr-core/src/security/taint_tests.rs`.
+**Caveats requiring orchestrator attention (post-amendment):**
+- Risk 4 (mitigated): M5 must delete all **6** obsolete `taint_tests.rs` tests (3 detect_sources + 3 detect_sinks). Verification grep for executor: `grep -n "fn test_ruby_detect_sources\|fn test_ruby_detect_sinks\|fn test_elixir_detect_sources\|fn test_elixir_detect_sinks\|fn test_ocaml_detect_sources\|fn test_ocaml_detect_sinks" crates/tldr-core/src/security/taint_tests.rs` — must yield exactly 6 hits at L1123, L1196, L1432, L1477, L1536, L1595 pre-deletion.
+- Risk 8 (mitigated): M1 must scaffold the `analyze_ast_only(...)` harness; without it, M2/M3/M4 are not actually test-gated.
+- Risk 9 (mitigated): M2 → M3 → M4 serial; do NOT parallelize.
 - Risk 6: M5 STOP threshold must include subscript-shape fixture (Ruby `params[`).
 - §0 reframe: executor MUST NOT modify `field_access_info` itself or `extract_call_name_*`. Add a sanity check: `git diff crates/tldr-core/src/security/ast_utils.rs` should show ONLY documentation changes (the partial-coverage caveat update at `ast_utils.rs:520-532`).
