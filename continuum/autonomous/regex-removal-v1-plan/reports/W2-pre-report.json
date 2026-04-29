@@ -89,7 +89,7 @@
     "pre_existing_unchanged": "16 unique pre-existing failures (file system, git, language parity, quality metrics, doctests, change-impact-git, AST-tree-empty-dir). All present at HEAD c874e7d. Orthogonal to taint analysis. Will be addressed in a separate hygiene milestone.",
     "blockers_encountered": "None. The 'gaps' described in the orchestrator brief (missing AST entries) were a misreading; once the actual root cause (regex coupling) was identified, fixes were straightforward."
   },
-  "commit_sha": "PENDING_COMMIT",
+  "commit_sha": "256d70949056aa6bc7ce3ab176713f43affc2b07",
   "files_staged": [
     "crates/tldr-core/src/security/taint.rs",
     "continuum/autonomous/regex-removal-v1-plan/reports/W2-pre-targeted-capture.txt",
