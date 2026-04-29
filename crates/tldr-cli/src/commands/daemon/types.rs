@@ -355,7 +355,19 @@ pub enum DaemonCommand {
     Tree { path: Option<PathBuf> },
 
     /// Get code structure
-    Structure { path: PathBuf, lang: Option<String> },
+    Structure {
+        path: PathBuf,
+        /// Optional language hint. Canonical wire name is `language` (matches
+        /// the seven M1-threaded variants); the legacy `lang` form is still
+        /// accepted via serde alias for v0.2.x clients.
+        #[serde(
+            default,
+            rename = "language",
+            alias = "lang",
+            skip_serializing_if = "Option::is_none"
+        )]
+        lang: Option<String>,
+    },
 
     /// Get context for entry point
     Context {

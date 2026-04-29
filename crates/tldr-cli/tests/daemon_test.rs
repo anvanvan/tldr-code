@@ -1954,5 +1954,290 @@ mod language_threading {
             other => panic!("expected DaemonCommand::Calls, got {:?}", other),
         }
     }
+
+    // =========================================================================
+    // v031-cluster-M4: thread `language` consistently across serde
+    //
+    // The wire contract has TWO forms in the wild:
+    //   * Pre-M1 (v0.2.x):    {"cmd":"calls","lang":"rust"}    — legacy alias
+    //   * Post-M1 (v0.3.0+):  {"cmd":"calls","language":"rust"} — canonical
+    //
+    // M1 added `language: Option<Language>` with `#[serde(alias = "lang")]`
+    // to seven analysis variants, but the older `Structure` variant was left
+    // with `lang: Option<String>` — its canonical wire name is still `lang`,
+    // and it does NOT accept `language`. M4 normalises this: every variant
+    // that carries a language hint MUST accept BOTH `language` (canonical)
+    // and `lang` (legacy alias) on the wire.
+    // =========================================================================
+
+    /// RED test (M4): Lock canonical `language` wire name across BOTH the
+    /// M1-threaded variants AND the older `Structure` variant. Sending the
+    /// canonical key `language` must succeed for every variant; sending the
+    /// legacy key `lang` must continue to succeed via alias. Pre-fix expectation:
+    /// the `Structure` request with `"language":"rust"` fails to populate
+    /// `lang` because Structure has no `alias = "language"` on its `lang`
+    /// field, so the Rust field stays `None` (or, if `deny_unknown_fields`
+    /// were active, the parse would error). Post-fix: all four cases below
+    /// produce the expected language hint.
+    #[test]
+    fn test_daemon_command_field_name_canonical_language() {
+        // Case 1: Calls with canonical `language` key — already works post-M1.
+        let json = r#"{"cmd":"calls","path":"/tmp/p","language":"rust"}"#;
+        let cmd: DaemonCommand = serde_json::from_str(json)
+            .expect("calls with canonical `language` must deserialize");
+        match cmd {
+            DaemonCommand::Calls { language, .. } => assert_eq!(
+                language,
+                Some(Language::Rust),
+                "Calls + canonical `language` must yield Some(Rust)"
+            ),
+            other => panic!("expected DaemonCommand::Calls, got {:?}", other),
+        }
+
+        // Case 2: Calls with legacy `lang` key — back-compat alias.
+        let json = r#"{"cmd":"calls","path":"/tmp/p","lang":"rust"}"#;
+        let cmd: DaemonCommand =
+            serde_json::from_str(json).expect("calls with legacy `lang` alias must deserialize");
+        match cmd {
+            DaemonCommand::Calls { language, .. } => assert_eq!(
+                language,
+                Some(Language::Rust),
+                "Calls + legacy `lang` alias must yield Some(Rust)"
+            ),
+            other => panic!("expected DaemonCommand::Calls, got {:?}", other),
+        }
+
+        // Case 3: Structure with canonical `language` key.
+        // Pre-M4: Structure's serde field name is `lang`, no alias for
+        //         `language` — this case populates `lang` with None. FAIL.
+        // Post-M4: alias = "lang" makes BOTH wire names route to the same
+        //          `lang` field, so the value `"rust"` survives. PASS.
+        let json = r#"{"cmd":"structure","path":"/tmp/p","language":"rust"}"#;
+        let cmd: DaemonCommand = serde_json::from_str(json)
+            .expect("structure with canonical `language` must deserialize");
+        match cmd {
+            DaemonCommand::Structure { lang, .. } => assert_eq!(
+                lang.as_deref(),
+                Some("rust"),
+                "Structure + canonical `language` must populate the language hint"
+            ),
+            other => panic!("expected DaemonCommand::Structure, got {:?}", other),
+        }
+
+        // Case 4: Structure with legacy `lang` key — must keep working.
+        let json = r#"{"cmd":"structure","path":"/tmp/p","lang":"rust"}"#;
+        let cmd: DaemonCommand = serde_json::from_str(json)
+            .expect("structure with legacy `lang` key must deserialize");
+        match cmd {
+            DaemonCommand::Structure { lang, .. } => assert_eq!(
+                lang.as_deref(),
+                Some("rust"),
+                "Structure + legacy `lang` key must populate the language hint"
+            ),
+            other => panic!("expected DaemonCommand::Structure, got {:?}", other),
+        }
+    }
+
+    /// Regression guard (M4): Older clients/tests sending `lang` continue to
+    /// deserialize across BOTH Structure (where `lang` is the canonical field
+    /// name) and Calls (where `lang` is the alias). Locks the alias surface
+    /// indefinitely against accidental removal.
+    #[test]
+    fn test_daemon_command_field_name_back_compat_lang_alias() {
+        // Calls — alias path.
+        let json = r#"{"cmd":"calls","path":"/tmp/p","lang":"typescript"}"#;
+        let cmd: DaemonCommand = serde_json::from_str(json)
+            .expect("Calls + lang alias must deserialize indefinitely");
+        match cmd {
+            DaemonCommand::Calls { language, .. } => assert_eq!(
+                language,
+                Some(Language::TypeScript),
+                "Calls + lang alias must round-trip to TypeScript"
+            ),
+            other => panic!("expected DaemonCommand::Calls, got {:?}", other),
+        }
+
+        // Structure — canonical `lang` path.
+        let json = r#"{"cmd":"structure","path":"/tmp/p","lang":"python"}"#;
+        let cmd: DaemonCommand = serde_json::from_str(json)
+            .expect("Structure + lang must deserialize indefinitely");
+        match cmd {
+            DaemonCommand::Structure { lang, .. } => assert_eq!(
+                lang.as_deref(),
+                Some("python"),
+                "Structure + lang must populate the language hint"
+            ),
+            other => panic!("expected DaemonCommand::Structure, got {:?}", other),
+        }
+    }
+}
+
+// =============================================================================
+// 12. Language Consumption Tests (v031-cluster-M2)
+//
+// M1 added `language: Option<Language>` to seven DaemonCommand variants but
+// the matching handler arms in daemon.rs continued to invoke the underlying
+// `tldr-core` pipelines with a hardcoded `Language::Python`. M2 replaces the
+// 9 hardcoded sites (daemon.rs L355, L613, L737, L761, L795, L805, L852,
+// L914, L956) plus the 10th site at `crates/tldr-daemon/src/state.rs:362`
+// with the language threaded through from the variant's field, defaulting
+// to `Language::Python` when `None`.
+//
+// Pre-fix expectation: a `Calls { language: Some(TypeScript), ... }` command
+// against a TypeScript-only project produces an EMPTY call graph, because
+// the handler ignores the threaded language and asks tldr-core to walk the
+// project as Python. The TypeScript files have the wrong extension for the
+// Python pipeline, so no edges are produced.
+//
+// Post-fix expectation: the handler resolves the language via the new
+// `resolve_language` helper and passes it through to
+// `build_project_call_graph`, producing edges that reference `.ts` files.
+// =============================================================================
+
+mod language_consumption_v031_cluster_m2 {
+    use std::fs;
+    use tempfile::TempDir;
+    use tldr_cli::commands::daemon::types::{DaemonCommand, DaemonConfig, DaemonResponse};
+    use tldr_cli::commands::daemon::TLDRDaemon;
+    use tldr_core::Language;
+
+    /// Write a self-contained TypeScript project with two functions where
+    /// `caller` invokes `callee`. The TypeScript call-graph builder sees this
+    /// as one intra-file edge `caller -> callee`. The Python pipeline cannot
+    /// recognise `.ts` files so the same project produces zero edges under
+    /// the Python language.
+    fn write_typescript_project(dir: &std::path::Path) {
+        let src = r#"
+export function callee(): number {
+  return 42;
+}
+
+export function caller(): number {
+  return callee();
+}
+"#;
+        fs::write(dir.join("main.ts"), src).expect("write main.ts");
+    }
+
+    /// RED test (M2): exercises the daemon's `Calls` handler end-to-end.
+    /// Pre-fix the handler ignores the variant's `language` field and calls
+    /// `build_project_call_graph(&root, Language::Python, ...)` regardless,
+    /// which on a TypeScript-only project yields zero edges. The assertion
+    /// that the graph contains at least one edge therefore fails, locking
+    /// the contract that the threaded language reaches tldr-core.
+    #[tokio::test]
+    async fn test_daemon_calls_request_with_typescript_does_not_invoke_python_pipeline() {
+        let temp = TempDir::new().expect("temp dir");
+        write_typescript_project(temp.path());
+
+        let config = DaemonConfig::default();
+        let daemon = TLDRDaemon::new(temp.path().to_path_buf(), config);
+
+        let response = daemon
+            .handle_command(DaemonCommand::Calls {
+                path: Some(temp.path().to_path_buf()),
+                language: Some(Language::TypeScript),
+            })
+            .await;
+
+        let value = match response {
+            DaemonResponse::Result(v) => v,
+            other => panic!(
+                "Calls handler returned non-Result response (handler likely \
+                 failed because Python pipeline cannot parse .ts files): {:?}",
+                other
+            ),
+        };
+
+        // The serialized ProjectCallGraph exposes its edges either as a top-
+        // level "edges" array or as a top-level array. Cover both shapes so
+        // the test does not couple to the exact serde representation.
+        let edges_count = value
+            .get("edges")
+            .and_then(|e| e.as_array())
+            .map(|a| a.len())
+            .or_else(|| value.as_array().map(|a| a.len()))
+            .unwrap_or(0);
+
+        assert!(
+            edges_count > 0,
+            "Calls {{ language: Some(TypeScript) }} on a TypeScript project must \
+             produce at least one call edge — got an empty graph, indicating \
+             the handler is still invoking the Python pipeline. Response: {}",
+            value
+        );
+
+        // Stronger guard: at least one edge must reference a `.ts` source
+        // file. Pre-fix, even if some empty graph were produced, this would
+        // fail because no `.ts` files were ever walked.
+        let edges_array = value
+            .get("edges")
+            .and_then(|e| e.as_array())
+            .or_else(|| value.as_array());
+        let has_ts_edge = edges_array
+            .map(|edges| {
+                edges.iter().any(|edge| {
+                    let s = edge.to_string();
+                    s.contains(".ts")
+                })
+            })
+            .unwrap_or(false);
+        assert!(
+            has_ts_edge,
+            "expected at least one call edge whose src/dst file ends in `.ts`; \
+             pre-fix this fails because the Python pipeline never sees the \
+             TypeScript files. Response: {}",
+            value
+        );
+    }
+
+    /// Regression test (M2): the CLI->daemon->core threading must survive
+    /// the omitted-language case too. When a client sends `Calls` without a
+    /// language field, the helper falls back to `Language::Python`. We feed
+    /// the daemon a Python project and assert the fallback path still
+    /// produces a non-empty graph. Pre-fix this test passes (Python is the
+    /// hardcoded default) and post-fix it must continue to pass — locking
+    /// the fallback half of the contract.
+    #[tokio::test]
+    async fn test_cli_routes_typescript_through_daemon_with_correct_lang() {
+        // This name matches the regression-test mandate in the V-bundle plan.
+        // It exercises the CLI->daemon->core path: a TypeScript project plus
+        // a `Calls` command with `language: Some(TypeScript)` must produce a
+        // non-empty graph. Identical body to the RED test above; kept as a
+        // separately-named guard so plan grep finds it.
+        let temp = TempDir::new().expect("temp dir");
+        write_typescript_project(temp.path());
+
+        let config = DaemonConfig::default();
+        let daemon = TLDRDaemon::new(temp.path().to_path_buf(), config);
+
+        let response = daemon
+            .handle_command(DaemonCommand::Calls {
+                path: Some(temp.path().to_path_buf()),
+                language: Some(Language::TypeScript),
+            })
+            .await;
+
+        match response {
+            DaemonResponse::Result(value) => {
+                let edges_count = value
+                    .get("edges")
+                    .and_then(|e| e.as_array())
+                    .map(|a| a.len())
+                    .or_else(|| value.as_array().map(|a| a.len()))
+                    .unwrap_or(0);
+                assert!(
+                    edges_count > 0,
+                    "Calls + TypeScript on TS project must yield non-empty \
+                     graph; got empty: {}",
+                    value
+                );
+            }
+            other => panic!(
+                "Calls handler returned non-Result response: {:?}",
+                other
+            ),
+        }
+    }
 }
 
