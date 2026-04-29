@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::output::OutputFormat;
 
 use super::daemon_active::remove_active;
+use super::daemon_registry::{live_entries, remove_entry};
 use super::error::DaemonError;
 use super::ipc::{check_socket_alive, cleanup_socket, send_command};
 use super::pid::{cleanup_stale_pid, compute_pid_path};
@@ -28,9 +29,19 @@ use super::types::DaemonCommand;
 /// Arguments for the `daemon stop` command.
 #[derive(Debug, Clone, Args)]
 pub struct DaemonStopArgs {
-    /// Project root directory (default: current directory)
+    /// Project root directory (default: current directory).
+    ///
+    /// Mutually exclusive with `--all`. When neither is set, the command
+    /// targets the daemon for the current working directory.
     #[arg(long, short = 'p', default_value = ".")]
     pub project: PathBuf,
+
+    /// Stop ALL running daemons known to the v0.3.0 multi-daemon registry.
+    ///
+    /// Mutually exclusive with `--project`. Iterates the registry, sends
+    /// shutdown to each daemon, and removes the entry on success.
+    #[arg(long, conflicts_with = "project")]
+    pub all: bool,
 }
 
 // =============================================================================
@@ -61,6 +72,11 @@ impl DaemonStopArgs {
 
     /// Async implementation of the daemon stop command.
     async fn run_async(&self, format: OutputFormat, quiet: bool) -> anyhow::Result<()> {
+        // --all: iterate the v0.3.0 registry and stop each known daemon.
+        if self.all {
+            return self.run_stop_all(format, quiet).await;
+        }
+
         // Resolve project path to absolute
         let project = self.project.canonicalize().unwrap_or_else(|_| {
             std::env::current_dir()
@@ -87,11 +103,13 @@ impl DaemonStopArgs {
                 }
             }
 
-            // Clean up any stale files (incl. VAL-013 active-daemon record).
+            // Clean up any stale files (legacy daemon-active.json + v0.3.0
+            // registry entry).
             let pid_path = compute_pid_path(&project);
             let _ = cleanup_stale_pid(&pid_path);
             let _ = cleanup_socket(&project);
             let _ = remove_active();
+            let _ = remove_entry(&project);
 
             return Ok(());
         }
@@ -111,11 +129,12 @@ impl DaemonStopArgs {
                     retries += 1;
                 }
 
-                // Clean up files (incl. VAL-013 active-daemon record).
+                // Clean up files (legacy daemon-active.json + v0.3.0 entry).
                 let _ = cleanup_socket(&project);
                 let pid_path = compute_pid_path(&project);
                 let _ = cleanup_stale_pid(&pid_path);
                 let _ = remove_active();
+                let _ = remove_entry(&project);
 
                 let output = DaemonStopOutput {
                     status: "ok".to_string(),
@@ -153,16 +172,106 @@ impl DaemonStopArgs {
                     }
                 }
 
-                // Clean up any stale files (incl. VAL-013 active-daemon record).
+                // Clean up any stale files (legacy daemon-active.json +
+                // v0.3.0 registry entry).
                 let _ = cleanup_socket(&project);
                 let pid_path = compute_pid_path(&project);
                 let _ = cleanup_stale_pid(&pid_path);
                 let _ = remove_active();
+                let _ = remove_entry(&project);
 
                 Ok(())
             }
             Err(e) => Err(anyhow::anyhow!("Failed to stop daemon: {}", e)),
         }
+    }
+
+    /// Implements `daemon stop --all`. Iterates the v0.3.0 registry and
+    /// sends shutdown to each known daemon. Best-effort: a failure on one
+    /// entry does not abort the iteration; failures are reported in the
+    /// final output but the command exits 0 if at least the registry is
+    /// reachable.
+    async fn run_stop_all(&self, format: OutputFormat, quiet: bool) -> anyhow::Result<()> {
+        let entries = live_entries();
+
+        if entries.is_empty() {
+            let output = DaemonStopOutput {
+                status: "ok".to_string(),
+                message: Some("No daemons running".to_string()),
+            };
+            if !quiet {
+                match format {
+                    OutputFormat::Json | OutputFormat::Compact => {
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                    }
+                    OutputFormat::Text | OutputFormat::Sarif | OutputFormat::Dot => {
+                        println!("No daemons running");
+                    }
+                }
+            }
+            // Defensive: ensure no legacy daemon-active.json lingers.
+            let _ = remove_active();
+            return Ok(());
+        }
+
+        let mut stopped = 0usize;
+        let mut failed = 0usize;
+        for entry in &entries {
+            let project = &entry.project;
+            let cmd = DaemonCommand::Shutdown;
+            match send_command(project, &cmd).await {
+                Ok(_response) => {
+                    // Wait briefly for the daemon to exit.
+                    let mut retries = 0;
+                    while retries < 50 {
+                        if !check_socket_alive(project).await {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        retries += 1;
+                    }
+                    let _ = cleanup_socket(project);
+                    let pid_path = compute_pid_path(project);
+                    let _ = cleanup_stale_pid(&pid_path);
+                    let _ = remove_entry(project);
+                    stopped += 1;
+                }
+                Err(DaemonError::NotRunning) | Err(DaemonError::ConnectionRefused) => {
+                    // Already dead — clean up the registry record.
+                    let _ = cleanup_socket(project);
+                    let pid_path = compute_pid_path(project);
+                    let _ = cleanup_stale_pid(&pid_path);
+                    let _ = remove_entry(project);
+                    stopped += 1;
+                }
+                Err(_) => {
+                    failed += 1;
+                }
+            }
+        }
+        // Defensive: drop any legacy single-slot record.
+        let _ = remove_active();
+
+        let summary = if failed == 0 {
+            format!("Stopped {} daemon(s)", stopped)
+        } else {
+            format!("Stopped {} daemon(s); {} failed", stopped, failed)
+        };
+        let output = DaemonStopOutput {
+            status: "ok".to_string(),
+            message: Some(summary.clone()),
+        };
+        if !quiet {
+            match format {
+                OutputFormat::Json | OutputFormat::Compact => {
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                }
+                OutputFormat::Text | OutputFormat::Sarif | OutputFormat::Dot => {
+                    println!("{}", summary);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -179,9 +288,11 @@ mod tests {
     fn test_daemon_stop_args_default() {
         let args = DaemonStopArgs {
             project: PathBuf::from("."),
+            all: false,
         };
 
         assert_eq!(args.project, PathBuf::from("."));
+        assert!(!args.all);
     }
 
     #[test]
@@ -213,6 +324,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let args = DaemonStopArgs {
             project: temp.path().to_path_buf(),
+            all: false,
         };
 
         // Should succeed when daemon is not running

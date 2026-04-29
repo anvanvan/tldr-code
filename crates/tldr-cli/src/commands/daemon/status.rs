@@ -18,6 +18,7 @@ use serde::Serialize;
 use crate::output::OutputFormat;
 
 use super::daemon_active::read_active;
+use super::daemon_registry::live_entries;
 use super::error::DaemonError;
 use super::ipc::send_command;
 use super::types::{DaemonCommand, DaemonResponse, DaemonStatus, SalsaCacheStats};
@@ -85,27 +86,34 @@ impl DaemonStatusArgs {
 
     /// Async implementation of the daemon status command.
     async fn run_async(&self, format: OutputFormat, quiet: bool) -> anyhow::Result<()> {
-        // VAL-013 (issue #20): when `--project` is the default (the literal
-        // ".", meaning the user did not pass an explicit path), prefer the
-        // active-daemon discovery record. This lets `daemon status` from any
-        // cwd find the running daemon by its recorded project path rather
-        // than mis-hashing the caller's cwd.
+        // VAL-003 (v0.3.0): when `--project` is the default (the literal
+        // ".", meaning the user did not pass an explicit path), dispatch on
+        // the live multi-daemon registry:
+        //   - 0 entries: fall back to the legacy daemon-active.json record
+        //     (covers the migration window) and ultimately the cwd path.
+        //   - 1 entry:   use that entry's project path (preserves VAL-013).
+        //   - 2+ entries: ERROR with a hint to pass `--project` or list.
         //
-        // If a record exists AND its PID is alive (validated by
-        // `read_active` via `kill(pid, 0)`), use the recorded project. If
-        // no record exists, fall back to the previous behaviour (canonicalize
-        // `--project`, which defaults to the cwd).
-        //
-        // An explicit `--project` passed by the user (anything other than
-        // `"."`) is ALWAYS honoured — the workaround path is preserved.
+        // An explicit `--project` (anything other than ".") is ALWAYS
+        // honoured — the workaround path is preserved.
         let project = if self.project == Path::new(".") {
-            match read_active() {
-                Some(active) => active.project,
-                None => self.project.canonicalize().unwrap_or_else(|_| {
-                    std::env::current_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join(&self.project)
-                }),
+            let entries = live_entries();
+            match entries.len() {
+                0 => match read_active() {
+                    Some(active) => active.project,
+                    None => self.project.canonicalize().unwrap_or_else(|_| {
+                        std::env::current_dir()
+                            .unwrap_or_else(|_| PathBuf::from("."))
+                            .join(&self.project)
+                    }),
+                },
+                1 => entries.into_iter().next().unwrap().project,
+                n => {
+                    return Err(anyhow::anyhow!(
+                        "multiple daemons running ({}); use --project <abs-path> or run 'tldr daemon list'",
+                        n
+                    ));
+                }
             }
         } else {
             self.project.canonicalize().unwrap_or_else(|_| {

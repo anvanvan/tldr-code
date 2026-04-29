@@ -48,10 +48,12 @@
 pub mod cache_clear;
 pub mod cache_stats;
 pub mod daemon_active;
+pub mod daemon_registry;
 #[path = "daemon.rs"]
 pub mod daemon_impl;
 pub mod error;
 pub mod ipc;
+pub mod list;
 pub mod notify;
 pub mod pid;
 pub mod query;
@@ -105,6 +107,7 @@ pub use daemon_impl::TLDRDaemon;
 // Re-export CLI argument types for main.rs integration
 pub use cache_clear::CacheClearArgs;
 pub use cache_stats::CacheStatsArgs;
+pub use list::DaemonListArgs;
 pub use notify::DaemonNotifyArgs;
 pub use query::DaemonQueryArgs;
 pub use start::DaemonStartArgs;

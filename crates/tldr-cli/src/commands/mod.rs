@@ -126,9 +126,10 @@ pub use semantic::SemanticArgs;
 #[cfg(feature = "semantic")]
 pub use similar::SimilarArgs;
 
-// Daemon subsystem commands (Phase 5-6)
+// Daemon subsystem commands (Phase 5-6; v0.3.0 adds DaemonListArgs)
 pub use daemon::{
-    DaemonNotifyArgs, DaemonQueryArgs, DaemonStartArgs, DaemonStatusArgs, DaemonStopArgs,
+    DaemonListArgs, DaemonNotifyArgs, DaemonQueryArgs, DaemonStartArgs, DaemonStatusArgs,
+    DaemonStopArgs,
 };
 
 // Cache commands (Phase 9)

@@ -39,8 +39,9 @@ use tldr_cli::commands::remaining::{ApiCheckArgs, VulnArgs};
 use tldr_cli::commands::{
     ApiSurfaceArgs, AvailableArgs, BugbotCheckArgs, CacheClearArgs, CacheStatsArgs, CallsArgs,
     ChangeImpactArgs, ChopArgs, ChurnArgs, ClonesArgs, CognitiveArgs, ComplexityArgs, ContextArgs,
-    ContractsArgs, CoverageArgs, DaemonNotifyArgs, DaemonQueryArgs, DaemonStartArgs,
-    DaemonStatusArgs, DaemonStopArgs, DeadArgs, DeadStoresArgs, DebtArgs, DefinitionArgs, DepsArgs,
+    ContractsArgs, CoverageArgs, DaemonListArgs, DaemonNotifyArgs, DaemonQueryArgs,
+    DaemonStartArgs, DaemonStatusArgs, DaemonStopArgs, DeadArgs, DeadStoresArgs, DebtArgs,
+    DefinitionArgs, DepsArgs,
     DiagnosticsArgs, DiceArgs, DiffArgs, DoctorArgs, ExplainArgs, ExtractArgs, FixArgs,
     HalsteadArgs, HealthArgs, HotspotsArgs, HubsArgs, ImpactArgs, ImportersArgs, ImportsArgs,
     InheritanceArgs, InvariantsArgs, LocArgs, PatternsArgs, ReachingDefsArgs, ReferencesArgs,
@@ -394,6 +395,9 @@ pub enum DaemonCommand {
 
     /// Notify daemon of file changes
     Notify(DaemonNotifyArgs),
+
+    /// List all running daemons (multi-daemon registry, v0.3.0)
+    List(DaemonListArgs),
 }
 
 /// Cache subcommands
@@ -512,6 +516,7 @@ fn run_command(cli: &Cli) -> Result<()> {
             DaemonCommand::Status(args) => args.run(cli.format, cli.quiet),
             DaemonCommand::Query(args) => args.run(cli.format, cli.quiet),
             DaemonCommand::Notify(args) => args.run(cli.format, cli.quiet),
+            DaemonCommand::List(args) => args.run(cli.format, cli.quiet),
         },
         // Cache management commands
         Command::Cache(cache_cmd) => match cache_cmd {

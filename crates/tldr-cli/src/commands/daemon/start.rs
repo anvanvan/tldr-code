@@ -21,7 +21,7 @@ use serde::Serialize;
 use crate::output::OutputFormat;
 
 use super::daemon::{start_daemon_background, wait_for_daemon, TLDRDaemon};
-use super::daemon_active::write_active;
+use super::daemon_registry::{add_entry, remove_entry};
 use super::error::DaemonError;
 use super::ipc::{check_socket_alive, cleanup_socket, compute_socket_path, IpcListener};
 use super::pid::{compute_pid_path, try_acquire_lock};
@@ -141,14 +141,14 @@ impl DaemonStartArgs {
         let socket_path = compute_socket_path(project);
         let our_pid = std::process::id();
 
-        // VAL-013 (issue #20): record the active daemon for cross-cwd
-        // discovery. Failures are logged but non-fatal — the file is
-        // auxiliary state. A missing file degrades to the legacy
-        // behaviour where `daemon status` from a different cwd reports
-        // `not_running`.
-        if let Err(e) = write_active(project, our_pid, &socket_path) {
+        // VAL-003 (v0.3.0): register the daemon in the multi-daemon
+        // registry. Replaces v0.2.x's single-slot daemon-active.json.
+        // Failures are logged but non-fatal — the file is auxiliary
+        // state. A missing file degrades to the legacy behaviour where
+        // `daemon status` from a different cwd reports `not_running`.
+        if let Err(e) = add_entry(project, our_pid, &socket_path) {
             eprintln!(
-                "warning: could not write daemon-active discovery file: {}",
+                "warning: could not register daemon in registry: {}",
                 e
             );
         }
@@ -178,9 +178,9 @@ impl DaemonStartArgs {
         let daemon = Arc::new(TLDRDaemon::new(project.to_path_buf(), config));
         daemon.run(listener).await?;
 
-        // Cleanup socket and active-daemon discovery file on exit.
+        // Cleanup socket and registry entry on exit.
         let _ = cleanup_socket(project);
-        let _ = super::daemon_active::remove_active();
+        let _ = remove_entry(project);
 
         Ok(())
     }
