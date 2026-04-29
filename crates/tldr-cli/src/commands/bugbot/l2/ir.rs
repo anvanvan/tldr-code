@@ -97,6 +97,11 @@ pub fn build_taint_for_function(
         .map_err(|e| anyhow::anyhow!(e))
         .ok();
 
+    // M1b VAL-001b: layer SSA-versioned propagation when SSA construction
+    // succeeds. Per-language SSA-coverage gap is tolerated via `.ok()` — the
+    // engine falls back to M1a's String-keyed VarRef path when None is passed.
+    let ssa = tldr_core::ssa::construct::construct_minimal_ssa(&cfg, &dfg).ok();
+
     tldr_core::compute_taint_with_tree(
         &cfg,
         &dfg.refs,
@@ -104,6 +109,7 @@ pub fn build_taint_for_function(
         tree.as_ref(),
         Some(file_contents.as_bytes()),
         language,
+        ssa.as_ref(),
     )
     .map_err(|e| anyhow::anyhow!(e))
     .with_context(|| format!("Taint analysis for {}", function_id))

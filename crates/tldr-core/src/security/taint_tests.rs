@@ -3619,8 +3619,16 @@ fn test_compute_taint_with_tree_no_tree() {
     statements.insert(5, "eval(x)".to_string());
 
     // Without tree - should behave like compute_taint
-    let result =
-        compute_taint_with_tree(&cfg, &refs, &statements, None, None, Language::Python).unwrap();
+    let result = compute_taint_with_tree(
+        &cfg,
+        &refs,
+        &statements,
+        None,
+        None,
+        Language::Python,
+        None,
+    )
+    .unwrap();
 
     assert!(
         !result.sources.is_empty(),
@@ -3664,6 +3672,7 @@ fn test_compute_taint_with_tree_sql_injection() {
         Some(&tree),
         Some(source_code.as_bytes()),
         Language::Python,
+        None,
     )
     .unwrap();
 

@@ -23,9 +23,39 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::ssa::types::{SsaFunction, SsaNameId};
 use crate::types::{CfgInfo, RefType, VarRef};
 use crate::Language;
 use crate::TldrError;
+
+/// Internal taint-set key for the SSA-aware propagation path (M1b VAL-001b).
+///
+/// When `compute_taint_with_tree` is called with `Some(&SsaFunction)` the
+/// engine keys its taint set by `Versioned(SsaNameId)` so that re-assignment
+/// through a sanitiser (`x = sanitize(x)`) correctly clears taint on the
+/// post-sanitiser SSA version.
+///
+/// `Raw(String)` is used in the SAME SSA-aware path as a robustness fallback
+/// for variables that have no SSA name entry — this can happen in real
+/// SsaFunction outputs when the DFG emits a Use for a free variable (function
+/// parameter, builtin) that has no defining SSA instruction in the function.
+/// Mixed `Versioned`/`Raw` keys allow the SSA propagation to remain sound under
+/// the per-language SSA-coverage gap rather than silently dropping taint.
+///
+/// When `compute_taint_with_tree` is called with `None`, the engine bypasses
+/// `TaintKey` entirely and runs the M1a `HashSet<String>` path unchanged.
+///
+/// This enum is private to the taint module: callers see only the `Option<&
+/// SsaFunction>` parameter on `compute_taint_with_tree` and the `TaintInfo`
+/// shape, both of which are unchanged at the API boundary.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+enum TaintKey {
+    /// SSA-versioned taint key. Set when an SsaNameId is available for the var.
+    Versioned(SsaNameId),
+    /// Raw variable-name fallback. Set when the SSA function has no entry for
+    /// the variable (free vars, parameters in some languages, partial SSA).
+    Raw(String),
+}
 
 /// Hard cap on worklist iterations to prevent infinite loops in taint analysis.
 ///
@@ -3146,6 +3176,7 @@ pub fn compute_taint_with_tree(
     tree: Option<&tree_sitter::Tree>,
     source: Option<&[u8]>,
     language: Language,
+    ssa: Option<&SsaFunction>,
 ) -> Result<TaintInfo, TldrError> {
     // If we have tree + source, use AST-enhanced detection within compute_taint
     // For now, delegate to the existing compute_taint which uses regex patterns.
@@ -3283,45 +3314,91 @@ pub fn compute_taint_with_tree(
             .insert(source.var.clone());
     }
 
-    while let Some(block_id) = worklist.pop_front() {
-        if iterations >= max_iterations {
-            iteration_limit_reached = true;
-            break;
-        }
-        iterations += 1;
-
-        let mut taint_in: HashSet<String> = predecessors
-            .get(&block_id)
-            .map(|preds| {
-                preds
-                    .iter()
-                    .flat_map(|p| tainted.get(p).cloned().unwrap_or_default())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if let Some(source_vars) = source_vars_by_block.get(&block_id) {
-            taint_in.extend(source_vars.clone());
-        }
-
-        let taint_out = process_block(
-            block_id,
-            taint_in,
-            &refs_by_block,
+    // M1b VAL-001b: SSA-versioned propagation when an `SsaFunction` is supplied
+    // and non-empty. When SSA is unavailable (None, Err, or an empty function
+    // per the per-language SSA-coverage gap documented in the v0.3.0 contract),
+    // this branch is bypassed entirely and the M1a String-keyed worklist below
+    // runs unchanged — the engine never panics on missing SSA.
+    let ssa_active = ssa.is_some_and(|s| !s.blocks.is_empty());
+    let ssa_tainted_per_block: Option<HashMap<usize, HashSet<TaintKey>>> = if ssa_active {
+        let ssa_ref = ssa.expect("ssa_active implies Some");
+        let ctx = SsaPropagateCtx {
+            ssa: ssa_ref,
+            sources: &result.sources,
+            predecessors: &predecessors,
+            successors: &successors,
+            line_to_block: &line_to_block,
             statements,
-            &line_to_block,
-            &sources_by_line,
-            &mut result.sanitized_vars,
             language,
-        );
+            max_iterations,
+        };
+        let tainted_ssa = ssa_propagate(&ctx, &mut result.sanitized_vars);
+        // Translate SSA-versioned tainted set into the String-keyed `tainted`
+        // map for backward compatibility with the rest of the pipeline (e.g.,
+        // `result.tainted_vars` debug surface). This is an over-approximation:
+        // a variable name appears in `tainted[block]` if any of its SSA versions
+        // is tainted at block exit. The precise sink check below uses the
+        // SsaNameId-keyed set instead, so the over-approximation here does not
+        // produce false-positive flows.
+        for (block_id, taint_keys) in &tainted_ssa {
+            let str_set: HashSet<String> = taint_keys
+                .iter()
+                .filter_map(|k| match k {
+                    TaintKey::Versioned(id) => ssa_ref
+                        .ssa_names
+                        .get(id.0 as usize)
+                        .map(|n| n.variable.clone()),
+                    TaintKey::Raw(s) => Some(s.clone()),
+                })
+                .collect();
+            tainted.insert(*block_id, str_set);
+        }
+        Some(tainted_ssa)
+    } else {
+        None
+    };
 
-        let old_taint = tainted.get(&block_id).cloned().unwrap_or_default();
-        if taint_out != old_taint {
-            tainted.insert(block_id, taint_out);
-            if let Some(succs) = successors.get(&block_id) {
-                for &s in succs {
-                    if !worklist.contains(&s) {
-                        worklist.push_back(s);
+    if !ssa_active {
+        while let Some(block_id) = worklist.pop_front() {
+            if iterations >= max_iterations {
+                iteration_limit_reached = true;
+                break;
+            }
+            iterations += 1;
+
+            let mut taint_in: HashSet<String> = predecessors
+                .get(&block_id)
+                .map(|preds| {
+                    preds
+                        .iter()
+                        .flat_map(|p| tainted.get(p).cloned().unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if let Some(source_vars) = source_vars_by_block.get(&block_id) {
+                taint_in.extend(source_vars.clone());
+            }
+
+            let taint_out = process_block(
+                block_id,
+                taint_in,
+                &refs_by_block,
+                statements,
+                &line_to_block,
+                &sources_by_line,
+                &mut result.sanitized_vars,
+                language,
+            );
+
+            let old_taint = tainted.get(&block_id).cloned().unwrap_or_default();
+            if taint_out != old_taint {
+                tainted.insert(block_id, taint_out);
+                if let Some(succs) = successors.get(&block_id) {
+                    for &s in succs {
+                        if !worklist.contains(&s) {
+                            worklist.push_back(s);
+                        }
                     }
                 }
             }
@@ -3337,8 +3414,19 @@ pub fn compute_taint_with_tree(
     // Phase 5: Detect vulnerabilities
     for sink in &mut result.sinks {
         if let Some(&sink_block) = line_to_block.get(&sink.line) {
-            if let Some(tainted_at_block) = tainted.get(&sink_block) {
-                // Direct match: sink variable itself is tainted
+            if let (Some(tainted_ssa), Some(ssa_ref)) = (ssa_tainted_per_block.as_ref(), ssa) {
+                // M1b SSA-precise sink check: at the sink line, identify the
+                // SsaNameIds *used* (or defined) for the sink's variable; if
+                // any of those specific versioned ids are in the tainted set
+                // at this block, the sink is tainted. This catches the
+                // sanitiser-reassignment case where the over-approximated
+                // String-keyed `tainted` map would say "x is tainted" but the
+                // latest SSA version of x at the sink line is actually clean.
+                if ssa_sink_is_tainted(ssa_ref, sink, sink_block, tainted_ssa) {
+                    sink.tainted = true;
+                }
+            } else if let Some(tainted_at_block) = tainted.get(&sink_block) {
+                // M1a String-keyed sink check (unchanged when SSA is inactive).
                 if tainted_at_block.contains(&sink.var) {
                     sink.tainted = true;
                 } else if !tainted_at_block.is_empty() {
@@ -3851,6 +3939,313 @@ fn rhs_uses_tainted(
     })
 }
 
+// =============================================================================
+// SSA-aware Propagation (M1b VAL-001b v0.3.0)
+// =============================================================================
+
+/// SSA-versioned forward dataflow propagation.
+///
+/// Layered on top of M1a's VarRef path (still the fallback when SSA is
+/// unavailable per the per-language SSA-coverage gap), this function keys the
+/// taint set by `SsaNameId` (versioned) so that re-assignment through a
+/// sanitiser correctly clears taint on the post-sanitiser SSA version
+/// (`x = sanitize(x)` produces a distinct `x_v2` that is not propagated).
+///
+/// # Returns
+///
+/// A `HashMap<usize, HashSet<TaintKey>>` mapping each CFG block id to the set
+/// of `TaintKey` values tainted at block exit. `Versioned(SsaNameId)` keys are
+/// used when an instruction's target id is known; `Raw(String)` keys are used
+/// for free variables that have no SSA defining instruction (function
+/// parameters in some language frontends, builtins) — this preserves soundness
+/// under partial SSA coverage rather than silently dropping taint.
+/// Read-only context for the SSA-aware propagation worklist.
+///
+/// Bundles the helper maps and CFG-derived structures that
+/// `ssa_propagate` needs but does not mutate. The `sanitized_vars`
+/// out-parameter is passed separately because it is mutated.
+struct SsaPropagateCtx<'a> {
+    ssa: &'a SsaFunction,
+    sources: &'a [TaintSource],
+    predecessors: &'a HashMap<usize, Vec<usize>>,
+    successors: &'a HashMap<usize, Vec<usize>>,
+    line_to_block: &'a HashMap<u32, usize>,
+    statements: &'a HashMap<u32, String>,
+    language: Language,
+    max_iterations: usize,
+}
+
+fn ssa_propagate(
+    ctx: &SsaPropagateCtx<'_>,
+    sanitized_vars: &mut HashSet<String>,
+) -> HashMap<usize, HashSet<TaintKey>> {
+    let SsaPropagateCtx {
+        ssa,
+        sources,
+        predecessors,
+        successors,
+        line_to_block,
+        statements,
+        language,
+        max_iterations,
+    } = *ctx;
+    // Build per-block instruction list keyed by block id (SsaBlock.id matches
+    // CFG block id per ssa::types). Sort instructions by line to guarantee
+    // deterministic processing order within a block (Q-M1-C).
+    let mut block_insts: HashMap<usize, Vec<&crate::ssa::types::SsaInstruction>> = HashMap::new();
+    for sblock in &ssa.blocks {
+        let mut insts: Vec<&crate::ssa::types::SsaInstruction> = sblock.instructions.iter().collect();
+        insts.sort_by_key(|i| i.line);
+        block_insts.insert(sblock.id, insts);
+    }
+
+    // Phi functions per block (entry-of-block taint merging).
+    let mut block_phis: HashMap<usize, &Vec<crate::ssa::types::PhiFunction>> = HashMap::new();
+    for sblock in &ssa.blocks {
+        block_phis.insert(sblock.id, &sblock.phi_functions);
+    }
+
+    // Initial source seeding: for each TaintSource, find an SsaNameId defined
+    // on `source.line` whose variable name matches `source.var`. If found,
+    // seed `Versioned(id)`. If no SSA instruction defines that var on that
+    // line (free var / partial SSA), seed `Raw(var)` so taint is not lost.
+    let mut tainted: HashMap<usize, HashSet<TaintKey>> = HashMap::new();
+    for source in sources {
+        if let Some(&block_id) = line_to_block.get(&source.line) {
+            let block = tainted.entry(block_id).or_default();
+            let mut seeded_versioned = false;
+            if let Some(insts) = block_insts.get(&block_id) {
+                for inst in insts {
+                    if inst.line != source.line {
+                        continue;
+                    }
+                    if let Some(target) = inst.target {
+                        if let Some(name) = ssa.ssa_names.get(target.0 as usize) {
+                            if name.variable == source.var {
+                                block.insert(TaintKey::Versioned(target));
+                                seeded_versioned = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !seeded_versioned {
+                block.insert(TaintKey::Raw(source.var.clone()));
+            }
+        }
+    }
+
+    // Worklist: CFG block ids visited in BFS order until fixed point.
+    let block_ids: Vec<usize> = ssa.blocks.iter().map(|b| b.id).collect();
+    let mut worklist: VecDeque<usize> = block_ids.iter().cloned().collect();
+    let mut iterations: usize = 0;
+
+    while let Some(block_id) = worklist.pop_front() {
+        if iterations >= max_iterations {
+            break;
+        }
+        iterations += 1;
+
+        // taint_in = union of predecessor taint_out, then phi-merge: for each
+        // phi target whose phi-source set intersects predecessor taint_out,
+        // mark the phi target as tainted.
+        let mut taint_in: HashSet<TaintKey> = HashSet::new();
+        if let Some(preds) = predecessors.get(&block_id) {
+            for p in preds {
+                if let Some(t) = tainted.get(p) {
+                    for k in t {
+                        taint_in.insert(k.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(phis) = block_phis.get(&block_id) {
+            for phi in phis.iter() {
+                let any_tainted = phi
+                    .sources
+                    .iter()
+                    .any(|s| taint_in.contains(&TaintKey::Versioned(s.name)));
+                if any_tainted {
+                    taint_in.insert(TaintKey::Versioned(phi.target));
+                }
+            }
+        }
+
+        // Re-seed sources that originate inside this block (matches the M1a
+        // path which extends taint_in with source_vars_by_block).
+        for source in sources {
+            if line_to_block.get(&source.line) == Some(&block_id) {
+                if let Some(insts) = block_insts.get(&block_id) {
+                    let mut found = false;
+                    for inst in insts {
+                        if inst.line != source.line {
+                            continue;
+                        }
+                        if let Some(target) = inst.target {
+                            if let Some(name) = ssa.ssa_names.get(target.0 as usize) {
+                                if name.variable == source.var {
+                                    taint_in.insert(TaintKey::Versioned(target));
+                                    found = true;
+                                }
+                            }
+                        }
+                    }
+                    if !found {
+                        taint_in.insert(TaintKey::Raw(source.var.clone()));
+                    }
+                }
+            }
+        }
+
+        // Process instructions in line order. For each instruction:
+        //   uses_tainted = any inst.uses[i] is in current_taint as Versioned;
+        //                  OR variable name of inst.uses[i] is in current_taint
+        //                  as Raw (covers partial SSA / free vars).
+        //   if a sanitiser is recognised on this line via the M1a regex
+        //     `detect_sanitizer` helper:
+        //       - record the original variable name in `sanitized_vars` (so
+        //         the downstream flow construction's `is_sanitized` guard
+        //         still fires).
+        //       - DO NOT mark the target as tainted (the post-sanitiser SSA
+        //         version is clean).
+        //   else if uses_tainted:
+        //       - mark target as Versioned(target) tainted.
+        //   else:
+        //       - target stays clean (its previous SSA version, if any, is
+        //         unaffected — SSA names are immutable single-assignment).
+        let mut current_taint = taint_in.clone();
+        if let Some(insts) = block_insts.get(&block_id) {
+            for inst in insts {
+                let line_stmt = statements
+                    .get(&inst.line)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+
+                let uses_tainted = inst.uses.iter().any(|use_id| {
+                    if current_taint.contains(&TaintKey::Versioned(*use_id)) {
+                        return true;
+                    }
+                    if let Some(name) = ssa.ssa_names.get(use_id.0 as usize) {
+                        if current_taint.contains(&TaintKey::Raw(name.variable.clone())) {
+                            return true;
+                        }
+                    }
+                    false
+                });
+
+                if let Some(target) = inst.target {
+                    let target_var = ssa
+                        .ssa_names
+                        .get(target.0 as usize)
+                        .map(|n| n.variable.clone());
+
+                    if detect_sanitizer(line_stmt, language).is_some() {
+                        if let Some(v) = target_var.clone() {
+                            sanitized_vars.insert(v);
+                        }
+                        // Sanitiser: post-sanitiser SSA version is clean.
+                        // The pre-sanitiser version, if it was tainted, stays
+                        // tainted in the set (it is a separate SsaNameId).
+                        // Downstream sink check uses inst.uses at the sink
+                        // line to resolve which version is referenced.
+                    } else if uses_tainted {
+                        current_taint.insert(TaintKey::Versioned(target));
+                        // If the prior version of this variable was tainted
+                        // via a Raw key (partial-SSA fallback), preserve that
+                        // shadow until the variable is unambiguously rebound.
+                    } else if let Some(ref v) = target_var {
+                        // A clean re-definition removes the Raw shadow for
+                        // this variable name (the new SSA version is clean
+                        // and downstream `Versioned` lookups will miss it).
+                        current_taint.remove(&TaintKey::Raw(v.clone()));
+                    }
+                }
+            }
+        }
+
+        let old_taint = tainted.get(&block_id).cloned().unwrap_or_default();
+        if current_taint != old_taint {
+            tainted.insert(block_id, current_taint);
+            if let Some(succs) = successors.get(&block_id) {
+                for &s in succs {
+                    if !worklist.contains(&s) {
+                        worklist.push_back(s);
+                    }
+                }
+            }
+        }
+    }
+
+    tainted
+}
+
+/// Precise SSA-mode sink-taint check.
+///
+/// Walks every SSA instruction at `sink.line` and checks whether any of the
+/// `inst.uses` for the sink's variable resolve to an SsaNameId tainted at
+/// `sink_block` (or whose name is tainted via a `Raw` fallback key). This is
+/// strictly more precise than the over-approximating String-keyed `tainted`
+/// map produced for backward compatibility — it correctly leaves the sink
+/// untainted in the `let x = req.body; x = DOMPurify.sanitize(x); eval(x)`
+/// fixture because the SSA name used at `eval(x)` is `x_v2` (clean) rather
+/// than `x_v1` (tainted).
+fn ssa_sink_is_tainted(
+    ssa: &SsaFunction,
+    sink: &TaintSink,
+    sink_block: usize,
+    tainted_ssa: &HashMap<usize, HashSet<TaintKey>>,
+) -> bool {
+    let block_taint = match tainted_ssa.get(&sink_block) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    // Find the SSA block matching the CFG sink_block.
+    let sblock = match ssa.blocks.iter().find(|b| b.id == sink_block) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    // Inspect every instruction on the sink line; any matching use that
+    // resolves to a tainted Versioned key — or whose name matches a Raw key —
+    // marks the sink as tainted.
+    for inst in &sblock.instructions {
+        if inst.line != sink.line {
+            continue;
+        }
+        for use_id in &inst.uses {
+            if block_taint.contains(&TaintKey::Versioned(*use_id)) {
+                if let Some(name) = ssa.ssa_names.get(use_id.0 as usize) {
+                    if name.variable == sink.var {
+                        return true;
+                    }
+                }
+            }
+            if let Some(name) = ssa.ssa_names.get(use_id.0 as usize) {
+                if name.variable == sink.var
+                    && block_taint.contains(&TaintKey::Raw(name.variable.clone()))
+                {
+                    return true;
+                }
+            }
+        }
+        // Also handle the rare case where the sink's variable appears as the
+        // instruction *target* (e.g., `eval(x)` modelled as a Call with
+        // target = result; here we keep the conservative check on uses only,
+        // which matches the M1a model for sink detection).
+    }
+
+    // Final fallback: the sink line might not have an SSA instruction at all
+    // (e.g., a multi-line call where the sink token sits on a continuation
+    // line). Fall back to the Raw-key check on the variable name.
+    if block_taint.contains(&TaintKey::Raw(sink.var.clone())) {
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4201,6 +4596,7 @@ def vulnerable_func(user_input):
             tree.as_ref(),
             Some(python_code.as_bytes()),
             Language::Python,
+            None,
         )
         .unwrap();
 
@@ -4305,6 +4701,7 @@ def vuln(user_input):
             tree.as_ref(),
             Some(python_code.as_bytes()),
             Language::Python,
+            None,
         )
         .unwrap();
 

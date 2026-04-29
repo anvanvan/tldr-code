@@ -41,6 +41,7 @@ fn analyze_ts(src: &str, function_name: &str) -> TaintInfo {
         Some(&tree),
         Some(src.as_bytes()),
         Language::TypeScript,
+        None,
     )
     .expect("taint analysis must succeed for fixture")
 }

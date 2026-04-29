@@ -117,6 +117,13 @@ impl TaintArgs {
         let pool = ParserPool::new();
         let tree = pool.parse(&source, language).ok();
 
+        // M1b VAL-001b: build SSA when possible so taint propagation can use
+        // SSA-versioned keys (sanitiser-reassignment correctly clears taint on
+        // the post-sanitiser version). Per-language SSA-coverage gap is handled
+        // gracefully via `.ok()` — falls back to M1a's VarRef path when SSA
+        // construction returns Err or yields an empty function.
+        let ssa = tldr_core::ssa::construct::construct_minimal_ssa(&cfg, &dfg).ok();
+
         // Run taint analysis (AST-based when tree available, regex fallback otherwise)
         let result = compute_taint_with_tree(
             &cfg,
@@ -125,6 +132,7 @@ impl TaintArgs {
             tree.as_ref(),
             Some(source.as_bytes()),
             language,
+            ssa.as_ref(),
         )?;
 
         // Output based on format
@@ -368,6 +376,9 @@ def vulnerable_func(user_input):
         let pool = ParserPool::new();
         let tree = pool.parse(code, Language::Python).ok();
 
+        // M1b VAL-001b: same SSA-with-fallback shape as the production site.
+        let ssa = tldr_core::ssa::construct::construct_minimal_ssa(&cfg, &dfg).ok();
+
         compute_taint_with_tree(
             &cfg,
             &dfg.refs,
@@ -375,6 +386,7 @@ def vulnerable_func(user_input):
             tree.as_ref(),
             Some(code.as_bytes()),
             Language::Python,
+            ssa.as_ref(),
         )
         .unwrap()
     }

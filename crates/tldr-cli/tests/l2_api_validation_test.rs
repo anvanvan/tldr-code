@@ -723,6 +723,7 @@ fn taint_with_tree_works_for_rust() {
         Some(&tree),
         Some(RUST_TAINT.as_bytes()),
         Language::Rust,
+        None,
     );
     assert!(
         result.is_ok(),
