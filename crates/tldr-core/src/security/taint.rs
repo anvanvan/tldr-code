@@ -2099,6 +2099,91 @@ static TYPESCRIPT_AST_SOURCES: &[AstSourcePattern] = &[
         member_patterns: &[("*", "read"), ("*", "readFile")],
         source_type: TaintSourceType::FileRead,
     },
+    // W1-M5: NextJS App Router + Fastify + NestJS HTTP source parity-add.
+    //
+    // The existing AST bank only covered `req.*` (Express convention). The
+    // regex banks `TYPESCRIPT_NEXTJS_PATTERNS`, `TYPESCRIPT_FASTIFY_PATTERNS`,
+    // and `TYPESCRIPT_NESTJS_PATTERNS` recognize the `request.*` receiver and
+    // the `searchParams.*` chain too. This block wires the structural
+    // equivalents into `TYPESCRIPT_AST_SOURCES` so Wave 2's atomic deletion
+    // of the regex banks does not regress source detection.
+    //
+    // HttpBody — App Router request reader methods + Fastify/NestJS body unwrap.
+    // `('request', 'body')` covers App Router, Fastify (`request.body`), and
+    // the NestJS `@Req()` manual unwrap idiom (`const body = request.body`).
+    // `('request', 'raw')` is Fastify's underlying Node-style request handle.
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[
+            ("request", "json"),
+            ("request", "text"),
+            ("request", "formData"),
+            ("request", "body"),
+            ("request", "raw"),
+        ],
+        source_type: TaintSourceType::HttpBody,
+    },
+    // HttpParam — request property accessors and Web-spec `URLSearchParams`
+    // methods. `searchParams.{get,getAll,has}` is the Web platform shape used
+    // by NextJS's `request.nextUrl.searchParams.get(...)` chain. Fastify uses
+    // `request.params` / `.query`; both frameworks expose `.headers` /
+    // `.cookies`.
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[
+            ("request", "headers"),
+            ("request", "cookies"),
+            ("request", "params"),
+            ("request", "query"),
+            ("searchParams", "get"),
+            ("searchParams", "getAll"),
+            ("searchParams", "has"),
+        ],
+        source_type: TaintSourceType::HttpParam,
+    },
+    // Raw-fallback HttpParam entries — non-member-access shapes.
+    //  * `request.nextUrl.searchParams` is a chained property access whose
+    //    structural shape varies; the substring fallback catches lines where
+    //    the chain appears verbatim.
+    //  * `headers().get(` / `cookies().get(` are NextJS server-component
+    //    helpers (call_expression on a bare identifier, not a member-access
+    //    on a fixed receiver).
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[
+            ("", "request.nextUrl.searchParams"),
+            ("", "headers().get("),
+            ("", "cookies().get("),
+        ],
+        source_type: TaintSourceType::HttpParam,
+    },
+    // NestJS decorator raw-fallbacks. Decorators (`@Body(...)`, `@Query(...)`,
+    // ...) are `decorator` AST nodes, not member-access; the empty-receiver
+    // raw-fallback path matches them by substring on the descendant text.
+    // The decorators bind a parameter to the corresponding HTTP source:
+    //  * `@Body`, `@Req`, `@Request`, `@UploadedFile(s)` -> HttpBody
+    //  * `@Query`, `@Param`, `@Headers`, `@Cookies` -> HttpParam
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[
+            ("", "@Body("),
+            ("", "@Req("),
+            ("", "@Request("),
+            ("", "@UploadedFile("),
+            ("", "@UploadedFiles("),
+        ],
+        source_type: TaintSourceType::HttpBody,
+    },
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[
+            ("", "@Query("),
+            ("", "@Param("),
+            ("", "@Headers("),
+            ("", "@Cookies("),
+        ],
+        source_type: TaintSourceType::HttpParam,
+    },
 ];
 
 static TYPESCRIPT_AST_SINKS: &[AstSinkPattern] = &[

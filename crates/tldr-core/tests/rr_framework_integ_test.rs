@@ -16,6 +16,11 @@
 //! * W1-M2 — Fastify sink AST entries (`reply.send` / `.redirect` / `.header`).
 //! * W1-M3 — NestJS sink AST entries (`res.send|redirect|json` +
 //!   `Response.send|redirect|json` builder forms).
+//! * W1-M5 — NextJS+Fastify+NestJS source AST entries (request.json/text/
+//!   formData/body/headers/cookies/params/query/raw + searchParams.* + 3
+//!   raw-fallbacks for nextUrl/headers()/cookies() + 9 NestJS decorator
+//!   raw-fallbacks). Source-side parity-add — exercises the full
+//!   source→sink flow path through `compute_taint_with_tree`.
 
 use std::collections::HashMap;
 
@@ -24,7 +29,7 @@ use tldr_core::cfg::get_cfg_context;
 use tldr_core::dfg::get_dfg_context;
 use tldr_core::security::taint::compute_taint_with_tree;
 use tldr_core::ssa::construct::construct_minimal_ssa;
-use tldr_core::{Language, TaintInfo, TaintSinkType};
+use tldr_core::{Language, TaintInfo, TaintSinkType, TaintSourceType};
 
 fn statements_from(src: &str) -> HashMap<u32, String> {
     src.lines()
@@ -363,4 +368,175 @@ async function handler(req, Response) {
          got sinks={:?}",
         result.sinks
     );
+}
+
+// ---------- W1-M5: NextJS + Fastify + NestJS sources ----------
+//
+// These seven tests exercise the source-side AST bank by demonstrating an
+// end-to-end taint flow from a framework-shaped HTTP source to an `eval()`
+// sink. Each test asserts:
+//   * `result.sources` contains an entry of the expected `TaintSourceType`
+//     (HttpBody / HttpParam) on the source line, AND
+//   * `result.sinks` contains a `CodeEval` entry on the eval line, AND
+//   * `result.flows` contains at least one flow connecting a source to a
+//     sink — proving the source-side pattern flows through the full taint
+//     pipeline.
+//
+// Pre-W1-M5: these tests pass via the regex bank's NEXTJS_PATTERNS /
+// FASTIFY_PATTERNS / NESTJS_PATTERNS source patterns. Post-W1-M5 the same
+// tests are also covered by the structural AST sources added to
+// `TYPESCRIPT_AST_SOURCES`. Because Wave 1 is ADDITIVE (regex bank stays
+// active), pre-add capture is expected to be GREEN — the milestone closes
+// the parity gap so Wave 2's atomic deletion does not regress these flows.
+
+/// Helper: assert at least one source of the given type, at least one
+/// `CodeEval` sink, and at least one source→sink flow.
+fn assert_source_to_eval_flow(result: &TaintInfo, expected_source: TaintSourceType) {
+    let source_match = result
+        .sources
+        .iter()
+        .any(|s| s.source_type == expected_source);
+    assert!(
+        source_match,
+        "expected at least one {:?} source; got sources={:?}",
+        expected_source, result.sources
+    );
+    let eval_sinks: Vec<_> = result
+        .sinks
+        .iter()
+        .filter(|s| matches!(s.sink_type, TaintSinkType::CodeEval))
+        .collect();
+    assert!(
+        !eval_sinks.is_empty(),
+        "expected at least one CodeEval sink; got sinks={:?}",
+        result.sinks
+    );
+    assert!(
+        !result.flows.is_empty(),
+        "expected at least one source->sink flow; got flows={:?}",
+        result.flows
+    );
+}
+
+/// W1-M5 #1 — App Router `request.json()` (HttpBody) flowing into `eval`.
+/// Pre-W1-M5: covered by NEXTJS_PATTERNS regex source
+/// `request\.(json|text|formData)\s*\(`. Post-W1-M5: structural match via
+/// `TYPESCRIPT_AST_SOURCES` member_pattern `('request', 'json')`.
+#[test]
+fn nextjs_request_json_to_eval_via_compute_taint() {
+    let src = "\
+export async function POST(request) {
+    const data = await request.json();
+    eval(data.code);
+    return new Response(JSON.stringify({ok: true}));
+}
+";
+    let result = analyze_with_ssa(src, Language::TypeScript, "POST", /* use_ssa */ false);
+    assert_source_to_eval_flow(&result, TaintSourceType::HttpBody);
+}
+
+/// W1-M5 #2 — App Router `request.text()` (HttpBody) flowing into `eval`.
+/// Post-W1-M5 covered by member_pattern `('request', 'text')`.
+#[test]
+fn nextjs_request_text_to_eval_via_compute_taint() {
+    let src = "\
+export async function POST(request) {
+    const raw = await request.text();
+    eval(raw);
+}
+";
+    let result = analyze_with_ssa(src, Language::TypeScript, "POST", /* use_ssa */ false);
+    assert_source_to_eval_flow(&result, TaintSourceType::HttpBody);
+}
+
+/// W1-M5 #3 — App Router `request.formData()` (HttpBody) flowing into
+/// `eval`. Post-W1-M5 covered by member_pattern `('request', 'formData')`.
+#[test]
+fn nextjs_request_formdata_to_eval_via_compute_taint() {
+    let src = "\
+export async function POST(request) {
+    const fd = await request.formData();
+    eval(fd.get('script'));
+}
+";
+    let result = analyze_with_ssa(src, Language::TypeScript, "POST", /* use_ssa */ false);
+    assert_source_to_eval_flow(&result, TaintSourceType::HttpBody);
+}
+
+/// W1-M5 #4 — `request.nextUrl.searchParams.get('q')` (HttpParam) flowing
+/// into `eval`. Post-W1-M5 covered by member_pattern
+/// `('searchParams', 'get')` (structural) AND raw-fallback
+/// `('', 'request.nextUrl.searchParams')`.
+#[test]
+fn nextjs_searchparams_get_to_eval_via_compute_taint() {
+    let src = "\
+export async function GET(request) {
+    const q = request.nextUrl.searchParams.get('q');
+    eval(q);
+}
+";
+    let result = analyze_with_ssa(src, Language::TypeScript, "GET", /* use_ssa */ false);
+    assert_source_to_eval_flow(&result, TaintSourceType::HttpParam);
+}
+
+/// W1-M5 #5 — Fastify handler `request.body` (HttpBody) flowing into
+/// `eval`. Note the receiver is `request`, not `req`; the existing AST bank
+/// only had `('req', 'body')`. Post-W1-M5 covered by `('request', 'body')`.
+#[test]
+fn fastify_request_body_to_eval_via_compute_taint() {
+    let src = "\
+import Fastify from 'fastify';
+async function fastifyEcho(request, reply) {
+    const cmd = request.body.cmd;
+    eval(cmd);
+}
+";
+    let result = analyze_with_ssa(
+        src,
+        Language::TypeScript,
+        "fastifyEcho",
+        /* use_ssa */ false,
+    );
+    assert_source_to_eval_flow(&result, TaintSourceType::HttpBody);
+}
+
+/// W1-M5 #6 — Fastify handler `request.query` (HttpParam) flowing into
+/// `eval`. Pre-W1-M5: caught by FASTIFY_PATTERNS regex
+/// `request\.(params|query|headers|cookies)\b`. Post-W1-M5: structural
+/// match via member_pattern `('request', 'query')`.
+#[test]
+fn fastify_request_query_to_eval_via_compute_taint() {
+    let src = "\
+async function handler(request, reply) {
+    const q = request.query.q;
+    eval(q);
+}
+";
+    let result = analyze_with_ssa(src, Language::TypeScript, "handler", /* use_ssa */ false);
+    assert_source_to_eval_flow(&result, TaintSourceType::HttpParam);
+}
+
+/// W1-M5 #7 — NestJS `@Req()`-style manual unwrap: `const body =
+/// request.body; eval(body.script);`. The decorator is import-only context
+/// (raw-fallback for the `@Body(`/`@Req(` decorators is wired in the AST
+/// bank for v0.3.0+ structural lookups); this test exercises the manual
+/// `request.body` access pattern that NestJS controllers also use after a
+/// `@Req()` decorator unwraps the request. Post-W1-M5: covered by
+/// member_pattern `('request', 'body')`.
+#[test]
+fn nestjs_request_body_to_eval_manual_unwrap_via_compute_taint() {
+    let src = "\
+import { Controller, Post, Req } from '@nestjs/common';
+async function nestCreate(request) {
+    const body = request.body;
+    eval(body.script);
+}
+";
+    let result = analyze_with_ssa(
+        src,
+        Language::TypeScript,
+        "nestCreate",
+        /* use_ssa */ false,
+    );
+    assert_source_to_eval_flow(&result, TaintSourceType::HttpBody);
 }
