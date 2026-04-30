@@ -88,7 +88,11 @@ pub fn get_dfg_context(
 }
 
 /// Extract DFG from a parsed tree
-fn extract_dfg_from_tree(
+///
+/// (vuln-migration-v1 M3) Visibility extended from private `fn` to `pub(crate)`
+/// so `vuln::scan_file_vulns` can avoid the per-function re-parse implicit in
+/// `get_dfg_context(&content, ...)`. Mirrors `extract_cfg_from_tree`.
+pub(crate) fn extract_dfg_from_tree(
     tree: &Tree,
     source: &str,
     function_name: &str,
@@ -103,6 +107,35 @@ fn extract_dfg_from_tree(
         Some(node) => build_dfg_for_function(node, function_name, source, language),
         None => Err(TldrError::function_not_found(function_name)),
     }
+}
+
+/// Build DFG when the caller already has the CFG in hand (skips an internal
+/// re-parse).
+///
+/// (vuln-migration-v1 M3 perf) `extract_dfg_from_tree`'s inner
+/// `build_dfg_for_function` calls `get_cfg_context(source, ...)` for
+/// reaching-defs, which unconditionally re-parses the file. In
+/// `vuln::scan_file_vulns` the CFG is already in hand from the call site —
+/// pass it in to skip the re-parse + re-build.
+pub(crate) fn extract_dfg_from_tree_with_cfg(
+    tree: &Tree,
+    source: &str,
+    function_name: &str,
+    language: Language,
+    cfg: &crate::types::CfgInfo,
+) -> TldrResult<DfgInfo> {
+    let root = tree.root_node();
+    let func_node = find_function_node(root, function_name, language, source)
+        .ok_or_else(|| TldrError::function_not_found(function_name))?;
+
+    let mut builder = DfgBuilder::new(function_name.to_string(), source, language);
+    builder.extract_parameters(func_node)?;
+    let body_node = get_function_body(func_node, language);
+    if let Some(body) = body_node {
+        builder.extract_refs_from_node(body, 0)?;
+    }
+    builder.build_def_use_chains(cfg)?;
+    builder.finalize()
 }
 
 /// Build DFG for a function node

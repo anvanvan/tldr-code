@@ -73,7 +73,12 @@ pub fn get_cfg_context(
 }
 
 /// Extract CFG from a parsed tree
-fn extract_cfg_from_tree(
+///
+/// (vuln-migration-v1 M3) Visibility extended from private `fn` to `pub(crate)`
+/// so `vuln::scan_file_vulns` can avoid the per-function re-parse implicit in
+/// `get_cfg_context(&content, ...)` — the per-function compute_taint loop
+/// passes the pre-parsed tree directly. Mirrors `extract_dfg_from_tree`.
+pub(crate) fn extract_cfg_from_tree(
     tree: &Tree,
     source: &str,
     function_name: &str,

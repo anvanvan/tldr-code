@@ -2453,6 +2453,14 @@ static C_AST_SOURCES: &[AstSourcePattern] = &[
         member_patterns: &[],
         source_type: TaintSourceType::UserInput,
     },
+    // VULN-MIGRATION-V1 M3: command-line argument access — `argv[N]` is a
+    // subscript_expression on the `argv` parameter. Mirrors vuln.rs
+    // get_sources entry `("argv[", "Command line arguments")`.
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[("", "argv[")],
+        source_type: TaintSourceType::UserInput,
+    },
 ];
 
 static C_AST_SINKS: &[AstSinkPattern] = &[
@@ -2511,6 +2519,12 @@ static CPP_AST_SOURCES: &[AstSourcePattern] = &[
         call_names: &[],
         member_patterns: &[("", "std::ifstream"), ("", "std::fstream")],
         source_type: TaintSourceType::FileRead,
+    },
+    // VULN-MIGRATION-V1 M3: command-line argument access. Mirrors C.
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[("", "argv[")],
+        source_type: TaintSourceType::UserInput,
     },
 ];
 
@@ -2751,6 +2765,18 @@ static KOTLIN_AST_SOURCES: &[AstSourcePattern] = &[
         member_patterns: &[("request", "getParameter")],
         source_type: TaintSourceType::HttpParam,
     },
+    // VULN-MIGRATION-V1 M3: Ktor query parameter access — raw-fallback for
+    // `call.request.queryParameters["..."]` subscript shape and the typed
+    // `call.parameters[`. Mirrors vuln.rs get_sources for Kotlin.
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[
+            ("", "call.request.queryParameters"),
+            ("", "call.parameters["),
+            ("", "call.receive<"),
+        ],
+        source_type: TaintSourceType::HttpParam,
+    },
 ];
 
 static KOTLIN_AST_SINKS: &[AstSinkPattern] = &[
@@ -2828,11 +2854,21 @@ static SWIFT_AST_SOURCES: &[AstSourcePattern] = &[
         ],
         source_type: TaintSourceType::FileRead,
     },
+    // VULN-MIGRATION-V1 M3: command-line argument access — Swift's
+    // `CommandLine.arguments[N]` is a subscript on a static member chain.
+    // Mirrors vuln.rs get_sources for Swift.
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[("", "CommandLine.arguments")],
+        source_type: TaintSourceType::UserInput,
+    },
 ];
 
 static SWIFT_AST_SINKS: &[AstSinkPattern] = &[
     AstSinkPattern {
-        call_names: &[],
+        // VULN-MIGRATION-V1 M3: bare `system(` is the C-bridged shell call;
+        // mirrors vuln.rs's substring entry for Swift.
+        call_names: &["system"],
         // `Process()` is a constructor call; `NSTask` is a bare identifier — raw.
         member_patterns: &[("", "Process()"), ("", "NSTask")],
         sink_type: TaintSinkType::ShellExec,
@@ -2881,6 +2917,13 @@ static CSHARP_AST_SOURCES: &[AstSourcePattern] = &[
     AstSourcePattern {
         call_names: &[],
         member_patterns: &[("Request", "QueryString"), ("Request", "Form")],
+        source_type: TaintSourceType::HttpParam,
+    },
+    // VULN-MIGRATION-V1 M3: ASP.NET Core / .NET request access — `Request.Query[
+    // "..."]` is a subscript shape; raw-fallback for the access prefix.
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[("", "Request.Query["), ("", "Request.Form[")],
         source_type: TaintSourceType::HttpParam,
     },
     AstSourcePattern {
@@ -2993,6 +3036,16 @@ static SCALA_AST_SOURCES: &[AstSourcePattern] = &[
         call_names: &[],
         member_patterns: &[("Source", "fromFile")],
         source_type: TaintSourceType::FileRead,
+    },
+    // VULN-MIGRATION-V1 M3: Play / generic Scala HTTP request access.
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[
+            ("request", "getQueryString"),
+            ("request", "queryString"),
+            ("request", "body"),
+        ],
+        source_type: TaintSourceType::HttpParam,
     },
 ];
 
@@ -3200,6 +3253,17 @@ static LUA_AST_SOURCES: &[AstSourcePattern] = &[
         member_patterns: &[("io", "open")],
         source_type: TaintSourceType::FileRead,
     },
+    // VULN-MIGRATION-V1 M3: OpenResty ngx HTTP request access — multi-segment
+    // chain (`ngx.req.get_uri_args(`, `ngx.req.get_post_args(`); raw fallback.
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[
+            ("", "ngx.req.get_uri_args"),
+            ("", "ngx.req.get_post_args"),
+            ("", "ngx.req.get_headers"),
+        ],
+        source_type: TaintSourceType::HttpParam,
+    },
 ];
 
 static LUA_AST_SINKS: &[AstSinkPattern] = &[
@@ -3268,6 +3332,17 @@ static ELIXIR_AST_SOURCES: &[AstSourcePattern] = &[
         call_names: &[],
         member_patterns: &[("File", "read"), ("File", "read!")],
         source_type: TaintSourceType::FileRead,
+    },
+    // VULN-MIGRATION-V1 M3: Phoenix conn.params subscript access — raw fallback
+    // for the multi-segment subscript shape `conn.params["..."]`.
+    AstSourcePattern {
+        call_names: &[],
+        member_patterns: &[
+            ("", "conn.params["),
+            ("", "conn.body_params["),
+            ("", "conn.query_params["),
+        ],
+        source_type: TaintSourceType::HttpParam,
     },
 ];
 
@@ -3625,6 +3700,50 @@ fn extract_first_identifier_arg_ast(
     language: Language,
 ) -> Option<String> {
     let string_kinds = string_node_kinds(language);
+
+    // VULN-MIGRATION-V1 M3 (PHP echo carry-forward from M2-carry-forward.json):
+    // PHP `echo $x;`, `print $x;`, and `<?= $x ?>` are language statement-keywords
+    // (echo_statement / print_intrinsic / unary_expression) — not call_expression.
+    // They have no `arguments` field and no `argument`-kind children. Walk the
+    // named children of the statement node and recursively scan for the first
+    // variable_name / name identifier descendant. Skips string-literal subtrees
+    // already filtered by is_in_string upstream of detect_sinks_ast.
+    if language == Language::Php
+        && matches!(
+            descendant.kind(),
+            "echo_statement" | "print_intrinsic"
+        )
+    {
+        // BFS over named descendants seeking the first variable_name / name node.
+        let mut stack: Vec<tree_sitter::Node> = vec![*descendant];
+        while let Some(node) = stack.pop() {
+            // Skip string-literal subtrees (defensive — caller also filters).
+            if string_kinds.contains(&node.kind()) {
+                continue;
+            }
+            // PHP variable references: `variable_name` (with `$` prefix in text).
+            // Member accesses (`$obj->name`) appear as `member_access_expression`
+            // with a `variable_name` first child.
+            if matches!(node.kind(), "variable_name" | "name") && node.id() != descendant.id() {
+                let text = node_text(&node, source);
+                let head = text.trim_start_matches('$');
+                let head = head.split('.').next().unwrap_or(head);
+                let head = head.split("->").next().unwrap_or(head);
+                if is_valid_identifier(head) {
+                    return Some(head.to_string());
+                }
+            }
+            // Push named children for further walk.
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    if child.is_named() {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        return None;
+    }
 
     // OCaml application_expression has no "arguments" field — child(0) is the
     // function expression and child(1..) are the arguments. Scan from child(1).
@@ -3989,7 +4108,16 @@ pub fn detect_sinks_ast(
                         tainted: false,
                         statement: Some(stmt_text.to_string()),
                     });
-                    break;
+                    // VULN-MIGRATION-V1 M3: do NOT break — a single descendant
+                    // can match multiple AstSinkPattern entries with different
+                    // sink_types (e.g., PHP `file_get_contents` is registered
+                    // under BOTH FileOpen and HttpRequest per the M2 dual-
+                    // classification convention; pre-M3 the `break` here
+                    // emitted only the FIRST matching pattern, silently
+                    // dropping the SSRF classification). The downstream
+                    // dedup_by `discriminant(sink_type)` filters same-type
+                    // duplicates so removing the break does not produce extra
+                    // findings for single-classification sinks.
                 }
             }
         }
@@ -4445,6 +4573,56 @@ pub fn compute_taint_with_tree(
                 if ssa_sink_is_tainted(ssa_ref, sink, sink_block, tainted_ssa) {
                     sink.tainted = true;
                 }
+                // VULN-MIGRATION-V1 M3 indirect-match fallback (parity with M1a):
+                // When the SSA-precise check fails because the sink's `var` is a
+                // free variable (e.g., a method receiver like `cursor` in
+                // `cursor.execute(f"... {tainted}")`), the precise check sees no
+                // SSA match for `cursor` because it's never assigned in-function.
+                // Mirrors the M1a `else if !tainted_at_block.is_empty()` block
+                // below. Sanitised variables (in `result.sanitized_vars`) are
+                // excluded from the indirect match so SSA's sanitiser-precision
+                // is preserved (val001b regression guard:
+                // `let x = req.body; x = sanitize(x); eval(x)` MUST stay 0
+                // flows under SSA-versioned propagation).
+                //
+                // Additional gate: ONLY trigger the indirect match when the
+                // sink's `var` is NOT itself an SSA-tracked variable in this
+                // function — i.e., the sink's `var` is a free variable
+                // (method receiver / module identifier) where the SSA-precise
+                // check is structurally inapplicable. This preserves SSA's
+                // sanitiser-reassignment precision: when `var` IS SSA-tracked
+                // (like `x` in `let x = ...; x = sanitize(x); eval(x)`), the
+                // SSA path's verdict is authoritative.
+                if !sink.tainted {
+                    let sink_var_is_ssa_tracked = ssa_ref
+                        .ssa_names
+                        .iter()
+                        .any(|n| n.variable == sink.var);
+                    if !sink_var_is_ssa_tracked
+                        && !result.sanitized_vars.contains(&sink.var)
+                    {
+                        if let Some(tainted_at_block) = tainted.get(&sink_block) {
+                            if let Some(block) =
+                                cfg.blocks.iter().find(|b| b.id == sink_block)
+                            {
+                                let block_text: String = (block.lines.0..=block.lines.1)
+                                    .filter_map(|l| statements.get(&l))
+                                    .map(|s| s.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                for tvar in tainted_at_block {
+                                    if result.sanitized_vars.contains(tvar) {
+                                        continue;
+                                    }
+                                    if identifier_in_text(&block_text, tvar) {
+                                        sink.tainted = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             } else if let Some(tainted_at_block) = tainted.get(&sink_block) {
                 // M1a String-keyed sink check (unchanged when SSA is inactive).
                 if tainted_at_block.contains(&sink.var) {
@@ -4495,8 +4673,38 @@ pub fn compute_taint_with_tree(
         if let Some(&sink_block) = line_to_block.get(&sink_line) {
             for source in &sources_clone {
                 if let Some(&source_block) = line_to_block.get(&source.line) {
-                    if flows_to(&source.var, &sink_var, &tainted, &predecessors, sink_block) {
-                        let is_sanitized = result.sanitized_vars.contains(&sink_var);
+                    // Direct flow: sink's `var` matches a tainted variable that
+                    // reaches sink_block.
+                    let direct =
+                        flows_to(&source.var, &sink_var, &tainted, &predecessors, sink_block);
+
+                    // VULN-MIGRATION-V1 M3: Indirect flow — when the sink's
+                    // structural `var` is the call receiver (e.g.,
+                    // `cursor.execute(f"...{name}")` extracts `cursor`) but the
+                    // tainted variable (`name`) flows through the f-string /
+                    // interpolation / concat argument, accept the flow if the
+                    // source's variable is tainted at the sink block AND its
+                    // identifier appears in the sink statement text. Mirrors
+                    // the indirect-match logic used to set `sink.tainted` above.
+                    let indirect = if direct {
+                        false
+                    } else if !result.sanitized_vars.contains(&source.var)
+                        && tainted
+                            .get(&sink_block)
+                            .map(|t| t.contains(&source.var))
+                            .unwrap_or(false)
+                    {
+                        match &sink_statement {
+                            Some(stmt) => identifier_in_text(stmt, &source.var),
+                            None => false,
+                        }
+                    } else {
+                        false
+                    };
+
+                    if direct || indirect {
+                        let is_sanitized = result.sanitized_vars.contains(&sink_var)
+                            || result.sanitized_vars.contains(&source.var);
                         if !is_sanitized {
                             let path = compute_flow_path(source_block, sink_block, &successors);
                             let flow = TaintFlow {

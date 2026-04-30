@@ -203,7 +203,13 @@ fn parse_block_doc_comment(text: &str) -> Option<String> {
 }
 
 /// Extract functions with full details
-fn extract_functions_detailed(tree: &Tree, source: &str, language: Language) -> Vec<FunctionInfo> {
+///
+/// (vuln-migration-v1 M3, premortem T3/DR3 amendment) Visibility extended from
+/// private `fn` to `pub(crate)` so `tldr_core::security::vuln::scan_file_vulns`
+/// can enumerate functions with line ranges for the per-function
+/// `compute_taint_with_tree` dispatch loop. NOT part of the external library
+/// API; internal-only consumers within tldr-core.
+pub(crate) fn extract_functions_detailed(tree: &Tree, source: &str, language: Language) -> Vec<FunctionInfo> {
     let mut functions = Vec::new();
     let root = tree.root_node();
 
@@ -233,7 +239,13 @@ fn extract_functions_detailed(tree: &Tree, source: &str, language: Language) -> 
 }
 
 /// Extract classes with full details
-fn extract_classes_detailed(tree: &Tree, source: &str, language: Language) -> Vec<ClassInfo> {
+///
+/// (vuln-migration-v1 M3) Visibility extended from private `fn` to `pub(crate)`
+/// alongside `extract_functions_detailed` so `vuln::scan_file_vulns` can
+/// enumerate per-method ranges for languages whose method definitions live
+/// only inside class/object/trait bodies (Scala `object M { def f ... }`,
+/// Java `class C { void f(){} }`, etc.). NOT part of the external library API.
+pub(crate) fn extract_classes_detailed(tree: &Tree, source: &str, language: Language) -> Vec<ClassInfo> {
     let mut classes = Vec::new();
     let root = tree.root_node();
 
