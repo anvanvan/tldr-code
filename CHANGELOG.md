@@ -1,5 +1,129 @@
 # Changelog
 
+## sanitizer-removal-v1 — internal milestone
+
+NOT a published release. Internal-versioning posture: external `cargo publish`
+deferred until ALL anti-product surfaces close end-to-end.
+
+This milestone closes the "tainted-forever tiger" carry-forward from
+regex-removal-v1 W3 T1: sanitizer dispatch is now regex-free across all 16
+supported languages. The W2-pre `detect_sanitizer_ast` per-line helper (dead
+code at HEAD `db8f2bd`'s parent) is now wired through the worklist via a new
+`build_sanitizer_ast_index` WALK-ONCE-INDEX-BY-LINE helper consumed by both
+`process_block` and `ssa_propagate`. The 30 regex sanitizer `Vec` entries
+across 16 `*_PATTERNS` banks are deleted, dispatch is flipped from
+AST-FIRST-WITH-REGEX-FALLBACK to AST-only at both worklist sites, and the #24
+string-literal substring FP closure (originally delivered for sources/sinks
+in regex-removal-v1) is generalized to sanitizers.
+
+### Changed
+
+- **Sanitizer detection is now AST-only** via the new
+  `build_sanitizer_ast_index` (M2-added WALK-ONCE-INDEX-BY-LINE helper)
+  consumed by both `process_block` and `ssa_propagate`.
+  `detect_sanitizer_ast` (was dead code at `taint.rs:3490`) is preserved
+  as the per-line public API; the worklist consumes the index instead.
+- **M2 extended `process_block` signature + `SsaPropagateCtx` struct** to
+  thread the index through (private API only).
+- **M4 flipped dispatch** from AST-FIRST-WITH-REGEX-FALLBACK to AST-only at
+  both `process_block` (~L4109) and `ssa_propagate` (~L4358).
+- **M4 added `mask_string_literal_descendants`** helper inside
+  `build_sanitizer_ast_index` to address M3-FIND-01 — masks string-literal
+  descendant byte ranges with ASCII spaces in a copy of the descendant text
+  before passing to `member_patterns_match`'s raw-substring fallback. Closes
+  a latent collision class for 13 langs that use raw-substring sanitizer
+  entries (Rust, Ruby, Elixir, etc.).
+- **M1 extended `AST_ONLY_TEST_MODE` thread-local check** by 3 LOC at
+  `taint.rs:1096` to also short-circuit `detect_sanitizer`. The
+  `AstOnlyTestModeGuard` (added in field_access_info-extension-v1 M1,
+  commit `49ed30c`) now uniformly short-circuits sources, sinks, AND
+  sanitizers.
+
+### Added
+
+- **M3 added 2 raw-fallback parity entries:**
+  - `TYPESCRIPT_AST_SANITIZERS`: `("*", "parse")` + `("*", "safeParse")`
+    `Numeric` (Zod-style schema validation; was regex-only).
+  - `CPP_AST_SANITIZERS`: moved `std::stoi` and `static_cast<int>` to
+    `call_names` (verified `extract_call_name_c` returns the exact
+    strings). Restricts to `call_expression` descendants only — string
+    literals are structurally excluded; resolves M2-FIND-01 string-literal
+    regression introduced when wiring activated.
+
+### Removed
+
+- **30 regex sanitizer Vec entries** across 16 `*_PATTERNS` `lazy_static`
+  banks (Python ×3, TS ×3, Go ×2, Java ×2, Rust ×1, C ×2, Cpp ×2, Ruby ×2,
+  Kotlin ×1, Swift ×2, CSharp ×2, Scala ×2, PHP ×3, Lua ×1, Elixir ×2,
+  OCaml ×1).
+- **24 obsolete unit tests** across 2 files:
+  - `crates/tldr-core/src/security/taint_tests.rs`: 17
+    `test_<lang>_detect_sanitizers` (typescript, javascript, go, java,
+    rust, c, cpp, ruby, kotlin, swift, csharp, scala, php, lua, luau,
+    elixir, ocaml) + 3 Python-named-shape sanitizer tests
+    (`test_int_sanitizes_sql_injection`,
+    `test_shlex_quote_sanitizes_command_injection`,
+    `test_html_escape_sanitizes_xss`).
+  - `crates/tldr-core/tests/security_tests.rs`: 4
+    `test_detect_sanitizer_*` tests (`python_int`, `python_shlex`,
+    `python_html_escape`, `typescript`).
+- **M4 removed unused params** (`statements`, `language`) from
+  `process_block` and `SsaPropagateCtx` post-dispatch-flip — genuinely no
+  longer needed.
+
+### Retained
+
+- **Public API preserved as no-ops:** `detect_sanitizer` (regex),
+  `is_sanitizer`, `find_sanitizers_in_statement` — all iterate the now-empty
+  `patterns.sanitizers` Vec; behavior change is `None`/`false`/empty Vec but
+  signatures unchanged. Signature preservation maintains backward
+  compatibility for any external caller; deletion deferred to a future
+  `patterns-shell-cleanup-v1` milestone.
+- **All 16 `LanguagePatterns` struct shells** (`sources`/`sinks`/
+  `sanitizers` all empty Vecs) — preserves rollback margin; cleanup
+  deferred.
+- **`detect_sanitizer_ast` per-line public API** at `taint.rs:3490` — kept
+  alongside the new walk-once index helper for external callers.
+- **Compute-taint level sanitizer tests in both files** (e.g.,
+  `test_sanitizer_removes_taint`, `test_no_vulnerability_when_sanitized`,
+  `test_compute_taint_sanitizer_removes_taint`,
+  `test_sanitizer_type_serialization`).
+
+### Issues closed (binary-verified)
+
+- **"Tainted-forever tiger" carry-forward from regex-removal-v1 W3 T1:**
+  closed. Sanitizer dispatch is now regex-free across all 16 languages.
+- **Generalized #24 string-literal substring FP closure to sanitizers:**
+  14 `*_in_string_literal_does_not_sanitize` regression-guards transitioned
+  RED→GREEN. Binary-verified ZERO findings on string-literal fixtures
+  across Python/TS/Ruby/Rust at `/tmp/v041-verify/`.
+- **Positive control verified:** real sanitizer call (e.g., Python
+  `safe = int(raw)`) breaks flow correctly (UserInput source + CodeEval
+  sink detected, ZERO vulnerabilities).
+
+### Architectural notes
+
+- **NO source change** to `field_access_info`, `extract_call_name_*`
+  helpers, or `member_patterns_match` (validator mandates honored). M2's
+  wiring lives entirely in new private helpers + private struct extensions.
+- **The `mask_string_literal_descendants` helper** is a localized fix to
+  the AST raw-substring fallback collision class — operates on a copied
+  byte buffer, doesn't change the `member_patterns_match` matcher itself,
+  and is contained inside `build_sanitizer_ast_index`.
+- **Premortem caught 3 hard blockers pre-/autonomous:** M3 reframed
+  parity-fill→parity-audit, M4 obsolete-test enumeration expanded
+  13-16→24, M1 RED harness API reference fixed. Discipline pattern:
+  discriminative premortem-by-static-inspection complements
+  integration-test RED gates.
+
+### Standing rules upheld
+
+- **Internal-versioning posture.** External `cargo publish` deferred. One
+  future internal milestone queued before the next external publish:
+  `vuln-migration-v1`.
+- No push, no `cargo publish`, no `Cargo.toml` version bump in this
+  milestone. `Cargo.lock` not staged. Explicit-add staging only.
+
 ## field_access_info-extension-v1 — internal milestone
 
 NOT a published release. Internal-versioning posture: external `cargo publish`
