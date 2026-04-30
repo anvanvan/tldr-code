@@ -207,6 +207,10 @@ fn test_taint_sink_type_variants() {
     // - CodeCompile: compile()
     // - ShellExec: os.system(), subprocess.run()
     // - FileWrite: open(..., 'w'), .write_text()
+    // - HtmlOutput: HTML/template raw output (XSS sink)
+    // - FileOpen: file system path access (path-traversal sink, distinct from FileWrite)
+    // - HttpRequest: outbound HTTP/URL request (SSRF sink)
+    // - Deserialize: untrusted-data deserialization (RCE-via-deser sink)
 
     let variants = [
         TaintSinkType::SqlQuery,
@@ -215,8 +219,12 @@ fn test_taint_sink_type_variants() {
         TaintSinkType::CodeCompile,
         TaintSinkType::ShellExec,
         TaintSinkType::FileWrite,
+        TaintSinkType::HtmlOutput,
+        TaintSinkType::FileOpen,
+        TaintSinkType::HttpRequest,
+        TaintSinkType::Deserialize,
     ];
-    assert_eq!(variants.len(), 6);
+    assert_eq!(variants.len(), 10);
 }
 
 /// Tests that TaintInfo struct has required fields

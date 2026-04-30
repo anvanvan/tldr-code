@@ -163,6 +163,14 @@ pub enum TaintSinkType {
     ShellExec,
     /// File writes: `open(..., 'w')`, `.write_text()`
     FileWrite,
+    /// HTML/template raw output (XSS sink).
+    HtmlOutput,
+    /// File system path access (path-traversal sink). Distinct from FileWrite which is write-only.
+    FileOpen,
+    /// Outbound HTTP/URL request (SSRF sink).
+    HttpRequest,
+    /// Untrusted-data deserialization (RCE-via-deser sink).
+    Deserialize,
 }
 
 /// Sanitizer types that neutralize taint.
