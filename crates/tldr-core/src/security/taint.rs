@@ -1708,6 +1708,56 @@ static PYTHON_AST_SINKS: &[AstSinkPattern] = &[
         member_patterns: &[("*", "write")],
         sink_type: TaintSinkType::FileWrite,
     },
+    // VULN-MIGRATION-V1 M2: HtmlOutput (Xss) sinks per vuln.rs L382-L386.
+    // `Markup(`, `mark_safe(` are bare calls; `|safe` is a Jinja filter
+    // (substring inside template strings) — raw fallback.
+    AstSinkPattern {
+        call_names: &["Markup", "mark_safe"],
+        member_patterns: &[("", "|safe")],
+        sink_type: TaintSinkType::HtmlOutput,
+    },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L514-L520.
+    // `open(` is a bare builtin; `Path(` is a constructor call. shutil/os.path
+    // are member-access shapes.
+    AstSinkPattern {
+        call_names: &["open", "Path"],
+        member_patterns: &[
+            ("os.path", "join"),
+            ("shutil", "copy"),
+            ("shutil", "move"),
+        ],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: HttpRequest (Ssrf) sinks per vuln.rs L616-L630.
+    AstSinkPattern {
+        call_names: &["urlopen"],
+        member_patterns: &[
+            ("requests", "get"),
+            ("requests", "post"),
+            ("requests", "put"),
+            ("requests", "delete"),
+            ("requests", "head"),
+            ("requests", "patch"),
+            ("requests", "request"),
+            ("urllib.request", "urlopen"),
+            ("httpx", "get"),
+            ("httpx", "post"),
+            ("httpx", "request"),
+            ("aiohttp", "ClientSession"),
+        ],
+        sink_type: TaintSinkType::HttpRequest,
+    },
+    // VULN-MIGRATION-V1 M2: Deserialize sinks per vuln.rs L713-L718.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("pickle", "load"),
+            ("pickle", "loads"),
+            ("yaml", "load"),
+            ("yaml", "unsafe_load"),
+        ],
+        sink_type: TaintSinkType::Deserialize,
+    },
 ];
 
 static PYTHON_AST_SANITIZERS: &[AstSanitizerPattern] = &[
@@ -1963,6 +2013,60 @@ static TYPESCRIPT_AST_SINKS: &[AstSinkPattern] = &[
         ],
         sink_type: TaintSinkType::FileWrite,
     },
+    // VULN-MIGRATION-V1 M2: HtmlOutput (Xss) sinks per vuln.rs L387-L394.
+    // `outerHTML` is a property name (member shape with wildcard receiver).
+    // `document.writeln` is member-access. `.html(` is jQuery method.
+    //
+    // PARITY NOTE — pattern subset deliberately avoids double-coverage with
+    // existing FileWrite entries: `("*", "innerHTML")`, `("document", "write")`,
+    // `("", "dangerouslySetInnerHTML")` already fire as FileWrite (pre-M2,
+    // regex-removal-v1 W1-M1 wired them as the closest available enum variant
+    // before HtmlOutput existed). Per dispatch-contract M2 line 156 (no
+    // double-coverage), they are NOT re-added here. M3 vuln_type_from_sink
+    // projects FileWrite -> Xss/PathTraversal/etc. via context-aware mapping
+    // OR a future reclassification milestone may flip these entries to
+    // HtmlOutput; that is out of scope for M2.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("*", "outerHTML"),
+            ("document", "writeln"),
+            ("*", "html"),
+        ],
+        sink_type: TaintSinkType::HtmlOutput,
+    },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L521-L527.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("fs", "readFile"),
+            ("fs", "writeFile"),
+            ("fs", "readFileSync"),
+            ("fs", "writeFileSync"),
+            ("path", "join"),
+        ],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: HttpRequest (Ssrf) sinks per vuln.rs L631-L646.
+    // `fetch(`, `got(`, `node-fetch(` are bare calls. `axios(` is also bare.
+    // `node-fetch` is a hyphenated identifier — raw fallback.
+    AstSinkPattern {
+        call_names: &["fetch", "got", "axios"],
+        member_patterns: &[
+            ("axios", "get"),
+            ("axios", "post"),
+            ("axios", "put"),
+            ("axios", "delete"),
+            ("axios", "request"),
+            ("http", "get"),
+            ("http", "request"),
+            ("https", "get"),
+            ("https", "request"),
+            ("superagent", "get"),
+            ("", "node-fetch("),
+        ],
+        sink_type: TaintSinkType::HttpRequest,
+    },
 ];
 
 static TYPESCRIPT_AST_SANITIZERS: &[AstSanitizerPattern] = &[
@@ -2055,6 +2159,31 @@ static GO_AST_SINKS: &[AstSinkPattern] = &[
         member_patterns: &[("template", "HTML"), ("fmt", "Fprintf")],
         sink_type: TaintSinkType::FileWrite,
     },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L528-L534.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("os", "Open"),
+            ("os", "Create"),
+            ("ioutil", "ReadFile"),
+            ("ioutil", "WriteFile"),
+            ("filepath", "Join"),
+        ],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: HttpRequest (Ssrf) sinks per vuln.rs L647-L654.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("http", "Get"),
+            ("http", "Post"),
+            ("http", "PostForm"),
+            ("http", "Head"),
+            ("http", "NewRequest"),
+            ("http", "NewRequestWithContext"),
+        ],
+        sink_type: TaintSinkType::HttpRequest,
+    },
 ];
 
 static GO_AST_SANITIZERS: &[AstSanitizerPattern] = &[
@@ -2128,6 +2257,51 @@ static JAVA_AST_SINKS: &[AstSinkPattern] = &[
         member_patterns: &[("Class", "forName")],
         sink_type: TaintSinkType::CodeEval,
     },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L541-L546.
+    // `new File(` is an object_creation_expression — raw fallback.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("Files", "readString"),
+            ("Files", "writeString"),
+            ("Paths", "get"),
+            ("", "new File("),
+        ],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: HttpRequest (Ssrf) sinks per vuln.rs L655-L666.
+    // `URL(` matches `new URL(...)` constructor; `RestTemplate` is a class
+    // identifier — raw fallback. `URI.create` and `HttpRequest.newBuilder`
+    // are structural. The wildcard `.send(`, `.openConnection(`, etc. use
+    // `*` receiver.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("URI", "create"),
+            ("HttpRequest", "newBuilder"),
+            ("HttpClient", "newHttpClient"),
+            ("*", "openConnection"),
+            ("*", "openStream"),
+            ("*", "send"),
+            ("*", "getForObject"),
+            ("*", "postForObject"),
+            ("", "URL("),
+            ("", "RestTemplate"),
+        ],
+        sink_type: TaintSinkType::HttpRequest,
+    },
+    // VULN-MIGRATION-V1 M2: Deserialize sinks per vuln.rs L719-L723.
+    // `ObjectInputStream` and `XMLDecoder` are class identifiers — raw fallback.
+    // `readObject(` is a method call (wildcard receiver).
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("*", "readObject"),
+            ("", "ObjectInputStream"),
+            ("", "XMLDecoder"),
+        ],
+        sink_type: TaintSinkType::Deserialize,
+    },
 ];
 
 static JAVA_AST_SANITIZERS: &[AstSanitizerPattern] = &[
@@ -2196,6 +2370,48 @@ static RUST_AST_SINKS: &[AstSinkPattern] = &[
         member_patterns: &[("", "std::ptr::write"), ("", "std::ptr::read")],
         sink_type: TaintSinkType::FileWrite,
     },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L535-L540.
+    // All four shapes are scoped_identifier paths — raw fallback.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("", "std::fs::read_to_string"),
+            ("", "std::fs::write"),
+            ("", "File::open"),
+            ("", "PathBuf::from"),
+        ],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: HttpRequest (Ssrf) sinks per vuln.rs L667-L676.
+    // `reqwest::get`, `reqwest::Client`, `ureq::get`, `ureq::post`,
+    // `hyper::Client`, `Url::parse` are scoped_identifier paths — raw fallback.
+    // `.get(` / `.post(` use wildcard receiver (matches reqwest/ureq client
+    // method calls).
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("*", "get"),
+            ("*", "post"),
+            ("", "reqwest::get"),
+            ("", "reqwest::Client"),
+            ("", "ureq::get"),
+            ("", "ureq::post"),
+            ("", "hyper::Client"),
+            ("", "Url::parse"),
+        ],
+        sink_type: TaintSinkType::HttpRequest,
+    },
+    // VULN-MIGRATION-V1 M2: Deserialize sinks per vuln.rs L724-L728.
+    // All scoped_identifier paths — raw fallback.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("", "serde_json::from_str"),
+            ("", "serde_yaml::from_str"),
+            ("", "bincode::deserialize"),
+        ],
+        sink_type: TaintSinkType::Deserialize,
+    },
 ];
 
 static RUST_AST_SANITIZERS: &[AstSanitizerPattern] = &[AstSanitizerPattern {
@@ -2255,6 +2471,14 @@ static C_AST_SINKS: &[AstSinkPattern] = &[
         member_patterns: &[],
         sink_type: TaintSinkType::FileWrite,
     },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L547-L551.
+    // Note: `open` is NOT C's typical `fopen` — it's the POSIX `open(fd, ...)`
+    // syscall. Both `open` and `fopen` are bare calls.
+    AstSinkPattern {
+        call_names: &["fopen", "open", "freopen"],
+        member_patterns: &[],
+        sink_type: TaintSinkType::FileOpen,
+    },
 ];
 
 static C_AST_SANITIZERS: &[AstSanitizerPattern] = &[
@@ -2300,6 +2524,24 @@ static CPP_AST_SINKS: &[AstSinkPattern] = &[
         call_names: &["sprintf"],
         member_patterns: &[],
         sink_type: TaintSinkType::ShellExec,
+    },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L552-L556.
+    // `std::ifstream(` / `std::ofstream(` are constructor calls (qualified
+    // identifier) — raw fallback. `fopen(` is the C function (bare call).
+    AstSinkPattern {
+        call_names: &["fopen"],
+        member_patterns: &[("", "std::ifstream"), ("", "std::ofstream")],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: Deserialize sinks per vuln.rs L729-L738.
+    // Both are qualified-identifier shapes — raw fallback.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("", "boost::archive::text_iarchive"),
+            ("", "cereal::BinaryInputArchive"),
+        ],
+        sink_type: TaintSinkType::Deserialize,
     },
 ];
 
@@ -2421,6 +2663,54 @@ static RUBY_AST_SINKS: &[AstSinkPattern] = &[
         member_patterns: &[("*", "send")],
         sink_type: TaintSinkType::CodeEval,
     },
+    // VULN-MIGRATION-V1 M2: HtmlOutput (Xss) sinks per vuln.rs L395-L399.
+    // `html_safe` is a bare method on a string receiver (wildcard). `raw(` is
+    // a Rails view helper (bare call). `render html:` is a method call with
+    // a keyword argument — raw substring fallback.
+    AstSinkPattern {
+        call_names: &["raw"],
+        member_patterns: &[("*", "html_safe"), ("", "render html:")],
+        sink_type: TaintSinkType::HtmlOutput,
+    },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L557-L562.
+    // `Pathname.new(` is a constructor — raw fallback.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("File", "open"),
+            ("File", "read"),
+            ("File", "write"),
+            ("", "Pathname.new("),
+        ],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: HttpRequest (Ssrf) sinks per vuln.rs L677-L687.
+    // `Net::HTTP.*`, `URI.*`, `RestClient.*`, `HTTParty.*` are scoped paths —
+    // raw fallback. Bare `open(` is Kernel#open (allows http:// URLs).
+    AstSinkPattern {
+        call_names: &["open"],
+        member_patterns: &[
+            ("", "Net::HTTP.get"),
+            ("", "Net::HTTP.post"),
+            ("", "Net::HTTP.start"),
+            ("", "URI.open"),
+            ("", "URI.parse"),
+            ("", "RestClient.get"),
+            ("", "RestClient.post"),
+            ("", "HTTParty.get"),
+        ],
+        sink_type: TaintSinkType::HttpRequest,
+    },
+    // VULN-MIGRATION-V1 M2: Deserialize sinks per vuln.rs L739-L743.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("Marshal", "load"),
+            ("YAML", "load"),
+            ("Psych", "load"),
+        ],
+        sink_type: TaintSinkType::Deserialize,
+    },
 ];
 
 static RUBY_AST_SANITIZERS: &[AstSanitizerPattern] = &[
@@ -2481,6 +2771,29 @@ static KOTLIN_AST_SINKS: &[AstSinkPattern] = &[
         ],
         sink_type: TaintSinkType::SqlQuery,
     },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L563-L568.
+    // `File(` is a constructor call — raw fallback.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("Files", "readString"),
+            ("Files", "writeString"),
+            ("Paths", "get"),
+            ("", "File("),
+        ],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: Deserialize sinks per vuln.rs L744-L747.
+    // `ObjectInputStream(` is a constructor — raw fallback.
+    // `readObject(` is a method call (wildcard receiver).
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("*", "readObject"),
+            ("", "ObjectInputStream("),
+        ],
+        sink_type: TaintSinkType::Deserialize,
+    },
 ];
 
 static KOTLIN_AST_SANITIZERS: &[AstSanitizerPattern] = &[AstSanitizerPattern {
@@ -2528,6 +2841,20 @@ static SWIFT_AST_SINKS: &[AstSinkPattern] = &[
         call_names: &["sqlite3_exec"],
         member_patterns: &[],
         sink_type: TaintSinkType::SqlQuery,
+    },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L569-L573.
+    // Swift labelled-argument constructor calls (`String(contentsOfFile:`,
+    // `Data(contentsOf:`) are unique syntax shapes — raw substring fallback.
+    // `FileManager.default.contents(atPath:` is a chained-call labelled
+    // argument — raw fallback.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("", "String(contentsOfFile:"),
+            ("", "Data(contentsOf:"),
+            ("", "FileManager.default.contents(atPath:"),
+        ],
+        sink_type: TaintSinkType::FileOpen,
     },
 ];
 
@@ -2595,6 +2922,38 @@ static CSHARP_AST_SINKS: &[AstSinkPattern] = &[
         member_patterns: &[("Activator", "CreateInstance")],
         sink_type: TaintSinkType::CodeEval,
     },
+    // VULN-MIGRATION-V1 M2: HtmlOutput (Xss) sinks per vuln.rs L405-L409.
+    // `Html.Raw(` and `AppendHtml(` are method calls. `@Html.Raw(` is a Razor
+    // operator-prefix template syntax — raw fallback (carry-forward documented
+    // per validator mandate razor_java_constructor_carry_forward_documented).
+    AstSinkPattern {
+        call_names: &["AppendHtml"],
+        member_patterns: &[
+            ("Html", "Raw"),
+            ("", "@Html.Raw("),
+        ],
+        sink_type: TaintSinkType::HtmlOutput,
+    },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L574-L579.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("File", "Open"),
+            ("File", "ReadAllText"),
+            ("File", "WriteAllText"),
+            ("Path", "Combine"),
+        ],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: Deserialize sinks per vuln.rs L748-L757.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("BinaryFormatter", "Deserialize"),
+            ("NetDataContractSerializer", "Deserialize"),
+        ],
+        sink_type: TaintSinkType::Deserialize,
+    },
 ];
 
 static CSHARP_AST_SANITIZERS: &[AstSanitizerPattern] = &[
@@ -2653,6 +3012,27 @@ static SCALA_AST_SINKS: &[AstSinkPattern] = &[
         call_names: &[],
         member_patterns: &[("*", "execute"), ("*", "executeQuery")],
         sink_type: TaintSinkType::SqlQuery,
+    },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L580-L585.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("Source", "fromFile"),
+            ("Files", "readString"),
+            ("Files", "writeString"),
+            ("Paths", "get"),
+        ],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: Deserialize sinks per vuln.rs L758-L761.
+    // `ObjectInputStream(` is a constructor — raw fallback.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("*", "readObject"),
+            ("", "ObjectInputStream("),
+        ],
+        sink_type: TaintSinkType::Deserialize,
     },
 ];
 
@@ -2728,6 +3108,61 @@ static PHP_AST_SINKS: &[AstSinkPattern] = &[
         member_patterns: &[("", "->query(")],
         sink_type: TaintSinkType::SqlQuery,
     },
+    // VULN-MIGRATION-V1 M2: HtmlOutput (Xss) sinks per vuln.rs L400-L404.
+    // `echo` and `print` are PHP statement-keywords (echo_statement / print_intrinsic);
+    // `<?= ` is the short-tag template raw output — all raw substring fallbacks.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("", "echo "),
+            ("", "print "),
+            ("", "<?= "),
+        ],
+        sink_type: TaintSinkType::HtmlOutput,
+    },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L586-L592.
+    // `include(` and `require(` are language constructs — raw substring
+    // fallback. Bare `fopen`, `file_get_contents`, `file_put_contents` are
+    // function calls (call_names path).
+    AstSinkPattern {
+        call_names: &["fopen", "file_get_contents", "file_put_contents"],
+        member_patterns: &[
+            ("", "include("),
+            ("", "require("),
+        ],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: HttpRequest (Ssrf) sinks per vuln.rs L688-L697.
+    // `Guzzle\Client` is a namespaced class identifier — raw fallback.
+    // `->request(` is PHP arrow-method-call — raw fallback (mirrors the
+    // existing PHP `->query(` SqlQuery convention).
+    // NOTE: `fopen` and `file_get_contents` deliberately appear in BOTH the
+    // FileOpen and HttpRequest sink banks — vuln.rs lists them under both
+    // VulnTypes because PHP's `fopen` / `file_get_contents` accept http://
+    // URLs (SSRF) AND filesystem paths (PathTraversal). The taint engine
+    // emits one TaintFlow per matching (pattern, descendant) pair, so the
+    // pattern is correctly mirrored from vuln.rs.
+    AstSinkPattern {
+        call_names: &[
+            "fopen",
+            "file_get_contents",
+            "curl_exec",
+            "curl_setopt",
+            "get_headers",
+            "readfile",
+        ],
+        member_patterns: &[
+            ("", "Guzzle\\Client"),
+            ("", "->request("),
+        ],
+        sink_type: TaintSinkType::HttpRequest,
+    },
+    // VULN-MIGRATION-V1 M2: Deserialize sinks per vuln.rs L762-L765.
+    AstSinkPattern {
+        call_names: &["unserialize", "yaml_parse"],
+        member_patterns: &[],
+        sink_type: TaintSinkType::Deserialize,
+    },
 ];
 
 static PHP_AST_SANITIZERS: &[AstSanitizerPattern] = &[
@@ -2783,6 +3218,22 @@ static LUA_AST_SINKS: &[AstSinkPattern] = &[
         member_patterns: &[],
         sink_type: TaintSinkType::CodeEval,
     },
+    // VULN-MIGRATION-V1 M2: HtmlOutput (Xss) sinks per vuln.rs L414-L417.
+    // OpenResty `ngx.say(` / `ngx.print(` — member-access shape.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[("ngx", "say"), ("ngx", "print")],
+        sink_type: TaintSinkType::HtmlOutput,
+    },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L593-L597.
+    // `io.open` is member-access; `dofile` and `loadfile` are bare calls but
+    // already wired as CodeEval above. Adding them here as FileOpen too
+    // mirrors vuln.rs's dual classification (file-load vector).
+    AstSinkPattern {
+        call_names: &["dofile", "loadfile"],
+        member_patterns: &[("io", "open")],
+        sink_type: TaintSinkType::FileOpen,
+    },
 ];
 
 // Lua sanitizers: zero member_patterns — type-annotation flip only.
@@ -2835,6 +3286,33 @@ static ELIXIR_AST_SINKS: &[AstSinkPattern] = &[
         call_names: &[],
         member_patterns: &[("Ecto.Adapters.SQL", "query")],
         sink_type: TaintSinkType::SqlQuery,
+    },
+    // VULN-MIGRATION-V1 M2: HtmlOutput (Xss) sinks per vuln.rs L410-L413.
+    // `Phoenix.HTML.raw(` is a multi-segment Module.function call —
+    // structural via (Phoenix.HTML, raw) tuple per Elixir `rfind('.')` shape.
+    // Bare `raw(` is a Phoenix view helper — call_names path.
+    AstSinkPattern {
+        call_names: &["raw"],
+        member_patterns: &[("Phoenix.HTML", "raw")],
+        sink_type: TaintSinkType::HtmlOutput,
+    },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L598-L602.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("File", "read"),
+            ("File", "write"),
+            ("Path", "join"),
+        ],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: Deserialize sinks per vuln.rs L766.
+    // `:erlang.binary_to_term(` is an Erlang-call shape (atom-prefixed) —
+    // raw fallback.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[("", ":erlang.binary_to_term(")],
+        sink_type: TaintSinkType::Deserialize,
     },
 ];
 
@@ -2904,6 +3382,23 @@ static OCAML_AST_SINKS: &[AstSinkPattern] = &[
         call_names: &[],
         member_patterns: &[("Sqlite3", "exec")],
         sink_type: TaintSinkType::SqlQuery,
+    },
+    // VULN-MIGRATION-V1 M2: FileOpen (PathTraversal) sinks per vuln.rs L603-L607.
+    // `open_in` and `open_out` are bare OCaml functions; `Filename.concat`
+    // is a Module.function call (structural via Elixir/OCaml rfind('.') path).
+    AstSinkPattern {
+        call_names: &["open_in", "open_out"],
+        member_patterns: &[("Filename", "concat")],
+        sink_type: TaintSinkType::FileOpen,
+    },
+    // VULN-MIGRATION-V1 M2: Deserialize sinks per vuln.rs L767-L770.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("Marshal", "from_channel"),
+            ("Marshal", "from_string"),
+        ],
+        sink_type: TaintSinkType::Deserialize,
     },
 ];
 
