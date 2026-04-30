@@ -3,6 +3,7 @@
   "title": "RED tests + TaintSinkType extension scaffold + perf baseline",
   "result": "GREEN",
   "head_commit_pre": "6d9a1d2",
+  "commit_sha": "cb32c12",
   "implemented": [
     "Added 4 ADDITIVE TaintSinkType variants (HtmlOutput, FileOpen, HttpRequest, Deserialize) at crates/tldr-core/src/security/taint.rs after FileWrite. Existing 6 variants (SqlQuery, CodeEval, CodeExec, CodeCompile, ShellExec, FileWrite) preserved verbatim — additive only per validator_mandate taintsinktype_extension_additive_only.",
     "Updated test_taint_sink_type_variants at crates/tldr-core/src/security/taint_tests.rs:202: variant array extended from 6 to 10, assert_eq! variants.len() == 10, doc-comment block extended with 4 new bullets (XSS sink, path-traversal sink, SSRF sink, deser sink). test_taint_source_type_variants left untouched (variants.len() == 6) — TaintSourceType is NOT extended.",
