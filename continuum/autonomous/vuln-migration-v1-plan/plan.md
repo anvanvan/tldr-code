@@ -81,8 +81,8 @@ Confirmed: **FP class is concentrated in the 14 fall-through languages** routed 
 
 | File | Type | Disposition | Rationale |
 |---|---|---|---|
-| `tldr-core/security/vuln.rs:68` | `TaintSource` | DELETE | Replace with canonical `taint::TaintSource` |
-| `tldr-core/security/vuln.rs:81` | `TaintSink` | DELETE | Replace with canonical `taint::TaintSink` |
+| `tldr-core/security/vuln.rs:68` | `TaintSource` | **RETAIN as output adapter** (premortem T2/DR2) | Existing field shape (`variable: String`, `source_type: String`, `expression: String`, `line: u32`) preserved. Inline propagation is replaced by canonical `taint::TaintSource`, but this struct stays as the **output-record adapter**: M3 adds `From<tldr_core::security::TaintSource>` impl that projects canonical → vuln-shape. CLI consumer at `tldr-cli/src/commands/remaining/vuln.rs:679-688` reads `f.source.line/expression/source_type` — unchanged post-migration. **NOT in M5 atomic deletion list.** |
+| `tldr-core/security/vuln.rs:81` | `TaintSink` | **RETAIN as output adapter** (premortem T2/DR2) | Same as above: existing field shape (`function: String`, `sink_type: String`, `expression: String`, `line: u32`) preserved. M3 adds `From<tldr_core::security::TaintSink>` impl. CLI consumer at `remaining/vuln.rs:684-691` reads `f.sink.line/expression/sink_type` unchanged. **NOT in M5 atomic deletion list.** The plan's prior "DELETE" wording was a contradiction with §5.2 — resolved here per discriminative premortem (commit c0a1107). |
 | `tldr-core/security/vuln.rs:38` | `VulnType` | RETAIN as user-facing ontology | Already mapped to CLI VulnType via `map_core_vuln_type` (exhaustive match per VAL-002 issue #11) |
 | `tldr-core/security/vuln.rs:94` | `VulnFinding` | RETAIN as output record | Constructed from canonical `TaintFlow` post-migration |
 | `tldr-core/security/vuln.rs:115/126` | `VulnSummary, VulnReport` | RETAIN | Output shape consumed by CLI |
@@ -161,18 +161,25 @@ Total: ~16 langs × 12 fixtures = **~190 tests**. Each fixture lives in `crates/
 - ADD doc-comments for each new variant.
 - ADD `pub use` exports through `security::mod.rs:24`.
 - DO NOT yet wire AST detection for the new variants (M2 work).
+- **UPDATE `test_taint_sink_type_variants` at `crates/tldr-core/src/security/taint_tests.rs:202`** (premortem T1/DR1 amendment). Change the assertion from `variants.len() == 6` to `variants.len() == 10`. Extend the per-variant `variants` array (currently L211-L218) to enumerate all 10 variants — append `TaintSinkType::HtmlOutput`, `TaintSinkType::FileOpen`, `TaintSinkType::HttpRequest`, `TaintSinkType::Deserialize`. Augment the doc-comment block (currently L203-L209) with one bullet per new variant explaining its semantics. Without this update, M1 `cargo test --workspace` fails deterministically. Note: `test_taint_source_type_variants` at L180 is **NOT** updated — `TaintSourceType` is not extended.
 
 **Deliverables:**
 - `crates/tldr-cli/tests/vuln_migration_v1_red.rs` (~700 LOC).
 - `crates/tldr-cli/tests/fixtures/vuln_migration_v1/` with ~190 fixture files.
 - `taint.rs:153` extended with 4 variants (compile-clean, no behavior change yet).
+- `taint_tests.rs:202` `test_taint_sink_type_variants` updated to assert variants.len() == 10 with all 10 variants enumerated.
+- `continuum/autonomous/vuln-migration-v1-plan/perf-fixture/` directory created with **20 representative Go files** (target shape mix: 5 files with >10 functions each, 5 with 3-10 functions each, 10 with 1-3 functions each — covers the per-function-CFG many-small-functions stress class flagged by premortem E2/E3/DR4).
 - `reports/M1-red-capture.json` and `reports/M1-test-enumeration.json`.
+- `reports/M1-perf-baseline.json` — wall-clock baseline on 20-file Go fixture for M3 stop-threshold gate (`time tldr vuln <fixture-dir> --lang go --format json > /dev/null`, 3× averaged + p99-file recorded).
+- `reports/M1-match-site-audit.json` — every `match`-on-`TaintSinkType` site discovered by `cargo check --workspace` post-extension.
 
 **Stop thresholds:**
 - All ~190 fixtures compile + new RED tests compile.
 - `cargo check --workspace` passes.
 - `cargo clippy --all-targets --workspace -- -D warnings` passes (TaintSinkType extension is complete + documented).
+- `cargo test --workspace` passes — including the updated `test_taint_sink_type_variants` (asserts variants.len() == 10).
 - RED capture: 14-lang × 6-vuln-types × 1 string-literal fixture = **84 tests EXPECTED FAIL deterministically** at HEAD; record per-test outcome.
+- `perf-fixture/` with 20 Go files committed; `M1-perf-baseline.json` records both **average** wall-clock AND **p99-file** wall-clock for use as M3 thresholds (avg <2× AND p99-file <5× per amendment DR4).
 
 ### M2 — Extend AST sink banks for HtmlOutput / FileOpen / HttpRequest / Deserialize across 16 LanguagePatterns
 
@@ -213,7 +220,7 @@ AstSinkPattern { call_names: vec!["requests.get", "requests.post", "urlopen", "h
 - `vuln.rs:140 get_sources` — DELETE (canonical AST source banks at `taint.rs:1700+` cover all 16 langs).
 - `vuln.rs:290 get_sinks` — DELETE (canonical AST sink banks post-M2 cover all 6 vuln categories).
 - `vuln.rs:1029-1280` — DELETE all the inline-propagation helpers (8 `extract_*` / `is_*` private functions).
-- `vuln.rs:68 TaintSource`, `vuln.rs:81 TaintSink` — DELETE.
+- `vuln.rs:68 TaintSource`, `vuln.rs:81 TaintSink` — **RETAIN as output adapters** (premortem T2/DR2 amendment). Add `From<tldr_core::security::TaintSource>` and `From<tldr_core::security::TaintSink>` impls in M3 to project canonical → vuln-shape. CLI consumers at `remaining/vuln.rs:679-688` continue reading these fields unchanged.
 - `vuln.rs:783 get_remediation`, `vuln.rs:801 get_cwe_id` — RETAIN (output-record helpers).
 - `vuln.rs:38 VulnType` — RETAIN.
 
@@ -223,19 +230,27 @@ fn scan_file_vulns(path: &Path, vuln_filter: Option<VulnType>) -> TldrResult<Vec
     let source = std::fs::read_to_string(path)?;
     let language = Language::from_path(path).ok_or(...)?;
 
-    // Discover functions in file via codemap.
-    let codemap = build_codemap(&source, language)?;
+    // Discover functions (with line ranges) using the canonical helper.
+    // Premortem T3/DR3: build_codemap() does NOT exist. The real helper is
+    // `tldr_core::ast::extract::extract_functions_detailed(tree, source, language)`
+    // which returns Vec<FunctionInfo> with (name, start_line, end_line). It is
+    // currently `fn` (private) at ast/extract.rs:206 — M3 extends visibility
+    // to `pub(crate)` (one-line change) so scan_file_vulns can call it.
+    let pool = ParserPool::new();
+    let tree = pool.parse(&source, language).ok_or(...)?;
+    let fn_infos = tldr_core::ast::extract::extract_functions_detailed(&tree, &source, language);
 
     let mut findings = Vec::new();
-    let pool = ParserPool::new();
-    let tree = pool.parse(&source, language).ok();
 
-    for fn_def in codemap.functions {
+    for fn_def in &fn_infos {
         let cfg = get_cfg_context(path, &fn_def.name, language)?;
         let dfg = get_dfg_context(path, &fn_def.name, language)?;
         let ssa = construct_minimal_ssa(&cfg, &dfg).ok();
         let statements: HashMap<u32, String> = source.lines().enumerate()
-            .filter(|(i, _)| within_fn_range(i, &fn_def))
+            .filter(|(i, _)| {
+                let line_no = (i + 1) as u32;
+                line_no >= fn_def.start_line && line_no <= fn_def.end_line
+            })
             .map(|(i, line)| ((i + 1) as u32, line.to_string()))
             .collect();
 
@@ -280,7 +295,7 @@ fn vuln_type_from_sink(s: TaintSinkType) -> VulnType {
 - All ~190 M1 RED tests transition GREEN — both positive (vuln expected, found) AND string-literal regression (zero vuln expected, none reported).
 - 14 of 14 fall-through languages pass FP-class regression: `tldr vuln <fixture> --lang <L>` returns 0 findings on string-literal fixtures.
 - Pre-existing `test_e2e_*` E2E tests at `vuln.rs:1568–2100` ALL still GREEN — they are the primary regression guard.
-- Performance: 20-file Go fixture runs in < 2× pre-migration wall-clock (baseline captured in M1).
+- Performance (per amendment DR4/E2): 20-file Go fixture **average** wall-clock < 2× M1 baseline AND **p99-file** wall-clock < 5× M1 baseline. The two-axis gate guards against the many-small-functions class (per-function CFG amortization risk per premortem E2). If either axis fails, parallelize per-file with rayon BEFORE declaring M3 GREEN.
 
 ### M4 — Collapse `tldr-cli/remaining/vuln.rs` Python path onto canonical taint
 
@@ -337,7 +352,12 @@ fn analyze_file(path: &Path) -> Result<Vec<VulnFinding>, RemainingError> {
 - `vuln.rs:1399 test_type_coercion_*` — DELETE (`is_type_coerced` deleted in M3; type-coercion semantics now live in canonical sanitizer dispatch via `Numeric` SanitizerType from sanitizer-removal-v1).
 - `vuln.rs:1497 test_sanitized_sql_*`, `test_sanitized_command_*`, `test_unsanitized_*` — DELETE (sanitizer detection now flows through canonical AST sanitizer dispatch already in place since sanitizer-removal-v1).
 
-**Estimated obsolete-test count:** ~30 tests across `vuln.rs` inline + ~6 in `remaining/vuln.rs`. Exact list verified in M1 enumeration (`reports/M1-test-enumeration.json`) — gating for M5.
+**Estimated obsolete-test count:** ~30 tests across `vuln.rs` inline + ~6 in `remaining/vuln.rs`. **Authoritative count lives in `reports/M1-test-enumeration.json`** (per amendment `obsolete_test_count_authoritative_in_m1`); plan §1 (~36) / §M5 stop-threshold (~26) / investigation.json (~26) numerical claims are decorative — M1 enumeration is the single source of truth and is GATING for M5.
+
+**NOT deleted in M5 (premortem T2/DR2 amendment):**
+- `tldr_core::security::vuln::TaintSource` struct at `vuln.rs:68` — RETAINED as output adapter (see §5.2). M3 adds `From<canonical::TaintSource>` impl.
+- `tldr_core::security::vuln::TaintSink` struct at `vuln.rs:81` — RETAINED as output adapter. M3 adds `From<canonical::TaintSink>` impl.
+- M5 atomic deletion is constrained to **obsolete unit tests + dead-code helpers**; the output-record adapters are part of the preserved public-output ABI per `cli_output_shape_unchanged` mandate.
 
 **Atomic commit reasoning:** the M3 deletion of `extract_assigned_variable`/`is_type_coerced` and the M3 introduction of new `scan_file_vulns` would leave dangling unit tests if not bundled. Atomic semantics ensure cargo test --workspace stays GREEN throughout.
 
@@ -464,6 +484,8 @@ Plus the existing 30+ E2E tests at `vuln.rs:1568-2100` that act as the primary r
 ```
 
 ### 5.2 `TaintFlow → VulnFinding` projection
+
+**Adapter pattern (premortem T2/DR2 resolution):** The output structs `tldr_core::security::vuln::TaintSource` (vuln.rs:68) and `tldr_core::security::vuln::TaintSink` (vuln.rs:81) are RETAINED with their existing field shapes (`variable`, `source_type: String`, `expression`, `line` for source; `function`, `sink_type: String`, `expression`, `line` for sink). M3 adds `From<tldr_core::security::TaintSource>` and `From<tldr_core::security::TaintSink>` impls performing the projection from the canonical (enum-typed) types to the vuln (string-typed) types. The CLI consumer at `crates/tldr-cli/src/commands/remaining/vuln.rs:679-688` reads `f.source.line/expression/source_type` and `f.sink.line/expression/sink_type` unchanged. The previous §1 "DELETE" wording is superseded.
 
 The canonical `TaintFlow` has fields: `source: TaintSource`, `sink: TaintSink`, `path: Vec<usize>` (block IDs). The `VulnFinding` output record needs:
 
@@ -603,6 +625,13 @@ Validator mandates encoded into the dispatch contract:
 - `public_api_unchanged_external` — `pub use` exports at `tldr-core/security/mod.rs` preserve same names; `scan_vulnerabilities` signature preserved; `tldr vuln` clap args preserved; JSON/SARIF schema preserved.
 - `vuln_rs_internal_collapse_only` — `tldr-core/security/vuln.rs` may be reduced to a thin wrapper but MUST remain a module (don't delete the file, don't rename, don't remove from mod.rs).
 - `closes_issues_verified_binary` — M5 stop-threshold runs `tldr vuln` against `/tmp/vuln-mig-repro/string_literal_fp.go` (--lang go) and `fp2.ts` (--lang typescript) and asserts ZERO findings on each.
+- `m1_test_variant_count_update` (premortem T1/DR1) — M1 MUST update `test_taint_sink_type_variants` at `crates/tldr-core/src/security/taint_tests.rs:202` to assert `variants.len() == 10`, with the per-variant array extended to enumerate all 10 variants (HtmlOutput/FileOpen/HttpRequest/Deserialize appended). Without this, M1 `cargo test --workspace` fails deterministically.
+- `adapter_pattern_retains_vuln_structs` (premortem T2/DR2) — `tldr_core::security::vuln::TaintSource` and `tldr_core::security::vuln::TaintSink` are RETAINED as **output adapter structs** with their existing field shapes. M3 adds `From<canonical::TaintSource>` and `From<canonical::TaintSink>` impls. CLI consumers at `crates/tldr-cli/src/commands/remaining/vuln.rs:679-688` continue reading these fields unchanged. M5 atomic deletion does NOT delete these structs. The plan's prior `§1` "DELETE" wording is superseded by this mandate.
+- `m3_uses_real_helper` (premortem T3/DR3) — M3 MUST use `tldr_core::ast::extract::extract_functions_detailed` (at `ast/extract.rs:206`) for per-function range extraction. The fictional `build_codemap()` reference in the prior §3-M3 sketch is replaced. If `extract_functions_detailed`'s private `fn` visibility blocks usage, M3 extends to `pub(crate)` (one-line change). NO new helper invented.
+- `m3_perf_two_axis_gate` (premortem DR4/E2) — M3 stop-threshold gates on BOTH (a) average wall-clock < 2× M1 baseline AND (b) p99-file wall-clock < 5× M1 baseline. M1 `perf-fixture/` MUST contain shape-mixed Go files: 5 with >10 functions each, 5 with 3-10, 10 with 1-3.
+- `m1_perf_fixture_directory_required` (premortem E3) — M1 MUST create `continuum/autonomous/vuln-migration-v1-plan/perf-fixture/` populated with 20 representative Go files. Without it, M3 perf gate is unreproducible.
+- `pre_publish_binary_verification_post_m6` (premortem E4/DR5) — After the M6 local tag lands, BEFORE any external `cargo publish`, an additional binary-verification phase runs and emits `reports/pre-publish-binary-verification.json`. Four checks: (1) `tldr vuln` against the tldr-code repo's own `crates/` (capture findings count + shape, expect no FPs of the closes-#24 class); (2) `cargo test --workspace --features semantic` (full taint regression suite GREEN); (3) `cargo doc --no-deps -p tldr-core` clean (no broken doc-link warnings on new TaintSinkType variants); (4) `tldr vuln` smoke against a known-tainted real-world Python project (e.g., a Flask app with intentional sources/sinks) with expected output captured. M6 produces this artifact; the publish operator gates on the JSON verdict. NO push, NO publish in this milestone bundle — the artifact is informational/operator-handoff.
+- `obsolete_test_count_authoritative_in_m1` (premortem E1 / non-blocking obs reconciliation) — Numerical counts of obsolete tests are inconsistent across plan §1 (~36), §M5 stop-threshold (~26), and investigation.json (~26). The **authoritative count** is `reports/M1-test-enumeration.json` produced in M1; all other locations (CHANGELOG draft §6, M5 stop-thresholds, investigation) defer to that artifact. M1 MUST commit the enumeration before M5 fires.
 
 ---
 
