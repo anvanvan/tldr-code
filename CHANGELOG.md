@@ -1,5 +1,121 @@
 # Changelog
 
+## field_access_info-extension-v1 — internal milestone
+
+NOT a published release. Internal-versioning posture: external `cargo publish`
+deferred until ALL anti-product surfaces close end-to-end.
+
+This milestone reframes the original "extend `field_access_info`" framing into
+a mechanical entry-shape migration. The Wave-2-pre `member_patterns_match`
+call-shape path (added during regex-removal-v1) is now load-bearing for the
+three HOLD languages — Ruby, Elixir, OCaml — whose `Module.function` call
+shapes were not yet routed through structured AST entries when regex-removal-v1
+landed. With this milestone, those 19 entries are migrated to structured
+`(Module, function)` tuples and the corresponding regex source+sink banks for
+those three languages are deleted (sanitizer banks retained).
+
+### Changed
+
+- **Structured `(Module, function)` AST entries shipped for 3 HOLD languages**
+  across 19 entries:
+  - **Ruby** (6): `STDIN.read`, `STDIN.gets`, `STDIN.readline` (sources);
+    `File.read`, `File.open`, `IO.popen` (sinks).
+  - **Elixir** (7): `IO.gets`, `System.get_env`, `File.read`, `File.read!`
+    (sources); `System.cmd`, `Code.eval_string`, `Ecto.Adapters.SQL.query`
+    (sinks).
+  - **OCaml** (6): `Sys.getenv`, `In_channel.read_all`, `In_channel.input_all`
+    (sources); `Sys.command`, `Unix.execvp`, `Sqlite3.exec` (sinks).
+- **W2-pre call-shape path in `member_patterns_match` is now load-bearing for
+  these 3 languages.** The path splits dotted call names from
+  `extract_call_name_*` on `rfind('.')` and matches structured
+  `(receiver, field)` tuples — added during regex-removal-v1 as a baseline-
+  language enabler, now extended in scope to cover Ruby/Elixir/OCaml.
+- **OCaml AST var-extraction extended (M5)** to handle `application_expression`
+  shape. Added an OCaml-specific branch to `extract_first_identifier_arg_ast`:
+  unlike `call_expression` (which has a named `arguments` field), OCaml's
+  `application_expression` exposes `child(0)` as the function and
+  `child(1..)` as the args, so the existing field lookup did not fire.
+- **Ruby AST pattern dispatch order corrected (M5).** The structured
+  `('STDIN', 'gets')` Stdin member pattern was moved BEFORE the UserInput
+  `call_names: ['gets']` entry in `RUBY_AST_SOURCES` so that the more-specific
+  member-shape fires first; otherwise the `ends_with('.gets')` heuristic in
+  the UserInput path would shadow it on `STDIN.gets` lines.
+- **String-literal regression-guard auto-fix (M5).** `detect_sources_ast` and
+  `detect_sinks_ast` now apply two fallbacks when an AST hit's argument list
+  contains only string literals (no identifier arg):
+  (1) text-fallback via `extract_source_var_from_statement`, and
+  (2) synthetic-var-from-call-name fallback. Without these, AST hits whose
+  args are all string literals (common for `File.read("/path")`-shaped sinks)
+  would silently drop their source/sink emission after the regex banks are
+  removed.
+
+### Retained
+
+- **All 16 sanitizer regex banks** across all languages — same posture as
+  regex-removal-v1; sanitizer AST dispatch is deferred to the
+  `sanitizer-removal-v1` future internal milestone.
+- **Subscript-shape AST entries in `RUBY_AST_SOURCES`:** `("", "params[")` and
+  `("", "ENV[")`. Subscripts are not `Module.function`-shaped; tree-sitter
+  parses them as `element_reference`, not `call`, so the W2-pre call-shape
+  path does not apply. These entries continue to use the existing subscript
+  matcher.
+- **`\bgets\b` regex entry in `RUBY_PATTERNS.sources`.** Bare Ruby `gets` is
+  parsed by tree-sitter-ruby as `identifier` (not `call`), so AST
+  `call_names: ['gets']` does NOT cover it. Documented carry-forward
+  exception (Option A from M1 finding #2). A future milestone may extend
+  `extract_call_name_ruby` to recognize bare `gets` and retire this regex.
+- **Bare OCaml `read_line` / `input_line` `call_names` entries** — already
+  structured-correct under the existing `call_names` path.
+
+### Removed
+
+- Ruby/Elixir/OCaml **regex source+sink Vec entries** in `RUBY_PATTERNS` /
+  `ELIXIR_PATTERNS` / `OCAML_PATTERNS` (sanitizer Vecs retained).
+- **14 raw-substring `("", "Module.fn")` AST raw-fallback duplicates**
+  superseded by the Wave-2 structured shape (M2 b48ba89, M3 6b6a093,
+  M4 f4e1b16).
+- **6 obsolete unit tests** in `crates/tldr-core/src/security/taint_tests.rs`:
+  `test_ruby_detect_sources`, `test_ruby_detect_sinks`,
+  `test_elixir_detect_sources`, `test_elixir_detect_sinks`,
+  `test_ocaml_detect_sources`, `test_ocaml_detect_sinks`. Sanitizer-touching
+  tests retained.
+
+### Issues closed (binary-verified)
+
+- **String-literal substring false-positive class GENERALIZED to 3 HOLD
+  languages.** Verified zero sources / zero sinks at the `tldr taint` binary
+  for Ruby `"use IO.popen for shell exec"`, Elixir `"use System.cmd"`, and
+  OCaml `"use Sys.command"` string-literal fixtures at `/tmp/v040-verify/`.
+  This generalizes regex-removal-v1's #24 closure (TypeScript) to Ruby /
+  Elixir / OCaml.
+- **Real-flow detection preserved.** Ruby `STDIN.gets → IO.popen(cmd)`,
+  Elixir `System.get_env → System.cmd`, and OCaml `Sys.getenv → Sys.command`
+  all correctly TAINTED in the binary smoke set.
+
+### Architectural notes
+
+- **No source change to `field_access_info` or `extract_call_name_*` helpers.**
+  The milestone reframed the original "extend `field_access_info`" framing
+  into a mechanical entry-shape migration. The W2-pre `member_patterns_match`
+  call-shape path (added during regex-removal-v1) was already the
+  architectural enabler — the work in this milestone is the corresponding
+  data migration plus three small targeted fixes (OCaml
+  `application_expression` var-extraction, Ruby dispatch order, string-
+  literal fallback).
+- **M1 added a test-only `analyze_ast_only(src, lang, fn_name)` harness** via
+  a thread-local `AST_ONLY_TEST_MODE` `Cell` and an RAII
+  `AstOnlyTestModeGuard`. While the guard is alive the flag short-circuits
+  `detect_sources` / `detect_sinks` to an empty `Vec`, mirroring W2-pre's
+  AST-only simulation. Production code never sets the flag.
+
+### Standing rules upheld
+
+- **Internal-versioning posture.** External `cargo publish` deferred. Two
+  future internal milestones still queued before the next external publish:
+  `sanitizer-removal-v1` and `vuln-migration-v1`.
+- No push, no `cargo publish`, no `Cargo.toml` version bump in this
+  milestone. `Cargo.lock` not staged. Explicit-add staging only.
+
 ## regex-removal-v1 (internal milestone) — 2026-04-29
 
 **INTERNAL milestone — NOT a published release.** Closes #24 (string-literal
