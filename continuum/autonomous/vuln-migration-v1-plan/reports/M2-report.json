@@ -90,5 +90,5 @@
     "continuum/autonomous/vuln-migration-v1-plan/reports/M2-carry-forward.json",
     "continuum/autonomous/vuln-migration-v1-plan/reports/M2-report.json"
   ],
-  "commit_sha": "PENDING_AT_REPORT_WRITE_TIME"
+  "commit_sha": "870f03ea0858fba965adcb0d11dea3f40a7f4a7c"
 }
