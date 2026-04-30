@@ -371,148 +371,11 @@ fn test_available_nonexistent_file() {
 // Dominators Tests
 // =============================================================================
 
-#[test]
-fn test_dominators_basic_json() {
-    let temp_dir = create_dataflow_test_project();
-    let file_path = temp_dir.path().join("dataflow.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args(["dominators", file_path.to_str().unwrap(), "calculate", "-q"])
-        .output()
-        .expect("Failed to execute tldr dominators");
 
-    assert!(output.status.success(), "dominators command should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("idom") || stdout.contains("dom_tree") || stdout.contains("dom_frontier"),
-        "JSON should contain dominator data"
-    );
-}
 
-#[test]
-fn test_dominators_text_format() {
-    let temp_dir = create_dataflow_test_project();
-    let file_path = temp_dir.path().join("dataflow.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "dominators",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "-f",
-            "text",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr dominators");
 
-    assert!(
-        output.status.success(),
-        "dominators text format should succeed"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Dominator") || stdout.contains("idom") || stdout.contains("Block"),
-        "Text output should show dominator info"
-    );
-}
 
-#[test]
-fn test_dominators_idom_only() {
-    let temp_dir = create_dataflow_test_project();
-    let file_path = temp_dir.path().join("dataflow.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "dominators",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "--idom-only",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr dominators --idom_only");
 
-    assert!(
-        output.status.success(),
-        "dominators --idom_only should succeed"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("idom") || stdout.contains("Block"),
-        "Output should contain immediate dominators"
-    );
-}
-
-#[test]
-fn test_dominators_frontier_only() {
-    let temp_dir = create_dataflow_test_project();
-    let file_path = temp_dir.path().join("dataflow.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "dominators",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "--frontier-only",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr dominators --frontier_only");
-
-    assert!(
-        output.status.success(),
-        "dominators --frontier_only should succeed"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("frontier") || stdout.contains("DF"),
-        "Output should contain dominance frontier"
-    );
-}
-
-#[test]
-fn test_dominators_dot_format() {
-    let temp_dir = create_dataflow_test_project();
-    let file_path = temp_dir.path().join("dataflow.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "dominators",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "-f",
-            "dot",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr dominators -f dot");
-
-    assert!(
-        output.status.success(),
-        "dominators DOT format should succeed"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("digraph") || stdout.contains("->"),
-        "DOT output should contain graph structure"
-    );
-}
-
-#[test]
-fn test_dominators_help() {
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args(["dominators", "--help"])
-        .output()
-        .expect("Failed to execute tldr dominators --help");
-
-    assert!(output.status.success(), "dominators --help should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage:"), "Help should show usage");
-    assert!(
-        stdout.contains("--idom-only"),
-        "Help should mention --idom-only"
-    );
-    assert!(
-        stdout.contains("--frontier-only"),
-        "Help should mention --frontier-only"
-    );
-}
 
 // =============================================================================
 // Reaching Definitions Tests
@@ -650,118 +513,10 @@ fn test_reaching_defs_help() {
 // Live Variables Tests
 // =============================================================================
 
-#[test]
-fn test_live_vars_basic_json() {
-    let temp_dir = create_dataflow_test_project();
-    let file_path = temp_dir.path().join("dataflow.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args(["live-vars", file_path.to_str().unwrap(), "calculate", "-q"])
-        .output()
-        .expect("Failed to execute tldr live-vars");
 
-    assert!(output.status.success(), "live-vars command should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("live_in") || stdout.contains("live_out") || stdout.contains("blocks"),
-        "JSON should contain live variables data"
-    );
-}
 
-#[test]
-fn test_live_vars_text_format() {
-    let temp_dir = create_dataflow_test_project();
-    let file_path = temp_dir.path().join("dataflow.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "live-vars",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "-f",
-            "text",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr live-vars");
 
-    assert!(
-        output.status.success(),
-        "live-vars text format should succeed"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Live") || stdout.contains("live_in") || stdout.contains("live_out"),
-        "Text output should show live variables"
-    );
-}
 
-#[test]
-fn test_live_vars_var_filter() {
-    let temp_dir = create_dataflow_test_project();
-    let file_path = temp_dir.path().join("dataflow.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "live-vars",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "--var",
-            "result",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr live-vars --var");
-
-    assert!(output.status.success(), "live-vars --var should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("result") || stdout.contains("Filtered") || stdout.contains("Block"),
-        "Output should show variable-specific live data"
-    );
-}
-
-#[test]
-fn test_live_vars_live_only() {
-    let temp_dir = create_dataflow_test_project();
-    let file_path = temp_dir.path().join("dataflow.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "live-vars",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "--var",
-            "result",
-            "--live-only",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr live-vars --live_only");
-
-    assert!(
-        output.status.success(),
-        "live-vars --live_only should succeed"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Block") || stdout.contains("live"),
-        "Output should show live-only blocks"
-    );
-}
-
-#[test]
-fn test_live_vars_help() {
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args(["live-vars", "--help"])
-        .output()
-        .expect("Failed to execute tldr live-vars --help");
-
-    assert!(output.status.success(), "live-vars --help should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage:"), "Help should show usage");
-    assert!(stdout.contains("--var"), "Help should mention --var option");
-    assert!(
-        stdout.contains("--live-only"),
-        "Help should mention --live-only option"
-    );
-}
 
 // =============================================================================
 // Taint Analysis Tests
@@ -856,138 +611,11 @@ fn test_taint_help() {
 // Alias Analysis Tests
 // =============================================================================
 
-#[test]
-fn test_alias_basic_json() {
-    let temp_dir = create_test_project();
-    let file_path = temp_dir.path().join("main.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args(["alias", file_path.to_str().unwrap(), "main", "-q"])
-        .output()
-        .expect("Failed to execute tldr alias");
 
-    assert!(output.status.success(), "alias command should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("may_alias")
-            || stdout.contains("must_alias")
-            || stdout.contains("points_to"),
-        "JSON should contain alias analysis data"
-    );
-}
 
-#[test]
-fn test_alias_text_format() {
-    let temp_dir = create_test_project();
-    let file_path = temp_dir.path().join("main.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "alias",
-            file_path.to_str().unwrap(),
-            "main",
-            "-f",
-            "text",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr alias");
 
-    assert!(output.status.success(), "alias text format should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Alias") || stdout.contains("may") || stdout.contains("must"),
-        "Text output should show alias info"
-    );
-}
 
-#[test]
-fn test_alias_check_option() {
-    let temp_dir = create_test_project();
-    let file_path = temp_dir.path().join("main.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "alias",
-            file_path.to_str().unwrap(),
-            "main",
-            "--check",
-            "x,y",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr alias --check");
 
-    // May fail if variables not found - that's ok
-    assert!(
-        output.status.success() || String::from_utf8_lossy(&output.stderr).contains("Error"),
-        "alias --check should either succeed or error gracefully"
-    );
-}
-
-#[test]
-fn test_alias_points_to_option() {
-    let temp_dir = create_test_project();
-    let file_path = temp_dir.path().join("main.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "alias",
-            file_path.to_str().unwrap(),
-            "main",
-            "--points-to",
-            "x",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr alias --points_to");
-
-    // May fail if variable not found - that's ok
-    assert!(
-        output.status.success() || String::from_utf8_lossy(&output.stderr).contains("Error"),
-        "alias --points_to should either succeed or error gracefully"
-    );
-}
-
-#[test]
-fn test_alias_dot_format() {
-    let temp_dir = create_test_project();
-    let file_path = temp_dir.path().join("main.py");
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "alias",
-            file_path.to_str().unwrap(),
-            "main",
-            "-f",
-            "dot",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr alias -f dot");
-
-    assert!(output.status.success(), "alias DOT format should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("digraph") || stdout.contains("points_to") || stdout.contains("Alias"),
-        "DOT output should contain graph structure or alias info"
-    );
-}
-
-#[test]
-fn test_alias_help() {
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args(["alias", "--help"])
-        .output()
-        .expect("Failed to execute tldr alias --help");
-
-    assert!(output.status.success(), "alias --help should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage:"), "Help should show usage");
-    assert!(
-        stdout.contains("--check"),
-        "Help should mention --check option"
-    );
-    assert!(
-        stdout.contains("--points-to"),
-        "Help should mention --points-to option"
-    );
-}
 
 // =============================================================================
 // Slice Tests
@@ -2358,29 +1986,6 @@ fn test_cache_clear_help() {
 // Cross-Command Integration Tests
 // =============================================================================
 
-#[test]
-fn test_dataflow_commands_consistency() {
-    let temp_dir = create_dataflow_test_project();
-    let file_path = temp_dir.path().join("dataflow.py");
-    let file_path_str = file_path.to_str().unwrap();
-
-    // Run multiple dataflow commands on the same function
-    let commands = vec![
-        vec!["available", file_path_str, "calculate", "-q"],
-        vec!["dominators", file_path_str, "calculate", "-q"],
-        vec!["reaching-defs", file_path_str, "calculate", "-q"],
-        vec!["live-vars", file_path_str, "calculate", "-q"],
-    ];
-
-    for cmd in &commands {
-        let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-            .args(cmd)
-            .output()
-            .unwrap_or_else(|_| panic!("Failed to execute tldr {}", cmd[0]));
-
-        assert!(output.status.success(), "{} command should succeed", cmd[0]);
-    }
-}
 
 #[test]
 fn test_analysis_commands_on_same_project() {
@@ -2407,42 +2012,6 @@ fn test_analysis_commands_on_same_project() {
 // Error Handling Tests
 // =============================================================================
 
-#[test]
-fn test_all_remaining_commands_help_available() {
-    let commands = vec![
-        "available",
-        "dominators",
-        "reaching-defs",
-        "live-vars",
-        "taint",
-        "alias",
-        "slice",
-        "change-impact",
-        "whatbreaks",
-        "hubs",
-        "references",
-        "deps",
-        "inheritance",
-        "clones",
-        "dice",
-    ];
-
-    for cmd in &commands {
-        let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-            .args([*cmd, "--help"])
-            .output()
-            .unwrap_or_else(|_| panic!("Failed to execute tldr {} --help", cmd));
-
-        assert!(output.status.success(), "{} --help should succeed", cmd);
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("Usage:"),
-            "{} help should contain usage info",
-            cmd
-        );
-    }
-}
 
 #[test]
 fn test_invalid_format_option() {

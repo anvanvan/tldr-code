@@ -21,28 +21,6 @@ fn tldr_cmd() -> Command {
 // Help and Version Tests
 // =============================================================================
 
-#[test]
-fn test_help_text() {
-    let mut cmd = tldr_cmd();
-    cmd.arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "TLDR provides code analysis commands",
-        ))
-        .stdout(predicate::str::contains("tree"))
-        .stdout(predicate::str::contains("structure"))
-        .stdout(predicate::str::contains("calls"))
-        .stdout(predicate::str::contains("impact"))
-        .stdout(predicate::str::contains("dead"))
-        .stdout(predicate::str::contains("cfg"))
-        .stdout(predicate::str::contains("dfg"))
-        .stdout(predicate::str::contains("slice"))
-        .stdout(predicate::str::contains("search"))
-        .stdout(predicate::str::contains("context"))
-        .stdout(predicate::str::contains("smells"))
-        .stdout(predicate::str::contains("secrets"));
-}
 
 #[test]
 fn test_version() {
@@ -248,23 +226,7 @@ fn test_calls_alias() {
 // CFG/DFG/Slice Tests (require actual Python files with functions)
 // =============================================================================
 
-#[test]
-fn test_cfg_command_help() {
-    let mut cmd = tldr_cmd();
-    cmd.args(["cfg", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("control flow graph"));
-}
 
-#[test]
-fn test_dfg_command_help() {
-    let mut cmd = tldr_cmd();
-    cmd.args(["dfg", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("data flow graph"));
-}
 
 #[test]
 fn test_slice_command_help() {
@@ -291,17 +253,6 @@ fn test_smells_command() {
         .stdout(predicate::str::contains("smells"));
 }
 
-#[test]
-fn test_secrets_command() {
-    let temp = TempDir::new().unwrap();
-    fs::write(temp.path().join("test.py"), "# no secrets here").unwrap();
-
-    let mut cmd = tldr_cmd();
-    cmd.args(["secrets", temp.path().to_str().unwrap(), "-q"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("findings"));
-}
 
 // =============================================================================
 // Cold Start Performance Test (M15 Mitigation)

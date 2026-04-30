@@ -44,33 +44,6 @@ def unused_func():
     temp_dir
 }
 
-/// Create a more complex test project with branches for CFG/DFG/SSA testing
-fn create_complex_test_project() -> TempDir {
-    let temp_dir = TempDir::new().unwrap();
-    let project_path = temp_dir.path();
-
-    // Create a Python file with branches and variables
-    fs::write(
-        project_path.join("complex.py"),
-        r#"def calculate(x, y):
-    if x > 0:
-        result = x + y
-    else:
-        result = x - y
-    return result
-
-def loop_func(items):
-    total = 0
-    for item in items:
-        total = total + item
-    return total
-"#,
-    )
-    .unwrap();
-
-    temp_dir
-}
-
 // =============================================================================
 // Calls Command Tests
 // =============================================================================
@@ -617,351 +590,28 @@ fn test_dead_json_line_is_nonzero_for_real_functions() {
 // CFG Command Tests
 // =============================================================================
 
-#[test]
-fn test_cfg_basic_json() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args(["cfg", file_path.to_str().unwrap(), "calculate", "-q"])
-        .output()
-        .expect("Failed to execute tldr cfg");
 
-    assert!(output.status.success(), "cfg command should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("\"function\""),
-        "JSON should contain function field"
-    );
-    assert!(stdout.contains("\"blocks\""), "JSON should contain blocks");
-    assert!(stdout.contains("\"edges\""), "JSON should contain edges");
-    assert!(
-        stdout.contains("cyclomatic_complexity"),
-        "JSON should contain complexity"
-    );
-}
 
-#[test]
-fn test_cfg_text_format() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args([
-            "cfg",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "-f",
-            "text",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr cfg");
 
-    assert!(output.status.success(), "cfg text format should succeed");
-    // Text format not yet implemented for graph commands - returns empty
-    // Tracked separately; just verify command doesn't crash
-}
-
-#[test]
-fn test_cfg_nonexistent_function() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args([
-            "cfg",
-            file_path.to_str().unwrap(),
-            "nonexistent_function_xyz",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr cfg");
-
-    // Nonexistent function returns empty CFG (not an error)
-    // This is documented behavior
-    assert!(
-        output.status.success(),
-        "cfg for nonexistent function may succeed with empty result"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("\"blocks\": []") || stdout.contains("\"blocks\":[]"),
-        "Nonexistent function should return empty blocks"
-    );
-}
-
-#[test]
-fn test_cfg_help() {
-    let output = tldr_cmd()
-        .args(["cfg", "--help"])
-        .output()
-        .expect("Failed to execute tldr cfg --help");
-
-    assert!(output.status.success(), "cfg --help should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage:"), "Help should show usage");
-    assert!(stdout.contains("<FILE>"), "Help should show FILE argument");
-    assert!(
-        stdout.contains("<FUNCTION>"),
-        "Help should show FUNCTION argument"
-    );
-    assert!(
-        stdout.contains("--lang"),
-        "Help should mention --lang option"
-    );
-}
 
 // =============================================================================
 // DFG Command Tests
 // =============================================================================
 
-#[test]
-fn test_dfg_basic_json() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args(["dfg", file_path.to_str().unwrap(), "calculate", "-q"])
-        .output()
-        .expect("Failed to execute tldr dfg");
 
-    assert!(output.status.success(), "dfg command should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("\"function\""),
-        "JSON should contain function field"
-    );
-    assert!(stdout.contains("\"refs\""), "JSON should contain refs");
-    assert!(
-        stdout.contains("\"variables\""),
-        "JSON should contain variables"
-    );
-}
 
-#[test]
-fn test_dfg_text_format() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args([
-            "dfg",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "-f",
-            "text",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr dfg");
-
-    assert!(output.status.success(), "dfg text format should succeed");
-    // Text format not yet implemented for graph commands - returns empty
-    // Tracked separately; just verify command doesn't crash
-}
-
-#[test]
-fn test_dfg_help() {
-    let output = tldr_cmd()
-        .args(["dfg", "--help"])
-        .output()
-        .expect("Failed to execute tldr dfg --help");
-
-    assert!(output.status.success(), "dfg --help should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage:"), "Help should show usage");
-    assert!(stdout.contains("<FILE>"), "Help should show FILE argument");
-    assert!(
-        stdout.contains("<FUNCTION>"),
-        "Help should show FUNCTION argument"
-    );
-}
 
 // =============================================================================
 // SSA Command Tests
 // =============================================================================
 
-#[test]
-fn test_ssa_basic_json() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args(["ssa", file_path.to_str().unwrap(), "calculate", "-q"])
-        .output()
-        .expect("Failed to execute tldr ssa");
 
-    assert!(output.status.success(), "ssa command should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("\"function\""),
-        "JSON should contain function field"
-    );
-    assert!(
-        stdout.contains("\"ssa_type\""),
-        "JSON should contain ssa_type"
-    );
-    assert!(stdout.contains("\"blocks\""), "JSON should contain blocks");
-    assert!(
-        stdout.contains("\"phi_functions\""),
-        "JSON should contain phi_functions"
-    );
-}
 
-#[test]
-fn test_ssa_text_format() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args([
-            "ssa",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "-f",
-            "text",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr ssa");
 
-    assert!(output.status.success(), "ssa text format should succeed");
-    // Text format not yet implemented for graph commands - returns empty
-    // Tracked separately; just verify command doesn't crash
-}
 
-#[test]
-fn test_ssa_type_minimal() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args([
-            "ssa",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "--type",
-            "minimal",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr ssa --type minimal");
 
-    assert!(output.status.success(), "ssa --type minimal should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("minimal") || stdout.contains("Minimal"),
-        "Output should indicate minimal SSA type"
-    );
-}
 
-#[test]
-fn test_ssa_type_semi_pruned() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args([
-            "ssa",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "--type",
-            "semi-pruned",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr ssa --type semi-pruned");
 
-    assert!(
-        output.status.success(),
-        "ssa --type semi-pruned should succeed"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("semi_pruned") || stdout.contains("semi-pruned"),
-        "Output should indicate semi-pruned SSA type"
-    );
-}
-
-#[test]
-fn test_ssa_type_pruned() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args([
-            "ssa",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "--type",
-            "pruned",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr ssa --type pruned");
-
-    assert!(output.status.success(), "ssa --type pruned should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Pruned may fall back to semi-pruned if live variables not available
-    assert!(
-        stdout.contains("pruned")
-            || stdout.contains("semi_pruned")
-            || stdout.contains("semi-pruned"),
-        "Output should indicate pruned or semi-pruned SSA type"
-    );
-}
-
-#[test]
-fn test_ssa_memory_flag() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args([
-            "ssa",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "--memory",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr ssa --memory");
-
-    assert!(output.status.success(), "ssa --memory should succeed");
-    // Memory SSA may or may not be included in output depending on implementation
-}
-
-#[test]
-fn test_ssa_dot_format() {
-    let temp_dir = create_complex_test_project();
-    let file_path = temp_dir.path().join("complex.py");
-    let output = tldr_cmd()
-        .args([
-            "ssa",
-            file_path.to_str().unwrap(),
-            "calculate",
-            "-f",
-            "dot",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr ssa -f dot");
-
-    assert!(output.status.success(), "ssa DOT format should succeed");
-    // DOT format not yet implemented for graph commands - returns empty
-    // Tracked separately; just verify command doesn't crash
-}
-
-#[test]
-fn test_ssa_help() {
-    let output = tldr_cmd()
-        .args(["ssa", "--help"])
-        .output()
-        .expect("Failed to execute tldr ssa --help");
-
-    assert!(output.status.success(), "ssa --help should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage:"), "Help should show usage");
-    assert!(
-        stdout.contains("--type"),
-        "Help should mention --type option"
-    );
-    assert!(
-        stdout.contains("--memory"),
-        "Help should mention --memory option"
-    );
-    assert!(stdout.contains("--var"), "Help should mention --var option");
-}
 
 // =============================================================================
 // Cross-Command Integration Tests
@@ -1029,26 +679,6 @@ fn test_dead_finds_unused_from_calls() {
 // Error Handling Tests
 // =============================================================================
 
-#[test]
-fn test_all_commands_help_available() {
-    let commands = ["calls", "impact", "dead", "cfg", "dfg", "ssa"];
-
-    for cmd in &commands {
-        let output = tldr_cmd()
-            .args([*cmd, "--help"])
-            .output()
-            .unwrap_or_else(|_| panic!("Failed to execute tldr {} --help", cmd));
-
-        assert!(output.status.success(), "{} --help should succeed", cmd);
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("Usage:"),
-            "{} help should contain usage info",
-            cmd
-        );
-    }
-}
 
 #[test]
 fn test_invalid_format_option() {

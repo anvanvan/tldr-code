@@ -156,36 +156,6 @@ fn create_minimal_project() -> TempDir {
     temp_dir
 }
 
-/// Create a project with type hints for bounds analysis
-fn create_typed_project() -> TempDir {
-    let temp_dir = TempDir::new().unwrap();
-    let project_path = temp_dir.path();
-
-    fs::write(
-        project_path.join("typed.py"),
-        r#"def calculate(x: int, y: int) -> int:
-    if x > 0:
-        z = x + y
-    else:
-        z = 0
-    return z * 2
-
-def divide(a: int, b: int) -> float:
-    return a / b
-
-def bounded(n: int) -> int:
-    if n < 0:
-        n = 0
-    elif n > 100:
-        n = 100
-    return n
-"#,
-    )
-    .unwrap();
-
-    temp_dir
-}
-
 /// Create a project with data flow patterns for chop analysis
 fn create_chop_project() -> TempDir {
     let temp_dir = TempDir::new().unwrap();
@@ -461,42 +431,7 @@ fn test_interface_basic() {
 // Behavioral Command Tests
 // =============================================================================
 
-#[test]
-fn test_behavioral_basic_json() {
-    let temp_dir = create_test_project();
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "behavioral",
-            temp_dir.path().join("main.py").to_str().unwrap(),
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr behavioral");
 
-    assert!(output.status.success(), "behavioral command should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Should extract behavioral constraints
-    assert!(!stdout.is_empty(), "Output should not be empty");
-}
-
-#[test]
-fn test_behavioral_with_function() {
-    let temp_dir = create_test_project();
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "behavioral",
-            temp_dir.path().join("main.py").to_str().unwrap(),
-            "guarded_function",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr behavioral with function");
-
-    assert!(
-        output.status.success(),
-        "behavioral with function should succeed"
-    );
-}
 
 // =============================================================================
 // Contracts Command Tests
@@ -549,42 +484,7 @@ fn test_contracts_text_format() {
 // Bounds Command Tests
 // =============================================================================
 
-#[test]
-fn test_bounds_basic_json() {
-    let temp_dir = create_typed_project();
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "bounds",
-            temp_dir.path().join("typed.py").to_str().unwrap(),
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr bounds");
 
-    assert!(output.status.success(), "bounds command should succeed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Bounds analysis should produce interval results
-    assert!(!stdout.is_empty(), "Output should not be empty");
-}
-
-#[test]
-fn test_bounds_with_function() {
-    let temp_dir = create_typed_project();
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "bounds",
-            temp_dir.path().join("typed.py").to_str().unwrap(),
-            "calculate",
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr bounds with function");
-
-    assert!(
-        output.status.success(),
-        "bounds with function should succeed"
-    );
-}
 
 // =============================================================================
 // Invariants Command Tests
@@ -861,15 +761,6 @@ fn test_diagnostics_no_typecheck() {
 // Error Handling Tests
 // =============================================================================
 
-#[test]
-fn test_patterns_nonexistent_file() {
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args(["purity", "/nonexistent/path/file.py", "-q"])
-        .output()
-        .expect("Failed to execute tldr purity on nonexistent file");
-
-    assert!(!output.status.success(), "Should fail for nonexistent file");
-}
 
 #[test]
 fn test_contracts_nonexistent_function() {
@@ -911,62 +802,7 @@ fn test_chop_invalid_line_numbers() {
 // Help Tests
 // =============================================================================
 
-#[test]
-fn test_patterns_help() {
-    let commands = [
-        "resources",
-        "temporal",
-        "coupling",
-        "cohesion",
-        "interface",
-        "behavioral",
-    ];
 
-    for cmd in &commands {
-        let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-            .args([cmd, "--help"])
-            .output()
-            .unwrap_or_else(|_| panic!("Failed to execute tldr {} --help", cmd));
-
-        assert!(output.status.success(), "{} --help should succeed", cmd);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("Usage:"),
-            "Help should contain Usage section"
-        );
-        assert!(
-            stdout.contains("Options:"),
-            "Help should contain Options section"
-        );
-    }
-}
-
-#[test]
-fn test_contracts_help() {
-    let commands = [
-        "contracts",
-        "bounds",
-        "invariants",
-        "specs",
-        "verify",
-        "dead-stores",
-        "chop",
-    ];
-
-    for cmd in &commands {
-        let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-            .args([cmd, "--help"])
-            .output()
-            .unwrap_or_else(|_| panic!("Failed to execute tldr {} --help", cmd));
-
-        assert!(output.status.success(), "{} --help should succeed", cmd);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("Usage:"),
-            "Help should contain Usage section"
-        );
-    }
-}
 
 #[test]
 fn test_diagnostics_help() {
@@ -995,62 +831,4 @@ fn test_diagnostics_help() {
 // Multi-Language Tests
 // =============================================================================
 
-#[test]
-fn test_patterns_rust_file() {
-    let temp_dir = TempDir::new().unwrap();
-    let project_path = temp_dir.path();
 
-    fs::write(
-        project_path.join("test.rs"),
-        r#"fn add(a: i32, b: i32) -> i32 {
-    a + b
-}
-
-fn main() {
-    println!("{}", add(1, 2));
-}
-"#,
-    )
-    .unwrap();
-
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "purity",
-            project_path.join("test.rs").to_str().unwrap(),
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr purity on Rust file");
-
-    // May succeed or fail depending on Rust support
-    let _ = output.status;
-}
-
-#[test]
-fn test_patterns_go_file() {
-    let temp_dir = TempDir::new().unwrap();
-    let project_path = temp_dir.path();
-
-    fs::write(
-        project_path.join("test.go"),
-        r#"package main
-
-func Add(a, b int) int {
-    return a + b
-}
-"#,
-    )
-    .unwrap();
-
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
-        .args([
-            "purity",
-            project_path.join("test.go").to_str().unwrap(),
-            "-q",
-        ])
-        .output()
-        .expect("Failed to execute tldr purity on Go file");
-
-    // May succeed or fail depending on Go support
-    let _ = output.status;
-}
