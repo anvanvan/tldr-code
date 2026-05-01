@@ -12,7 +12,36 @@
   `continuum/autonomous/` predate this loop and are not staged by this plan.
 - **Empirical RED count at HEAD**: 8 of 166 RED in `vuln_migration_v1_red`
   (158 GREEN). This milestone closes 1 of those 8.
-- **Estimated LOC**: ~10-20 (taint.rs only; no ast_utils.rs change; no public API change).
+- **Estimated LOC**: ~65-85 source LOC (taint.rs only; no ast_utils.rs change; no public
+  API change). Bumped from initial ~10-20 estimate per premortem `a7f9a56` amendment A5: the
+  `extract_first_identifier_arg_ast` extension is REQUIRED (~30-40 LOC) in addition to the
+  dispatch arm (~25 LOC). See §0 helper audit and §M2.
+
+> **Premortem amendment notice (a7f9a56 — GO_WITH_REMEDIATIONS)**
+>
+> This plan was amended after the premortem identified 2 BLOCKER-class issues:
+>
+> - **A1 (T1)**: §0's claim that `extract_first_identifier_arg_ast` has a "generic
+>   path that walks named descendants" is FALSIFIED. The helper's strict path
+>   requires either `child_by_field_name("arguments")` or a child whose kind contains
+>   "argument" or equals "call_suffix". `subshell` has NEITHER (children are
+>   `interpolation` / `string_content` / `escape_sequence`), so the helper returns
+>   `None` for subshell. The R1 contingency in §7 is therefore REQUIRED, not
+>   optional. M2 MUST extend the helper with a Ruby-specific subshell descent arm.
+> - **A2 (T2)**: §5's `TaintSink { … }` pseudo-code is missing the `tainted: bool`
+>   field. The struct (taint.rs:210-222) has 5 fields:
+>   `var, line, sink_type, tainted, statement`. The canonical construction site at
+>   taint.rs:4341-4347 includes `tainted: false`. **Kraken instruction: read the
+>   canonical construction at taint.rs:4341-4347 verbatim — do NOT copy §5's sketch.**
+>
+> Three advisory amendments are also incorporated:
+>
+> - **A3 (E2)**: M3 binary smoke MUST use `cargo run -p tldr-cli --release -- vuln …`
+>   instead of PATH-resolved `tldr vuln …` (the PATH binary may be a stale symlink).
+> - **A4 (E4)**: M1 node-audit adds a 4th assertion (existing positive fixture uses
+>   the backtick form; new %x{} FP fixture has zero subshell descendants).
+> - **A5 (E1)**: LOC envelope bumped to ~65-85 source LOC (~99 total with fixtures /
+>   tests). LOC is informational; atomic-commit gates are the hard gates.
 
 ---
 
@@ -78,20 +107,53 @@ subshell node returns `false`. The interpolation's inner identifier
 `is_in_string` skip will NOT filter the subshell node nor an inner identifier
 inside `#{...}`.**
 
-### `extract_first_identifier_arg_ast` audit
+### `extract_first_identifier_arg_ast` audit (RETRACTED — see premortem A1/T1)
 
-`taint.rs:3934-3982` has language-specific arms (PHP echo / OCaml application_expression)
-followed by a generic body that walks named children seeking the first
-identifier. For a `subshell` containing `#{cmd}`, the walk yields:
-`subshell` → `interpolation` → `identifier(cmd)`. The generic body picks up
-the identifier. **Empirically verified by reading the body and the
-descendants walk pattern** (no language-specific arm needed for subshell —
-the generic path suffices).
+> **Premortem A1 (T1) — Plan-narrative retraction (a7f9a56)**: An earlier
+> draft of this section claimed the helper had a "generic body that walks
+> named children seeking the first identifier" and that "the generic body
+> picks up the identifier" for subshell. **This claim is FALSIFIED.** The
+> premortem read the full helper body at `taint.rs:3934-4065` and found:
+>
+> 1. PHP-specific BFS arm at L3948-L3983 (echo_statement / print_intrinsic).
+> 2. OCaml-specific arm at L3989-L4016 (application_expression).
+> 3. Generic path at L4022-L4036 that REQUIRES either
+>    `child_by_field_name("arguments")` OR a child whose `kind()` contains
+>    "argument" or equals "call_suffix". The `?` operator at L4036 returns
+>    `None` if neither is found.
+> 4. The args-list walk at L4039-L4062 is unreachable when (3) returns
+>    `None`.
+>
+> A `subshell` node has NO `arguments` field and its children are
+> `interpolation` / `string_content` / `escape_sequence` (none containing
+> the substring "argument" or equal to "call_suffix"). Therefore
+> `extract_first_identifier_arg_ast(subshell, source, Ruby)` returns
+> `None` at HEAD. The chain in §5
+> (`extract_first_identifier_arg_ast || extract_assignment_rhs_ident ||
+> extract_source_var_from_statement`) ALSO returns `None` for the canonical
+> fixture (the bare-line `` `#{cmd}` `` has no `=` token; see premortem
+> C10).
+>
+> **Consequence**: M2 MUST extend the helper with a Ruby-specific subshell
+> descent arm — the R1 contingency (now restated in §7) is REQUIRED, not
+> optional. Without the extension, the dispatch arm extracts `var=None`,
+> emits zero sinks, the fixture stays RED, and the M2 atomic commit must
+> be reverted per `rollback_rule`.
 
-If for some reason the generic body fails on subshell (M1 will verify), M2
-extends it with a Ruby-specific arm at the same site (still localized to
-`taint.rs`, no ast_utils.rs cross-cutting change). Tracked as a contingency
-in §7 R3.
+**Required helper extension** (see §M2 for full spec): at the same site as
+the PHP echo BFS at `taint.rs:3954-3982`, add:
+
+```rust
+if language == Language::Ruby && descendant.kind() == "subshell" {
+    // BFS over named children; recurse into `interpolation` nodes.
+    // Skip string-literal subtrees (string_kinds). Return the first
+    // `identifier`'s text via node_text. ~30-40 LOC.
+}
+```
+
+Mirror the PHP echo BFS stylistically: use a `Vec<tree_sitter::Node>` stack,
+skip `string_kinds.contains(&node.kind())`, push named children for further
+walk, return on first `identifier` match.
 
 ### FP fixture safety
 
@@ -135,9 +197,11 @@ Add a localized dispatch arm in `detect_sinks_ast`
 descendant.kind() == "subshell" AND language == Language::Ruby
 ```
 
-producing a synthetic `TaintSink { sink_type: ShellExec, var: <inner-ident>, ... }`.
-Var-extraction reuses the existing `extract_first_identifier_arg_ast` helper
-(generic descend-and-find-identifier path).
+producing a synthetic `TaintSink` with all 5 fields (var, line, sink_type:
+ShellExec, tainted: false, statement) — see canonical construction at
+`taint.rs:4341-4347`. Var-extraction calls a Ruby-extended
+`extract_first_identifier_arg_ast` (REQUIRED helper extension — see §0 audit
+retraction and §M2 spec).
 
 **No change to `call_node_kinds(Ruby)`.** No change to `extract_call_name_ruby`.
 No change to any AST bank's `call_names` / `member_patterns` (no new
@@ -226,9 +290,16 @@ opportunity — milestone is too small.
     REPORTS RED at HEAD (pre-M2).
   - Node-audit JSON empirically confirms `subshell` kind for both backtick
     and `%x{...}` shapes.
-  - extract_first_identifier_arg_ast verdict (empirical) recorded — either
-    "GREEN — generic path returns Some(\"cmd\")" or "RED — generic path returns
-    None; M2 must extend".
+  - extract_first_identifier_arg_ast verdict (empirical) recorded —
+    premortem T1 expects "RED — helper returns None; M2 MUST extend".
+    If empirical run unexpectedly returns "GREEN — Some(\"cmd\")",
+    re-investigate (premortem reading of taint.rs:3934-4065 indicates None).
+  - **4th assertion (premortem A4 / E4)**: confirm the existing positive
+    fixture `crates/tldr-cli/tests/fixtures/vuln_migration_v1/ruby/command_injection_positive.rb`
+    USES the backtick form (`` `#{cmd}` ``), NOT `%x{}`. Plus: parsing the
+    new FP fixture `command_injection_percent_x_string_literal_fp.rb` yields
+    ZERO subshell descendants (the `%x{cmd}` text is inside a `string`
+    literal, not at expression position).
   - Working tree clean except for `continuum/autonomous/ruby-backtick-extraction-v1-plan/reports/`.
 
 ### M2: ATOMIC — Implement subshell dispatch arm + %x{} fixture
@@ -247,11 +318,56 @@ opportunity — milestone is too small.
     using the WORD `%x{cmd}` inside a string; expected GREEN regression-guard
     (zero findings).
 - **green_files**:
-  - `crates/tldr-core/src/security/taint.rs` (~10-20 LOC).
-    - **Anchor**: `detect_sinks_ast` at `taint.rs:4256-4360` (the
-      `for descendant in &descendants` loop, immediately AFTER the
+  - `crates/tldr-core/src/security/taint.rs` (~65 LOC source).
+    - **Anchor 1 (REQUIRED helper extension — premortem T1 / R-DISPATCH-1)**:
+      `extract_first_identifier_arg_ast` at `taint.rs:3934-4065` — at the
+      same site as the PHP echo BFS arm (L3948-L3983) and OCaml
+      application_expression arm (L3989-L4016). Add a Ruby-specific
+      subshell descent arm BEFORE the generic args-list path (which returns
+      None for subshell). Mirror the PHP echo BFS stylistically. ~30-40 LOC.
+    - **Anchor 2 (dispatch arm)**: `detect_sinks_ast` at `taint.rs:4256-4360`
+      (the `for descendant in &descendants` loop, immediately AFTER the
       `for pattern in patterns.sinks { … }` block at L4275-L4374).
-    - **Addition**: dedicated dispatch arm. Pseudo-code:
+    - **Addition (helper extension)**: pseudo-code (mirror PHP echo BFS at
+      L3954-L3982 stylistically):
+      ```rust
+      // ruby-backtick-extraction-v1 — Ruby subshell var-extraction.
+      //
+      // The generic args-list path below requires `child_by_field_name(
+      // "arguments")` OR a child whose kind contains "argument" or equals
+      // "call_suffix". A `subshell` node has neither (children are
+      // interpolation / string_content / escape_sequence), so the generic
+      // path returns None. Add a BFS arm that walks named-children and
+      // recurses into `interpolation` nodes, returning the first
+      // `identifier`'s text.
+      if language == Language::Ruby && descendant.kind() == "subshell" {
+          let mut stack: Vec<tree_sitter::Node> = vec![*descendant];
+          while let Some(node) = stack.pop() {
+              if string_kinds.contains(&node.kind()) {
+                  continue;
+              }
+              if node.kind() == "identifier" && node.id() != descendant.id() {
+                  let text = node_text(&node, source);
+                  let head = text.split('.').next().unwrap_or(&text);
+                  if is_valid_identifier(head) {
+                      return Some(head.to_string());
+                  }
+              }
+              for i in 0..node.child_count() {
+                  if let Some(child) = node.child(i) {
+                      if child.is_named() {
+                          stack.push(child);
+                      }
+                  }
+              }
+          }
+          return None;
+      }
+      ```
+    - **Addition (dispatch arm)**: pseudo-code. **WARNING (premortem T2 /
+      R-DISPATCH-2)**: the `TaintSink { … }` construction below shows all 5
+      fields, but kraken MUST READ THE CANONICAL CONSTRUCTION AT
+      `taint.rs:4341-4347` VERBATIM. Do NOT copy this pseudo-code.
       ```rust
       // Ruby backtick / %x{} subshell dispatch
       // (ruby-backtick-extraction-v1 — see plan.md §5).
@@ -274,6 +390,7 @@ opportunity — milestone is too small.
                   var,
                   line,
                   sink_type: TaintSinkType::ShellExec,
+                  tainted: false, // REQUIRED — see canonical site at L4341
                   statement: Some(stmt_text.to_string()),
               });
               continue; // Only one sink per node
@@ -311,8 +428,11 @@ opportunity — milestone is too small.
     ```
   - `crates/tldr-cli/tests/vuln_migration_v1_red.rs` — add 2 test functions
     (mirror existing `ruby_command_injection_*` patterns).
-- **loc_delta**: source ~12-20 LOC + 2 fixtures (~12 LOC each) + 2 tests (~10 LOC each).
-  Total ~60 LOC.
+- **loc_delta**: source ~65 LOC (helper extension ~30-40 + dispatch arm + comment ~25) + 2
+  fixtures (~12 LOC each) + 2 tests (~10 LOC each). Total ~99 LOC. Bumped from earlier
+  estimate (~60) per premortem A5 / E1 — the helper extension is REQUIRED, not contingent.
+  LOC is informational; atomic-commit gates (cargo check, clippy -D warnings, all targeted
+  tests GREEN) are the hard gates.
 - **stop_thresholds**:
   - `cargo check --workspace` PASS.
   - `cargo clippy --all-targets --workspace -- -D warnings` PASS.
@@ -336,8 +456,14 @@ opportunity — milestone is too small.
   - `CHANGELOG.md` — add entry per `vuln-source-parity-v1 M6` precedent
     (see §6 below).
   - `continuum/autonomous/ruby-backtick-extraction-v1-plan/reports/M3-binary-smoke.json` —
-    `tldr vuln <fixture> --lang ruby --format json` output for both backtick
-    and `%x{...}` fixtures, asserting ≥1 finding of type `command_injection`.
+    output of `cargo run -p tldr-cli --release -- vuln <fixture> --lang ruby
+    --format json` for both backtick and `%x{...}` fixtures, asserting ≥1
+    finding of type `command_injection`. **Premortem A3 / E2 / R-DISPATCH-4**:
+    use `cargo run` (locally-built binary), NOT a PATH-resolved `tldr` —
+    the PATH symlink may point to an older release without the new
+    dispatch arm, producing a confusing 'no findings' result even when
+    cargo test is GREEN. Record the invoked binary path explicitly in the
+    report.
   - `continuum/autonomous/ruby-backtick-extraction-v1-plan/reports/M3-final-report.json` —
     summary: `vuln_migration_v1_red` count delta, workspace test count, LOC
     delta from `git diff HEAD~N --stat` (where N = M2 commit count).
@@ -345,7 +471,9 @@ opportunity — milestone is too small.
 - **loc_delta**: ~25 LOC in CHANGELOG + reports.
 - **stop_thresholds**:
   - CHANGELOG entry merged.
-  - Binary smoke produces ≥1 `command_injection` finding for both fixtures.
+  - Binary smoke (via `cargo run -p tldr-cli --release -- vuln …`) produces
+    ≥1 `command_injection` finding for both fixtures (premortem A3).
+  - M3-binary-smoke.json explicitly records which binary path was invoked.
   - Local annotated tag `ruby-backtick-extraction-v1` applied.
   - **NO push, NO publish, NO version bump** (per release_constraints).
 
@@ -396,8 +524,78 @@ test pair at L980-L1000.
 ## §5 Dispatch extension spec
 
 **File**: `crates/tldr-core/src/security/taint.rs`
-**Function**: `detect_sinks_ast` (signature unchanged)
+**Functions**: `extract_first_identifier_arg_ast` (helper extension —
+REQUIRED per premortem T1) AND `detect_sinks_ast` (signature unchanged on
+both).
+
+### §5.1 Helper extension — `extract_first_identifier_arg_ast` (REQUIRED)
+
+**Anchor**: at `taint.rs:3934-4065`, between the OCaml application_expression
+arm (ends L4016) and the generic args-list path (starts L4022). Add a
+Ruby-specific subshell descent arm.
+
+> **Premortem T1 / R-DISPATCH-1**: Without this extension, the dispatch
+> arm in §5.2 extracts `var=None` and emits zero sinks. Fixture stays RED.
+> M2 atomic commit must be reverted. This is REQUIRED, not contingent.
+
+```rust
+// ruby-backtick-extraction-v1 §5.1 — Ruby subshell var-extraction.
+//
+// The generic args-list path below (L4022-L4036) requires
+// `child_by_field_name("arguments")` OR a child whose kind contains
+// "argument" or equals "call_suffix". A `subshell` node has neither
+// (children are interpolation / string_content / escape_sequence), so
+// the generic path returns None for subshell. BFS over named children;
+// recurse into `interpolation` nodes; return the first identifier's
+// text. Mirror the PHP echo BFS at L3954-L3982 stylistically.
+if language == Language::Ruby && descendant.kind() == "subshell" {
+    let mut stack: Vec<tree_sitter::Node> = vec![*descendant];
+    while let Some(node) = stack.pop() {
+        if string_kinds.contains(&node.kind()) {
+            continue;
+        }
+        if node.kind() == "identifier" && node.id() != descendant.id() {
+            let text = node_text(&node, source);
+            let head = text.split('.').next().unwrap_or(&text);
+            if is_valid_identifier(head) {
+                return Some(head.to_string());
+            }
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if child.is_named() {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    return None;
+}
+```
+
+### §5.2 Dispatch arm — `detect_sinks_ast`
+
 **Anchor**: immediately after the `for pattern in patterns.sinks { … }` block at L4275-L4374, BEFORE the closing brace of the descendant loop iteration (so the same `descendant`, `line`, `is_in_comment` / `is_in_string` filters remain in scope).
+
+> **Premortem T2 / R-DISPATCH-2 — TaintSink construction WARNING**: The
+> `TaintSink { … }` literal below shows ALL 5 fields including
+> `tainted: false`. The struct definition at `taint.rs:210-222` is:
+>
+> ```rust
+> pub struct TaintSink {
+>     pub var: String,
+>     pub line: u32,
+>     pub sink_type: TaintSinkType,
+>     pub tainted: bool,
+>     pub statement: Option<String>,
+> }
+> ```
+>
+> Kraken MUST READ THE CANONICAL CONSTRUCTION AT `taint.rs:4341-4347`
+> VERBATIM (which is the existing `for pattern in patterns.sinks` arm's
+> sink emission) before writing the new dispatch arm body. Do NOT copy
+> the pseudo-code below verbatim — copy the canonical site's field shape
+> and adjust `sink_type` to `TaintSinkType::ShellExec`.
 
 ```rust
 // ruby-backtick-extraction-v1 §5 — Ruby backtick / %x{} subshell dispatch.
@@ -440,6 +638,7 @@ if language == Language::Ruby && descendant.kind() == "subshell" {
             var,
             line,
             sink_type: TaintSinkType::ShellExec,
+            tainted: false, // REQUIRED — see canonical site at taint.rs:4341
             statement: Some(stmt_text.to_string()),
         });
         continue; // Only one sink per node — same convention as the loop above.
@@ -447,9 +646,10 @@ if language == Language::Ruby && descendant.kind() == "subshell" {
 }
 ```
 
-**Edits required**: 1 file (`taint.rs`). 1 dispatch arm (~25 LOC including
-comment). LOC delta source-only ~25; LOC delta after counting fixtures and
-test functions ~60.
+**Edits required**: 1 file (`taint.rs`). Helper extension (~30-40 LOC at
+the helper site) + dispatch arm (~25 LOC including comment). Source-only
+LOC delta ~65; LOC delta after counting fixtures and test functions ~99.
+Bumped from earlier estimate (~25 source / ~60 total) per premortem A5 / E1.
 
 **No edit required to**:
 - `ast_utils.rs::call_node_kinds` (Option A rejected).
@@ -497,17 +697,22 @@ node-kind mismatch), different localized resolution.
 
 ## §7 Premortem / risk register
 
-### R1 — `extract_first_identifier_arg_ast` doesn't descend through `interpolation` (MEDIUM)
-- **Risk**: The generic body of the helper at `taint.rs:3934-3982` may not
-  descend through `interpolation` named-children to reach the inner
+### R1 — `extract_first_identifier_arg_ast` doesn't descend through `interpolation` (RESOLVED — extension is REQUIRED)
+- **Original risk**: The generic body of the helper at `taint.rs:3934-3982`
+  may not descend through `interpolation` named-children to reach the inner
   identifier. If so, `var` resolves to None → no sink emitted → fixture
   stays RED.
-- **Mitigation**: M1 explicitly verifies via empirical node-audit. If the
-  helper fails, M2 extends it with a Ruby-specific subshell descent arm at
-  the same site. Still localized to `taint.rs`. LOC delta bumps from ~25 to
-  ~40 (still inside the §0 LOC bound).
-- **Tiger / elephant**: tiger if M1 audit is skipped; elephant if M1 catches
-  it.
+- **Premortem T1 verdict (a7f9a56)**: CONFIRMED. The helper's strict path
+  (L4022-L4036) requires `child_by_field_name("arguments")` OR a child
+  whose kind contains "argument" or equals "call_suffix". `subshell` has
+  NEITHER. Helper returns `None` for subshell at HEAD.
+- **Resolution**: M2 MUST extend the helper with a Ruby-specific subshell
+  descent arm at the same site as the PHP echo BFS (taint.rs:3954-3982).
+  See §5.1 for the canonical helper-extension snippet. This is REQUIRED,
+  not contingent. LOC delta source-only ~65 (helper extension ~30-40 +
+  dispatch arm ~25).
+- **Tiger / elephant**: TIGER (premortem-confirmed). M1 audit's helper-verdict
+  step (now framed as "expects RED — helper returns None") will reconfirm.
 
 ### R2 — Side-effect on Ruby source detection (LOW)
 - **Risk**: `RUBY_AST_SOURCES` has `("", "params[")` raw-fallback. A
@@ -595,8 +800,10 @@ node-kind mismatch), different localized resolution.
 2. Design choice (Option B — localized dispatch arm) is documented with
    2 alternatives explicitly rejected and rationale.
 3. M1 / M2 / M3 gates are clear, deterministic, and binary-verifiable.
-4. LOC bound (~10-20 source LOC) is conservative; even worst-case (R1
-   triggers, helper extension required) stays under ~40 LOC.
+4. LOC envelope ~65-85 source LOC (~99 total with fixtures and tests) per
+   premortem A5 / E1 amendment. The helper extension (~30-40 LOC) plus the
+   dispatch arm (~25 LOC) are both required. LOC is informational; the
+   atomic-commit gates are the hard gates.
 5. No dependencies on other in-flight milestones (`var-extract-nested-constructor-v1`
    and `rust-vuln-taint-pipeline-v1` are independent — they touch
    different fixtures and different code paths).

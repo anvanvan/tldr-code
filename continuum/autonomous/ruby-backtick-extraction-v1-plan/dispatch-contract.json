@@ -1,7 +1,15 @@
 {
   "task": "ruby-backtick-extraction-v1",
   "complexity": "patch",
-  "scope": "Add a localized dispatch arm in detect_sinks_ast (crates/tldr-core/src/security/taint.rs) for Ruby `subshell` nodes (backtick `…` and %x{…}/%x[…]/%x(…) forms). Treats subshell as a ShellExec sink; var-extraction reuses extract_first_identifier_arg_ast's generic descend-named-children path (subshell → interpolation → identifier). Adds 2 new fixtures (%x{} positive + %x{} string-literal FP) and 2 new test functions. Closes 1 carry-forward from vuln-source-parity-v1 M5 Bucket A Ruby subset (ruby_command_injection_positive). NO edits to ast_utils.rs (call_node_kinds / extract_call_name_ruby unchanged). NO new RUBY_AST_SINKS entry (would be dead code — subshell is not call-shaped).",
+  "scope": "Add a localized dispatch arm in detect_sinks_ast (crates/tldr-core/src/security/taint.rs) for Ruby `subshell` nodes (backtick `…` and %x{…}/%x[…]/%x(…) forms) AND extend extract_first_identifier_arg_ast with a Ruby-specific subshell descent arm (REQUIRED — see premortem T1 / R-DISPATCH-1; the helper's generic path returns None for subshell because it requires an `arguments` field or 'argument'-kinded child which subshell lacks). Treats subshell as a ShellExec sink. Adds 2 new fixtures (%x{} positive + %x{} string-literal FP) and 2 new test functions. Closes 1 carry-forward from vuln-source-parity-v1 M5 Bucket A Ruby subset (ruby_command_injection_positive). NO edits to ast_utils.rs (call_node_kinds / extract_call_name_ruby unchanged). NO new RUBY_AST_SINKS entry (would be dead code — subshell is not call-shaped).",
+  "premortem": {
+    "verdict": "GO_WITH_REMEDIATIONS",
+    "premortem_commit": "a7f9a56",
+    "report_path": "continuum/autonomous/ruby-backtick-extraction-v1-plan/reports/premortem.json",
+    "blocking_remediations": ["R-DISPATCH-1", "R-DISPATCH-2"],
+    "advisory_remediations": ["R-DISPATCH-3", "R-DISPATCH-4", "R-DISPATCH-5"],
+    "amendment_summary": "A1 (T1): helper extension is REQUIRED, not contingent. A2 (T2): TaintSink construction has 5 fields (var, line, sink_type, tainted, statement) — read taint.rs:4341 verbatim, do NOT copy plan §5 sketch. A3: M3 binary smoke uses cargo run (not PATH tldr). A4: M1 node-audit has 4 assertions (added: positive fixture uses backtick form). A5: LOC envelope bumped from ~25 → ~65-85 source LOC."
+  },
   "closes_issues": [],
   "closes_carry_forward": "vuln-source-parity-v1 M5 Bucket A Ruby (1 test: ruby_command_injection_positive)",
   "enables_followons": [],
@@ -15,8 +23,10 @@
     "red_first_harness_required": true,
     "atomic_m2": "M2 ships dispatch arm + 2 fixtures + 2 tests in ONE commit. atomic_commit:true; release_commit_group:milestone_2_atomic. M3 (CHANGELOG + tag) is a separate commit per precedent (vuln-source-parity-v1 M6 / sanitizer-removal-v1 M5).",
     "binary_smoke_required_in_m3": "M3 produces `M3-binary-smoke.json` capturing `tldr vuln <fixture> --lang ruby --format json` output for both backtick and %x{} positive fixtures, asserting ≥1 finding of type `command_injection`. Catches any cargo-test-vs-binary drift (R3 risk in plan.md §7).",
-    "node_audit_empirical": "M1 produces `M1-node-audit.json` empirically verifying via tree-sitter-ruby 0.23.1 that BOTH `\\`#{cmd}\\`` and `%x{#{cmd}}` parse as a `subshell` named-node containing `interpolation` containing `identifier(cmd)`, and that `extract_first_identifier_arg_ast(subshell, source, Ruby)` returns `Some(\"cmd\")`. If the helper returns `None`, M2 extends its body with a Ruby-specific subshell descent arm (still localized to taint.rs).",
-    "predecessor_precedent_documented": "Code comment at the dispatch arm AND CHANGELOG architectural-note BOTH cross-reference field_access_info-extension-v1's `\\bgets\\b` retained-carry-forward as the predecessor pattern (raw-substring/AST node-kind mismatch resolved via localized handling rather than cross-cutting helper extension)."
+    "node_audit_empirical": "M1 produces `M1-node-audit.json` empirically verifying via tree-sitter-ruby 0.23.1 that BOTH `\\`#{cmd}\\`` and `%x{#{cmd}}` parse as a `subshell` named-node containing `interpolation` containing `identifier(cmd)`, and (PREMORTEM-VERIFIED, FALSIFIED in plan narrative) that `extract_first_identifier_arg_ast(subshell, source, Ruby)` RETURNS `None` at HEAD because the helper's generic path requires an `arguments` field or 'argument'-kinded child which subshell lacks (children are interpolation / string_content / escape_sequence). M2 MUST extend the helper.",
+    "predecessor_precedent_documented": "Code comment at the dispatch arm AND CHANGELOG architectural-note BOTH cross-reference field_access_info-extension-v1's `\\bgets\\b` retained-carry-forward as the predecessor pattern (raw-substring/AST node-kind mismatch resolved via localized handling rather than cross-cutting helper extension).",
+    "m2_helper_extension_required": "M2 MUST extend `extract_first_identifier_arg_ast` (taint.rs:3934-4065) with a Ruby-specific arm gated on `language == Language::Ruby && descendant.kind() == \"subshell\"`. Implementation: BFS over named children, recurse into `interpolation` nodes, return the first `identifier`'s text via `node_text`. Mirror the PHP echo BFS at taint.rs:3954-3982 stylistically (skip string_kinds, push named children to stack, return on first match). Without this extension, the dispatch arm extracts var=None → emits zero sinks → ruby_command_injection_positive STAYS RED → M2 atomic commit must be reverted per rollback_rule. The plan's R1 contingency is NOT optional — it is the EXPECTED path. (Premortem T1 / R-DISPATCH-1.)",
+    "m2_canonical_taintsink_construction_required": "M2 MUST construct TaintSink with all 5 fields: `var`, `line`, `sink_type`, `tainted: false`, `statement`. The plan §5 pseudo-code shows only 4 fields and would fail `cargo clippy --all-targets --workspace -- -D warnings` with `error[E0063]: missing field 'tainted'`. Kraken MUST read the canonical construction site at taint.rs:4341-4347 verbatim BEFORE writing the dispatch-arm body; do NOT copy plan §5 verbatim. (Premortem T2 / R-DISPATCH-2.)"
   },
   "skip_blokers": true,
   "release_constraints": {
@@ -60,7 +70,8 @@
       "stop_thresholds": [
         "`cargo test -p tldr-cli --release --test vuln_migration_v1_red ruby_command_injection_positive` REPORTS RED at HEAD (pre-M2). Captured in `M1-red-capture.txt`.",
         "`M1-node-audit.json` confirms `subshell` kind for both backtick and %x{} shapes via empirical tree-sitter-ruby 0.23.1 parse.",
-        "`M1-node-audit.json` records the empirical verdict for `extract_first_identifier_arg_ast(subshell)` — either `\"helper_returns_some\"` (proceed with M2 as designed) or `\"helper_returns_none\"` (M2 must extend the helper; LOC delta upgraded from ~25 to ~40).",
+        "`M1-node-audit.json` records the empirical verdict for `extract_first_identifier_arg_ast(subshell)` — premortem T1 expects `\"helper_returns_none\"` (M2 MUST extend the helper; LOC delta upgraded from ~25 to ~65). If empirical run returns `\"helper_returns_some\"`, re-investigate (premortem reading of taint.rs:3934-4065 indicates None).",
+        "`M1-node-audit.json` 4th assertion (premortem A4 / E4): the existing positive fixture `crates/tldr-cli/tests/fixtures/vuln_migration_v1/ruby/command_injection_positive.rb` USES the backtick form (not `%x{}`) — confirm by string-grep over the fixture text. Additionally: the new FP fixture `command_injection_percent_x_string_literal_fp.rb` parses with ZERO subshell descendants (the `%x{cmd}` text is inside a `string` literal, not at expression position).",
         "Working tree clean except for `continuum/autonomous/ruby-backtick-extraction-v1-plan/reports/`."
       ]
     },
@@ -86,9 +97,10 @@
       "green_files": [
         {
           "path": "crates/tldr-core/src/security/taint.rs",
-          "anchor": "detect_sinks_ast at L4256-L4360 — immediately after the `for pattern in patterns.sinks { … }` block and BEFORE the closing brace of the `for descendant in &descendants` loop iteration",
+          "anchor": "detect_sinks_ast at L4256-L4360 — immediately after the `for pattern in patterns.sinks { … }` block and BEFORE the closing brace of the `for descendant in &descendants` loop iteration; AND extract_first_identifier_arg_ast at L3934-L4065 — at the same site as the PHP echo_statement BFS arm (L3948-L3983) and OCaml application_expression arm (L3989-L4016)",
           "additions": [
-            "ADD a dedicated dispatch arm gated on `language == Language::Ruby && descendant.kind() == \"subshell\"`. Var-extraction chain: extract_first_identifier_arg_ast → extract_assignment_rhs_ident → extract_source_var_from_statement (mirrors the var-extraction chain used elsewhere in detect_sinks_ast at L4316-L4334). On `Some(var)`, push `TaintSink { var, line, sink_type: TaintSinkType::ShellExec, statement: Some(stmt_text.to_string()) }` then `continue` to next descendant. On `None` (pure-static subshell with no interpolation), emit nothing — correct (no taint flow possible).",
+            "REQUIRED (premortem T1 / R-DISPATCH-1): EXTEND `extract_first_identifier_arg_ast` (taint.rs:3934-4065) with a Ruby-specific arm gated on `language == Language::Ruby && descendant.kind() == \"subshell\"`. Mirror the PHP echo BFS at L3954-L3982: BFS over named-children of the subshell, recurse into `interpolation` named-children, skip string_kinds subtrees, return the first `identifier`'s text via `node_text`. ~30-40 LOC. Without this, the existing helper's strict path (requires `child_by_field_name(\"arguments\")` OR a child whose kind contains 'argument' or equals 'call_suffix') returns `None` for subshell — children are interpolation / string_content / escape_sequence — and the dispatch arm below produces no sinks.",
+            "ADD a dedicated dispatch arm in detect_sinks_ast gated on `language == Language::Ruby && descendant.kind() == \"subshell\"`. Var-extraction chain: extract_first_identifier_arg_ast → extract_assignment_rhs_ident → extract_source_var_from_statement (mirrors the var-extraction chain used elsewhere in detect_sinks_ast at L4316-L4334). On `Some(var)`, push `TaintSink` with ALL 5 fields (var, line, sink_type: TaintSinkType::ShellExec, tainted: false, statement: Some(stmt_text.to_string())) — read the canonical construction at taint.rs:4341-4347 verbatim; do NOT copy plan §5 (it is missing the `tainted` field). Then `continue` to next descendant. On `None`, emit nothing.",
             "ADD ~10-line comment block at the arm citing: (a) the carry-forward source (vuln-source-parity-v1 M5 Bucket A Ruby), (b) tree-sitter-ruby's collapse of backtick + %x{} onto subshell, (c) the FAI-v1 \\bgets\\b precedent, (d) Option A (call_node_kinds extension) explicitly rejected with rationale — see plan.md §5 for full comment text."
           ],
           "preserved": [
@@ -116,8 +128,8 @@
           ]
         }
       ],
-      "loc_delta": 60,
-      "loc_delta_note": "Source-only ~25 LOC (dispatch arm + comment); fixtures ~14 LOC; test functions ~20 LOC; total ~60 LOC. If R1 triggers (extract_first_identifier_arg_ast extension required), source-only bumps to ~40 LOC, total ~75 LOC — still inside the §0 LOC bound.",
+      "loc_delta": 99,
+      "loc_delta_note": "Source-only ~65 LOC (helper extension ~30-40 LOC + dispatch arm + comment ~25 LOC); fixtures ~14 LOC; test functions ~20 LOC; total ~99 LOC. Bumped from earlier estimate (~60) per premortem A5 / E1 — the helper extension is REQUIRED, not contingent (T1). LOC is informational; atomic-commit gates (cargo check, clippy -D warnings, all targeted tests GREEN) are the hard gates.",
       "stop_thresholds": [
         "`cargo check --workspace` PASS",
         "`cargo clippy --all-targets --workspace -- -D warnings` PASS",
@@ -162,8 +174,9 @@
       "loc_delta_note": "~10 LOC CHANGELOG + ~15 LOC reports.",
       "stop_thresholds": [
         "CHANGELOG entry merged.",
-        "`tldr vuln crates/tldr-cli/tests/fixtures/vuln_migration_v1/ruby/command_injection_positive.rb --lang ruby --format json` returns ≥1 command_injection finding.",
-        "`tldr vuln crates/tldr-cli/tests/fixtures/vuln_migration_v1/ruby/command_injection_percent_x_positive.rb --lang ruby --format json` returns ≥1 command_injection finding.",
+        "Binary smoke MUST invoke the locally-built binary, NOT a PATH-resolved `tldr` (premortem A3 / E2 / R-DISPATCH-4): use `cargo run -p tldr-cli --release -- vuln crates/tldr-cli/tests/fixtures/vuln_migration_v1/ruby/command_injection_positive.rb --lang ruby --format json` and assert ≥1 command_injection finding. The PATH `tldr` symlink may point to an older release without the new dispatch arm, producing a confusing 'no findings' result even when cargo test is GREEN.",
+        "Same `cargo run -p tldr-cli --release -- vuln ...` invocation against `command_injection_percent_x_positive.rb` returns ≥1 command_injection finding.",
+        "M3-binary-smoke.json explicitly records which binary path was invoked (cargo run vs PATH).",
         "Local annotated tag `ruby-backtick-extraction-v1` applied at HEAD post-M3.",
         "NO push, NO publish, NO version bump."
       ]
