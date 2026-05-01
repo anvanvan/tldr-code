@@ -1,5 +1,93 @@
 # Changelog
 
+## rust-vuln-taint-pipeline-v1 — internal milestone
+
+NOT a published release. Closes 4 of the remaining carry-forwards from
+vuln-source-parity-v1 M5 Bucket A — Rust subset
+(`rust_command_injection_positive`, `rust_deserialization_positive`,
+`rust_path_traversal_positive`, `rust_ssrf_positive`). Reframe C from
+vuln-migration-v1 §0 closure. Atomic dispatch flip + dedupe helper +
+SSRF bank patch (commit `8560ab9`).
+
+### Changed
+
+- **vuln**: Rust file analysis now runs the canonical taint pipeline
+  alongside the legacy line scanner. `tldr vuln file.rs` emits canonical
+  taint findings (`SqlInjection`, `Xss`, `CommandInjection`,
+  `PathTraversal`, `Ssrf`, `Deserialization`) AND line-scanner smell
+  findings (`UnsafeCode`, `MemorySafety`, `Panic`). Findings on the same
+  `(line, vuln_type)` tuple are domain-deduped to a single entry;
+  line-scanner-only smells (`UnsafeCode`, `MemorySafety`, `Panic`) are
+  always preserved. Pre-M2, `analyze_file` at
+  `crates/tldr-cli/src/commands/remaining/vuln.rs:368-370` short-circuited
+  `.rs` files into `analyze_rust_file` exclusively, blocking the canonical
+  `tldr_core::security::vuln::scan_vulnerabilities` pipeline. Post-M2,
+  the dispatch is dual: canonical runs for ALL extensions (.rs included);
+  the line scanner additionally runs on .rs and its overlapping
+  `SqlInjection`/`CommandInjection` emissions are deduped by
+  `dedupe_overlap` against canonical findings on the same `(line,
+  vuln_type)`. The "Rust files emit smell findings only" implicit
+  contract (Reframe C in vuln-migration-v1 §0) is retired.
+
+### Added
+
+- **taint banks**: `RUST_AST_SINKS` HttpRequest patterns extended with
+  `("", "reqwest::blocking::get")` and `("", "reqwest::blocking::Client")`
+  in `crates/tldr-core/src/security/taint.rs:2464-2491`. Required to close
+  `rust_ssrf_positive` whose handler calls `reqwest::blocking::get(&u)`.
+  `extract_call_name_rust` returns the full `scoped_identifier` text
+  (`"reqwest::blocking::get"`) — same shape as the existing
+  `("", "reqwest::get")` entries; matched via the raw-fallback path in
+  `member_patterns_match` (empty-receiver → `descendant_text.contains`).
+
+### Architectural note
+
+Atomic-commit boundary: dispatch flip + `dedupe_overlap` helper + SSRF
+bank patch + doc-comment retirement of the Reframe C carry-forward note
+ship in a SINGLE commit. Splitting creates intermediate states with
+regressions: (a) dispatch flip without bank patch leaves
+`rust_ssrf_positive` RED; (b) bank patch without dispatch flip is dead
+code unreachable for `.rs`; (c) dispatch flip without dedupe produces 2x
+`CommandInjection` findings on overlapping lines.
+
+### Carry-forwards (acknowledged, out of M2 scope)
+
+- `rust-wildcard-get-narrowing-v1` (recommended follow-on): the
+  `RUST_AST_SINKS` HttpRequest pattern `("*", "get")` becomes LIVE on
+  `.rs` files post-dispatch-flip. M3-binary-smoke quantifies a 100% FP
+  rate on synthetic non-HTTP-client `.get(<tainted>)` callers
+  (`HashMap::get`, `Vec::get`, `BTreeMap::get`). Real-world impact on
+  user Rust codebases is unmeasured but expected HIGH. Receiver-type-aware
+  narrowing (only fire when receiver resolves to `reqwest::Client` /
+  `reqwest::blocking::Client` / `ureq::Agent` / `ureq::Request`) is the
+  recommended fix; deferred to preserve M2 atomic boundary.
+- `rust-panic-suppression-v1` (recommended follow-on): `is_rust_test_file`
+  at `vuln.rs:679-685` suppresses `Panic` findings on `/tests/` paths
+  (which masks them on the 4 RED fixtures during verification) but
+  production-code paths (`src/main.rs`, `src/lib.rs`, etc.) get every
+  `.unwrap()` flagged. UX noise on real-world Rust codebases. A
+  `--include-smells` flag or default-suppress-on-Info severity is the
+  recommended fix.
+
+### Retained
+
+- `VulnFinding` struct shape unchanged.
+- `map_core_vuln_type` exhaustive-match contract preserved (no `_` arm).
+- `tldr_core::security::vuln::scan_vulnerabilities` signature unchanged.
+- `analyze_rust_file` body unchanged (M2 modifies dispatch only).
+- All 9 `#[test]` fns in `commands::remaining::vuln::tests` GREEN
+  post-merge.
+- All 4 `rust_*_string_literal_fp` regression-guards GREEN post-merge.
+- `("*", "get")` / `("*", "post")` wildcard patterns retained as-is —
+  narrowing deferred to follow-on (carry-forward documented above).
+
+### Closes carry-forwards
+
+- vuln-source-parity-v1 M5 Bucket A Rust subset (4 tests):
+  `rust_command_injection_positive`, `rust_deserialization_positive`,
+  `rust_path_traversal_positive`, `rust_ssrf_positive`. RED → GREEN.
+  `vuln_migration_v1_red` count: 163/168 → 167/168 (+4 closures).
+
 ## ruby-backtick-extraction-v1 — internal milestone
 
 NOT a published release. Closes 1 of the 6 remaining carry-forwards from
