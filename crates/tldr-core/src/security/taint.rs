@@ -2461,6 +2461,15 @@ static RUST_AST_SINKS: &[AstSinkPattern] = &[
     // `hyper::Client`, `Url::parse` are scoped_identifier paths — raw fallback.
     // `.get(` / `.post(` use wildcard receiver (matches reqwest/ureq client
     // method calls).
+    //
+    // RUST-VULN-TAINT-PIPELINE-V1 M2: extended with `reqwest::blocking::get`
+    // and `reqwest::blocking::Client` to close the SSRF bank gap surfaced in
+    // `vuln-source-parity-v1` M1 investigation. Required to close
+    // `rust_ssrf_positive` whose handler calls `reqwest::blocking::get(&u)`.
+    // `extract_call_name_rust` returns the full scoped_identifier text
+    // ("reqwest::blocking::get") — same shape as the existing reqwest::get /
+    // hyper::Client entries, matched via the raw-fallback path in
+    // `member_patterns_match` (pat_rcv == "" → descendant_text.contains).
     AstSinkPattern {
         call_names: &[],
         member_patterns: &[
@@ -2468,6 +2477,8 @@ static RUST_AST_SINKS: &[AstSinkPattern] = &[
             ("*", "post"),
             ("", "reqwest::get"),
             ("", "reqwest::Client"),
+            ("", "reqwest::blocking::get"),
+            ("", "reqwest::blocking::Client"),
             ("", "ureq::get"),
             ("", "ureq::post"),
             ("", "hyper::Client"),

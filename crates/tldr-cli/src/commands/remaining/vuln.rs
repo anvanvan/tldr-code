@@ -358,64 +358,109 @@ fn is_supported_source_file(path: &Path, lang: Option<Language>) -> bool {
 /// `TaintTracker` + per-language source/sink const tables) was
 /// collapsed onto the canonical `tldr_core::security::vuln::
 /// scan_vulnerabilities` path. Post-M4, every extension EXCEPT `.rs`
-/// flows through the canonical per-function `compute_taint_with_tree`
-/// dispatch that handles all 16 supported languages uniformly. The
-/// `.rs` branch is preserved per Reframe C — `analyze_rust_file` is a
-/// distinct concern (UnsafeCode/MemorySafety/Panic line-scanner, not
-/// taint flow).
+/// flowed through the canonical per-function `compute_taint_with_tree`
+/// dispatch that handles all 16 supported languages uniformly.
+///
+/// RUST-VULN-TAINT-PIPELINE-V1 M2 (Reframe C closure): post-M2, `.rs`
+/// files run the canonical `scan_vulnerabilities` pipeline AND the
+/// line-scanner `analyze_rust_file`, with domain-aware dedup on
+/// `(line, VulnType)` tuples for the overlapping `SqlInjection` /
+/// `CommandInjection` categories. The legacy "Rust files emit smell
+/// findings only" implicit contract is retired. The line scanner
+/// continues to emit the 3 Rust-specific smell variants
+/// (UnsafeCode, MemorySafety, Panic) plus its narrow SqlInjection /
+/// CommandInjection patterns; the canonical pipeline emits the 6
+/// base taint VulnTypes (SqlInjection, Xss, CommandInjection,
+/// PathTraversal, Ssrf, Deserialization). `dedupe_overlap` drops
+/// line-scanner SqlInjection/CommandInjection findings on
+/// `(line, VulnType)` tuples already covered by canonical —
+/// preserving smell-only findings unconditionally and keeping unique
+/// line-scanner emissions.
 fn analyze_file(path: &Path) -> Result<Vec<VulnFinding>, RemainingError> {
     let source = fs::read_to_string(path).map_err(|_| RemainingError::file_not_found(path))?;
-    if matches!(path.extension().and_then(|e| e.to_str()), Some("rs")) {
-        return Ok(analyze_rust_file(path, &source));
+    let is_rust = matches!(path.extension().and_then(|e| e.to_str()), Some("rs"));
+
+    // Canonical per-language taint pipeline runs for ALL extensions, including .rs
+    // (RUST-VULN-TAINT-PIPELINE-V1 M2 dispatch flip — closes Reframe C).
+    let mut findings: Vec<VulnFinding> =
+        match tldr_core::security::vuln::scan_vulnerabilities(path, None, None) {
+            Ok(report) => report
+                .findings
+                .into_iter()
+                .map(|f| {
+                    let vuln_type = map_core_vuln_type(f.vuln_type);
+                    let severity = match f.severity.to_uppercase().as_str() {
+                        "CRITICAL" => Severity::Critical,
+                        "HIGH" => Severity::High,
+                        "MEDIUM" => Severity::Medium,
+                        "LOW" => Severity::Low,
+                        _ => Severity::Medium,
+                    };
+                    let file_str = f.file.display().to_string();
+                    VulnFinding {
+                        vuln_type,
+                        severity,
+                        cwe_id: f.cwe_id.unwrap_or_default(),
+                        title: format!("{:?}", f.vuln_type),
+                        description: format!("{} with unsanitized input", f.sink.sink_type),
+                        file: file_str.clone(),
+                        line: f.sink.line,
+                        column: 0,
+                        taint_flow: vec![
+                            TaintFlow {
+                                file: file_str.clone(),
+                                line: f.source.line,
+                                column: 0,
+                                code_snippet: f.source.expression.clone(),
+                                description: format!("Source: {}", f.source.source_type),
+                            },
+                            TaintFlow {
+                                file: file_str,
+                                line: f.sink.line,
+                                column: 0,
+                                code_snippet: f.sink.expression.clone(),
+                                description: format!("Sink: {}", f.sink.sink_type),
+                            },
+                        ],
+                        remediation: f.remediation.clone(),
+                        confidence: 0.85,
+                    }
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+    // For .rs additionally run the line scanner — emits the 3 Rust-specific
+    // smell variants (UnsafeCode/MemorySafety/Panic) plus the 2 overlapping
+    // categories (SqlInjection/CommandInjection) handled by `dedupe_overlap`.
+    if is_rust {
+        let mut line_findings = analyze_rust_file(path, &source);
+        dedupe_overlap(&mut line_findings, &findings);
+        findings.extend(line_findings);
     }
-    // For all other languages (Python, Go, Java, JS, TS, C, C++, Ruby,
-    // PHP, etc.), use tldr-core's multi-language vulnerability scanner.
-    match tldr_core::security::vuln::scan_vulnerabilities(path, None, None) {
-        Ok(report) => {
-            let mut findings = Vec::new();
-            for f in report.findings {
-                let vuln_type = map_core_vuln_type(f.vuln_type);
-                let severity = match f.severity.to_uppercase().as_str() {
-                    "CRITICAL" => Severity::Critical,
-                    "HIGH" => Severity::High,
-                    "MEDIUM" => Severity::Medium,
-                    "LOW" => Severity::Low,
-                    _ => Severity::Medium,
-                };
-                let file_str = f.file.display().to_string();
-                findings.push(VulnFinding {
-                    vuln_type,
-                    severity,
-                    cwe_id: f.cwe_id.unwrap_or_default(),
-                    title: format!("{:?}", f.vuln_type),
-                    description: format!("{} with unsanitized input", f.sink.sink_type),
-                    file: file_str.clone(),
-                    line: f.sink.line,
-                    column: 0,
-                    taint_flow: vec![
-                        TaintFlow {
-                            file: file_str.clone(),
-                            line: f.source.line,
-                            column: 0,
-                            code_snippet: f.source.expression.clone(),
-                            description: format!("Source: {}", f.source.source_type),
-                        },
-                        TaintFlow {
-                            file: file_str,
-                            line: f.sink.line,
-                            column: 0,
-                            code_snippet: f.sink.expression.clone(),
-                            description: format!("Sink: {}", f.sink.sink_type),
-                        },
-                    ],
-                    remediation: f.remediation.clone(),
-                    confidence: 0.85,
-                });
-            }
-            Ok(findings)
-        }
-        Err(_) => Ok(Vec::new()),
-    }
+    Ok(findings)
+}
+
+/// Drop line-scanner findings whose `(line, vuln_type)` tuple is already
+/// covered by a canonical finding. Applies only to vuln_type values shared
+/// between both layers (`SqlInjection`, `CommandInjection`). Other
+/// line-scanner-only types (`UnsafeCode`, `MemorySafety`, `Panic`, etc.)
+/// are never dropped — no canonical analog exists.
+///
+/// RUST-VULN-TAINT-PIPELINE-V1 M2: predicate is `c.line == line_f.line &&
+/// c.vuln_type == line_f.vuln_type`. Line-precision matters. Three cases:
+/// (a) identical-line plus identical-vuln_type collapses to 1 finding
+/// (canonical wins, since line-scanner finding is dropped). (b) same-line
+/// plus different-vuln_type keeps both (e.g., line-scanner `UnsafeCode`
+/// alongside canonical `CommandInjection` on the same line). (c) same-vuln_type
+/// plus different-line keeps both (legitimate distinct sites).
+fn dedupe_overlap(line_findings: &mut Vec<VulnFinding>, canonical: &[VulnFinding]) {
+    line_findings.retain(|line_f| match line_f.vuln_type {
+        VulnType::SqlInjection | VulnType::CommandInjection => !canonical
+            .iter()
+            .any(|c| c.vuln_type == line_f.vuln_type && c.line == line_f.line),
+        _ => true,
+    });
 }
 
 /// Map a `tldr_core::security::vuln::VulnType` to the CLI-side `VulnType`.
