@@ -1,5 +1,114 @@
 # Changelog
 
+## taint-finding-dedupe-v1 — internal milestone
+
+NOT a published release. Medium-severity bug fix in the canonical
+taint engine output: the same call site was producing multiple
+findings when its expression simultaneously matched multiple sink
+patterns within ONE vuln_type. Pre-fix repro:
+
+- ripgrep `crates/ignore/src/gitignore.rs:608` → **4** findings
+- ripgrep `crates/ignore/src/dir.rs:901` → **4** findings
+- flask `cli.py:1023` → **4** findings — `eval(compile(f.read(), startup, "exec"), ctx)` matches CodeEval + CodeExec + CodeCompile sink patterns simultaneously, all mapping to `CommandInjection`, multiplied by 2 source variables (`startup` from env on line 1020 and `f` from file-read on line 1023)
+- flask `cli.py:1022` → **2** findings (FileOpen on the same line emitted twice from overlapping detector paths)
+- flask `config.py:209` → **2** findings (CodeExec + CodeCompile)
+
+Most consumers want a single highest-precedence finding per
+`(call site, vuln_type)` pair: the vuln-class is what drives
+remediation, and the choice between `CodeEval` vs `CodeCompile` at
+the same line for the same source variable is internal-detector
+noise.
+
+`vuln_migration_v1_red`: 168/168 stays GREEN.
+`secure-taint-aggregator-v1` parity preserved
+(`secure.taint_count == vuln.findings.length`, 4/4 on flask
+post-fix).
+
+### Changed
+
+- **vuln** (`tldr_core::security::vuln::scan_file_vulns`): the
+  per-function-merged dedupe key is replaced. Pre-fix key:
+  `(VulnType, source.line, sink.line, sink.function)` (set-based,
+  first-wins). Post-fix key:
+  `(file, sink.line, source.line, source.variable, vuln_type)`
+  (HashMap with rank-based keep-best). When multiple findings
+  collide on this tuple, the entry with the highest
+  `sink_type_precedence` rank is retained.
+- **vuln** (new helper `tldr_core::security::vuln::sink_type_precedence`):
+  ranks `TaintSinkType` variants by specificity for collision
+  resolution. Ordering (highest rank first):
+  1. `SqlQuery` (110) — only SQL sink, isolated rank for clarity.
+  2. `ShellExec` (100) — direct shell invocation.
+  3. `CodeEval` (95) — `eval` family, return value exfiltratable.
+  4. `CodeExec` (90) — `exec` family, no return value.
+  5. `CodeCompile` (85) — produces a code object only later
+     executed; least-specific of the Code* triple.
+  6. `Deserialize` (80) — gadget-chain-dependent RCE.
+  7. `HtmlOutput` (70) — XSS sink.
+  8. `FileOpen` (60) — read-side path-traversal, dominant in
+     real corpora; preferred when both file sinks match.
+  9. `FileWrite` (50).
+  10. `HttpRequest` (40) — SSRF.
+
+  The CodeEval > CodeExec > CodeCompile sub-ordering is the
+  load-bearing one: it determines which of the three CommandInjection
+  findings survives the flask `cli.py:1023` collapse.
+- **vuln** (test): two new regression-guard tests in
+  `crates/tldr-core/src/security/vuln.rs` —
+  `test_taint_finding_dedupe_eval_compile_collapses_to_one`
+  (synthetic `eval(compile(f.read(), ...))` triple-sink pattern
+  asserts exactly 1 CommandInjection finding remains, with
+  `sink.sink_type == "CodeEval"`) and
+  `test_taint_finding_dedupe_distinct_source_vars_kept` (boundary:
+  two distinct source variables flowing into the same `os.system`
+  sink line must remain as 2 separate findings — the dedupe key
+  includes `source.variable`).
+
+### Why `vuln_type` is part of the dedupe key
+
+A single sink expression can simultaneously be detected as TWO
+different `vuln_type`s. The canonical example is PHP
+`file_get_contents($url)` — both a `PathTraversal` (`FileOpen`
+sink) and an `Ssrf` (`HttpRequest` sink) for the same source
+variable on the same line. These are ORTHOGONAL findings (different
+remediation, different CWE, different risk class), and the
+`vuln_migration_v1_red` suite asserts ≥1 finding of EACH type.
+Collapsing across `vuln_type` would corrupt this signal.
+Within-`vuln_type` collapse still solves the
+CodeEval/CodeExec/CodeCompile case (all `CommandInjection`) and
+the FileOpen/FileWrite case (both `PathTraversal`), which was the
+originally reported bug.
+
+### Architectural note
+
+NO public API change. `VulnFinding` shape unchanged. CLI flags,
+output keys, JSON shape unchanged. The fix is entirely internal to
+`scan_file_vulns`'s merge phase. A previously emitted set of
+duplicate findings is now collapsed to a single representative; no
+new finding shapes are introduced.
+
+### Validation
+
+- `cargo test -p tldr-core --lib security::` — 125/125 GREEN
+  (includes the two new dedupe tests + the M3.1 causal-ordering
+  test).
+- `cargo test -p tldr-cli --test vuln_migration_v1_red` —
+  168/168 GREEN. (Note: an earlier draft of this fix that
+  EXCLUDED `vuln_type` from the dedupe key broke
+  `php_ssrf_positive` because PHP `file_get_contents` collapsed
+  the SSRF and PathTraversal findings together. Restoring
+  `vuln_type` to the key fixes it; spec's pre-warning was correct.)
+- `cargo test -p tldr-cli --test vuln_migration_v1_composite_red` —
+  1/1 GREEN.
+- Binary verify on `/tmp/repos/flask/src`:
+  - cli.py:1023: 4 → 2 findings; config.py:209: 2 → 1; cli.py:1022: 2 → 1.
+  - Total: 7 → 4 (post-M3.1 baseline → post-M3.2).
+- Binary verify on `/tmp/repos/ripgrep/crates`:
+  - gitignore.rs:608: 4 → 2; dir.rs:933: 4 → 2; dir.rs:919: 4 → 2.
+  - Total: 37 → 28 (post-M3.1 baseline → post-M3.2).
+- `secure-taint-aggregator-v1` parity preserved on flask
+  (`secure.taint_count == vuln.findings.length == 4`).
+
 ## taint-flow-causal-ordering-v1 — internal milestone
 
 NOT a published release. Medium-severity bug fix in the canonical

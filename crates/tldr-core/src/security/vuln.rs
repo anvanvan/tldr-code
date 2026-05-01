@@ -232,6 +232,55 @@ fn severity_for(_vuln_type: VulnType) -> &'static str {
     "HIGH"
 }
 
+/// TAINT-FINDING-DEDUPE-V1: rank a `TaintSinkType` by specificity for the
+/// per-call-site dedupe in `scan_file_vulns`.
+///
+/// When two findings collide on `(file, sink.line, source.line,
+/// source.variable)` — i.e. the SAME taint flow matched multiple sink
+/// patterns at the same call site — we keep the entry with the HIGHEST
+/// rank. The ordering reflects "most actionable diagnostic":
+///
+/// 1. **`SqlQuery`** (rank 110) — the only SQL sink, dedup against itself
+///    only; rank kept distinct from the code-execution family for clarity.
+/// 2. **`ShellExec`** (rank 100) — directly invokes a shell; an exploit
+///    is a one-step OS-level compromise.
+/// 3. **`CodeEval`** (rank 95) — `eval()` family: arbitrary in-process
+///    code execution, generally more severe than `exec()` because `eval`
+///    return values may be exfiltrated.
+/// 4. **`CodeExec`** (rank 90) — `exec()` family: runs a code object but
+///    does not return the value.
+/// 5. **`CodeCompile`** (rank 85) — `compile()` produces a code object
+///    that is only dangerous when later executed; least specific of the
+///    Code* triple.
+/// 6. **`Deserialize`** (rank 80) — RCE-via-deserialization, ranks below
+///    the code-execution family because the exploit pathway is gadget-
+///    chain-dependent.
+/// 7. **`HtmlOutput`** (rank 70) — XSS sink.
+/// 8. **`FileOpen`** (rank 60) — read-side path-traversal, more frequent
+///    in real corpora than `FileWrite`; preferred when both match.
+/// 9. **`FileWrite`** (rank 50).
+/// 10. **`HttpRequest`** (rank 40) — SSRF.
+///
+/// The numeric rank itself is internal; only the relative ordering is
+/// observable. The CodeEval > CodeExec > CodeCompile sub-ordering is the
+/// load-bearing one for the flask `cli.py:1023`/`config.py:209` case
+/// where `eval(compile(...))` triggers all three sink patterns at the
+/// same call site.
+fn sink_type_precedence(sink_type: TaintSinkType) -> u32 {
+    match sink_type {
+        TaintSinkType::SqlQuery => 110,
+        TaintSinkType::ShellExec => 100,
+        TaintSinkType::CodeEval => 95,
+        TaintSinkType::CodeExec => 90,
+        TaintSinkType::CodeCompile => 85,
+        TaintSinkType::Deserialize => 80,
+        TaintSinkType::HtmlOutput => 70,
+        TaintSinkType::FileOpen => 60,
+        TaintSinkType::FileWrite => 50,
+        TaintSinkType::HttpRequest => 40,
+    }
+}
+
 /// Get a human-readable description for a `TaintSourceType`, partitioned by
 /// language.
 ///
@@ -552,10 +601,6 @@ fn scan_file_vulns(path: &Path, vuln_filter: Option<VulnType>) -> TldrResult<Vec
     let path_buf = path.to_path_buf();
     let source_bytes = content.as_bytes();
     let mut findings: Vec<VulnFinding> = Vec::new();
-    // Track (vuln_type, source.line, sink.line, sink.var) to avoid duplicate
-    // emissions when two methods share a name and `find_function_node` returns
-    // the first match for both info entries.
-    let mut emitted: HashSet<(VulnType, u32, u32, String)> = HashSet::new();
 
     // FALLBACK: empty function list (e.g., top-level Go statements with no
     // user-defined functions, or extractor missed all). Run a single
@@ -575,7 +620,10 @@ fn scan_file_vulns(path: &Path, vuln_filter: Option<VulnType>) -> TldrResult<Vec
     // (where the outer loop has only 1 element), this inner par_iter is the
     // primary parallelism source.
     use rayon::prelude::*;
-    let per_fn_findings: Vec<Vec<VulnFinding>> = fn_infos
+    // TAINT-FINDING-DEDUPE-V1: tag each candidate finding with its canonical
+    // `TaintSinkType` so the merge phase can rank colliding entries by sink
+    // specificity (most-specific wins; see `sink_type_precedence`).
+    let per_fn_findings: Vec<Vec<(VulnFinding, TaintSinkType)>> = fn_infos
         .par_iter()
         .map(|fn_info| {
             let cfg = match extract_cfg_from_tree(&tree, &content, &fn_info.name, language) {
@@ -628,9 +676,10 @@ fn scan_file_vulns(path: &Path, vuln_filter: Option<VulnType>) -> TldrResult<Vec
                 Err(_) => return Vec::new(),
             };
             // Build candidate findings; dedup happens in the merge phase below.
-            let mut local: Vec<VulnFinding> = Vec::new();
+            let mut local: Vec<(VulnFinding, TaintSinkType)> = Vec::new();
             for flow in info.flows {
-                let vuln_type = vuln_type_from_sink(flow.sink.sink_type);
+                let canonical_sink_type = flow.sink.sink_type;
+                let vuln_type = vuln_type_from_sink(canonical_sink_type);
                 if let Some(filter) = vuln_filter {
                     if vuln_type != filter {
                         continue;
@@ -663,43 +712,91 @@ fn scan_file_vulns(path: &Path, vuln_filter: Option<VulnType>) -> TldrResult<Vec
                         .map(|bid| format!("block-{}", bid))
                         .collect()
                 };
-                local.push(VulnFinding {
-                    vuln_type,
-                    file: path_buf.clone(),
-                    source: TaintSource {
-                        variable: source_record.variable,
-                        source_type: description,
-                        line: source_record.line,
-                        expression: source_record.expression,
+                local.push((
+                    VulnFinding {
+                        vuln_type,
+                        file: path_buf.clone(),
+                        source: TaintSource {
+                            variable: source_record.variable,
+                            source_type: description,
+                            line: source_record.line,
+                            expression: source_record.expression,
+                        },
+                        sink: sink_record,
+                        flow_path,
+                        severity: severity_for(vuln_type).to_string(),
+                        remediation: get_remediation(vuln_type).to_string(),
+                        cwe_id: Some(get_cwe_id(vuln_type).to_string()),
                     },
-                    sink: sink_record,
-                    flow_path,
-                    severity: severity_for(vuln_type).to_string(),
-                    remediation: get_remediation(vuln_type).to_string(),
-                    cwe_id: Some(get_cwe_id(vuln_type).to_string()),
-                });
+                    canonical_sink_type,
+                ));
             }
             local
         })
         .collect();
 
-    // Merge per-function findings, deduplicating duplicates that arise when
-    // two methods share a name and `find_function_node` returns the first
-    // match for both info entries.
+    // TAINT-FINDING-DEDUPE-V1: collapse findings that share
+    // `(file, sink.line, source.line, source.variable, vuln_type)`. The
+    // same call site commonly matches multiple sink patterns within ONE
+    // vuln_type — e.g. `eval(compile(f.read(), startup, "exec"))` triggers
+    // CodeEval + CodeExec + CodeCompile in the canonical engine, all
+    // mapping to `CommandInjection`, all with the same sink line and the
+    // same `(source.line, source.variable)`. Most consumers want a single
+    // highest-precedence finding per `(call site, vuln_type)` pair.
+    //
+    // Tuple INCLUDES `source.variable` — distinct tainted variables on
+    // the same line are legitimately distinct findings (e.g.
+    // `os.system(env_var + " " + user_input)` has two source vars on one
+    // line; both must be retained).
+    //
+    // Tuple INCLUDES `vuln_type` — a single sink (e.g. PHP
+    // `file_get_contents($u)`) can simultaneously be a `PathTraversal`
+    // (FileOpen) AND an `Ssrf` (HttpRequest) for the same source variable
+    // and source line. These are ORTHOGONAL findings (different remediation,
+    // different CWE) and the RED suite asserts ≥1 of each type — collapsing
+    // across vuln_type would corrupt that signal. Within-vuln_type dedupe
+    // still solves the CodeEval/CodeExec/CodeCompile case (all
+    // `CommandInjection`) and the FileOpen/FileWrite case (both
+    // `PathTraversal`).
+    //
+    // Tuple EXCLUDES `sink.function` (the canonical sink var) because the
+    // sink var is derived from the sink-pattern detector and varies
+    // between overlapping detectors at the same call site (e.g. `f` for
+    // FileOpen vs the wrapped expression for Code* sinks); including it
+    // would defeat the dedupe.
+    //
+    // Precedence: pick the entry with highest `sink_type_precedence`
+    // rank — see that helper for the ordering rationale (CodeEval >
+    // CodeExec > CodeCompile, FileOpen > FileWrite, etc.). On ties the
+    // first-encountered entry wins (deterministic via parallel map order
+    // collected in `fn_infos` ordering).
+    use std::collections::hash_map::Entry;
+    let mut best: HashMap<(String, u32, u32, String, VulnType), (VulnFinding, TaintSinkType)> =
+        HashMap::new();
     for fn_findings in per_fn_findings {
-        for finding in fn_findings {
-            let dedup_key = (
-                finding.vuln_type,
-                finding.source.line,
+        for (finding, sink_type) in fn_findings {
+            let key = (
+                finding.file.display().to_string(),
                 finding.sink.line,
-                finding.sink.function.clone(),
+                finding.source.line,
+                finding.source.variable.clone(),
+                finding.vuln_type,
             );
-            if !emitted.insert(dedup_key) {
-                continue;
+            match best.entry(key) {
+                Entry::Vacant(v) => {
+                    v.insert((finding, sink_type));
+                }
+                Entry::Occupied(mut o) => {
+                    let cur_rank = sink_type_precedence(o.get().1);
+                    let new_rank = sink_type_precedence(sink_type);
+                    if new_rank > cur_rank {
+                        o.insert((finding, sink_type));
+                    }
+                }
             }
-            findings.push(finding);
         }
     }
+    findings.extend(best.into_values().map(|(f, _)| f));
 
     let _ = path_str; // path_str retained for future use; suppress unused warn
     Ok(findings)
@@ -891,6 +988,104 @@ def handler():
             !findings.is_empty(),
             "Real command injection must still be detected"
         );
+    }
+
+    /// TAINT-FINDING-DEDUPE-V1 regression guard.
+    ///
+    /// Reproduces the flask `cli.py:1023` triple-sink pattern:
+    /// `eval(compile(f.read(), startup, "exec"))` simultaneously matches the
+    /// `eval()` (CodeEval), `exec` argument (CodeExec), and `compile()`
+    /// (CodeCompile) sink patterns. With M3.1 causal-ordering applied, ONE
+    /// source variable on the same line emitting against a SINGLE call site
+    /// must collapse to ONE finding post-dedupe — keeping CodeEval as the
+    /// most-specific sink type.
+    ///
+    /// Acceptance: exactly 1 CommandInjection finding for the synthetic
+    /// `eval(compile(f.read(), ...))` shape, with `sink.sink_type == "CodeEval"`.
+    #[test]
+    fn test_taint_finding_dedupe_eval_compile_collapses_to_one() {
+        // Single call site `eval(compile(config_file.read(), filename, "exec"))`
+        // — with `config_file = ...read()` declared on the SAME line as the
+        // sink, source.line == sink.line, source.var == "config_file". The
+        // canonical engine emits one flow per matched sink pattern (CodeEval +
+        // CodeExec + CodeCompile) — dedupe must collapse to a single
+        // CodeEval-flagged finding.
+        let py = r#"
+def from_pyfile(filename, d):
+    config_file = open(filename, "rb").read()
+    eval(compile(config_file, filename, "exec"), d.__dict__)
+    return True
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dedupe_repro.py");
+        std::fs::write(&file, py).unwrap();
+        let findings = scan_file_vulns(&file, None).unwrap();
+        // Only inspect CommandInjection findings — the FileOpen on the
+        // `open(...)` line is a separate (legitimate) PathTraversal finding
+        // and must not be dedupe-folded across vuln_type.
+        let cmd_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.vuln_type == VulnType::CommandInjection)
+            .collect();
+        assert_eq!(
+            cmd_findings.len(),
+            1,
+            "Expected exactly 1 CommandInjection finding post-dedupe, got {}: {:?}",
+            cmd_findings.len(),
+            cmd_findings
+                .iter()
+                .map(|f| f.sink.sink_type.clone())
+                .collect::<Vec<_>>()
+        );
+        // Precedence: CodeEval beats CodeExec beats CodeCompile.
+        assert_eq!(
+            cmd_findings[0].sink.sink_type, "CodeEval",
+            "Dedupe must keep CodeEval (highest sink_type_precedence) over \
+             CodeExec/CodeCompile, got {}",
+            cmd_findings[0].sink.sink_type
+        );
+    }
+
+    /// TAINT-FINDING-DEDUPE-V1 boundary test: distinct source variables on
+    /// the same sink line must NOT be deduped against each other.
+    ///
+    /// Two source variables (`env_var` from `os.environ` and `name` from
+    /// `request.args.get`) flowing into a single sink line are legitimately
+    /// distinct findings — the dedupe key includes `source.variable` for
+    /// exactly this case.
+    #[test]
+    fn test_taint_finding_dedupe_distinct_source_vars_kept() {
+        let py = r#"
+import os
+from flask import request
+def handler():
+    env_var = os.environ.get("HOME")
+    name = request.args.get("name")
+    os.system("echo " + env_var + " " + name)
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("distinct_vars.py");
+        std::fs::write(&file, py).unwrap();
+        let findings = scan_file_vulns(&file, None).unwrap();
+        let cmd_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.vuln_type == VulnType::CommandInjection)
+            .collect();
+        // Two distinct source variables flow into the same `os.system` sink
+        // line; both must be retained.
+        assert_eq!(
+            cmd_findings.len(),
+            2,
+            "Expected 2 distinct CommandInjection findings (one per source \
+             variable), got {}",
+            cmd_findings.len()
+        );
+        let mut src_vars: Vec<&str> = cmd_findings
+            .iter()
+            .map(|f| f.source.variable.as_str())
+            .collect();
+        src_vars.sort();
+        assert_eq!(src_vars, vec!["env_var", "name"]);
     }
 
     /// TAINT-FLOW-CAUSAL-ORDERING-V1 regression guard.
