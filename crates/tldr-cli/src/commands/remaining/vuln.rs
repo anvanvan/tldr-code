@@ -152,11 +152,12 @@ impl VulnArgs {
                 if let Some(l) = detected {
                     if !is_natively_analyzed(l) {
                         return Err(RemainingError::autodetect_unsupported(format!(
-                            "vuln: taint analysis for {} is not yet supported by autodetect; \
-                             use --lang python, --lang rust, --lang typescript, or --lang javascript \
-                             to scan files of a supported language, or omit --lang in a pure \
-                             Python/Rust/TypeScript/JavaScript project.",
-                            l.as_str()
+                            "vuln: taint analysis for {lang} is not yet supported by autodetect; \
+                             pass --lang {lang} explicitly to scan this file (the canonical taint \
+                             pipeline supports it). Autodetect-by-extension currently routes only \
+                             --lang python, --lang rust, --lang typescript, and --lang javascript; \
+                             other languages require an explicit --lang flag.",
+                            lang = l.as_str()
                         ))
                         .into());
                     }

@@ -1,5 +1,64 @@
 # Changelog
 
+## vuln-autodetect-message-v1 — internal milestone
+
+NOT a published release. UX hardening of the `tldr vuln` autodetect-
+unsupported error message. Closes ZERO RED tests; this is a UX-clarity
+hardening milestone that closes a misleading-message FP surfaced during
+binary-verification of the prior 14 milestones. `vuln_migration_v1_red`
+remains 168/168 GREEN.
+
+### Changed
+
+- **vuln** (autodetect error message): when the autodetected language
+  lies outside the autodetect-by-extension set
+  (Python/Rust/TypeScript/JavaScript), the error now points the user at
+  `--lang <detected>` directly — the canonical taint pipeline DOES
+  support all 17 languages via an explicit `--lang` flag (Go, Java,
+  Cpp, C, CSharp, Ruby, Php, Kotlin, Swift, Scala, Elixir, Lua, Luau,
+  Ocaml — every language with `LanguagePatterns` AST banks). Pre-M1
+  message read "use --lang python, --lang rust, --lang typescript, or
+  --lang javascript", implying ONLY those four were supported and
+  steering Java/Ruby/Cpp/etc. users toward an unhelpful workaround.
+  Post-M1 message includes the actionable `--lang <detected>` form
+  AND retains the four-lang autodetect-routing list (which the
+  `vuln_autodetect_tests` regression-guards assert on at L191-198).
+
+### Architectural note
+
+NO public API change. NO new error-type variant. NO new CLI flag. NO
+change to `is_natively_analyzed` semantics. NO change to autodetect
+extension routing in `is_supported_source_file`. Single source-file
+edit (`crates/tldr-cli/src/commands/remaining/vuln.rs`); the message
+literal is the only edit. The phrase "is not yet supported by
+autodetect" is preserved verbatim per the
+`test_vuln_errors_on_unsupported_autodetected_lang` regression-guard
+at `vuln_autodetect_tests.rs:186-189`. The four-lang substring
+(`--lang python` / `--lang rust` / `--lang typescript` /
+`--lang javascript`) is retained per the same test's L191-198
+assertion (any-of). The new actionable `--lang {detected}` guidance
+is additive; existing tests pass unchanged.
+
+### Retained
+
+- All 6 `vuln_autodetect_tests` GREEN
+  (`test_vuln_errors_on_unsupported_autodetected_lang`,
+  `test_vuln_autodetects_python`, `test_vuln_autodetects_rust`,
+  `test_vuln_no_detectable_lang_empty_dir`,
+  `test_vuln_honors_explicit_lang_typescript`,
+  `test_vuln_no_cap_on_large_repos`).
+- `vuln_migration_v1_red`: 168/168 GREEN.
+- `val011_vuln_typescript_autodetect_test`: 1/1 GREEN.
+- Public API surface UNCHANGED.
+
+### Standing rules upheld
+
+- Internal-versioning posture honored: NO push, NO `cargo publish`, NO
+  version bump.
+- Local tag only (`vuln-autodetect-message-v1`).
+- USER STANDING RULE: cargo publish requires explicit user
+  authorization every time.
+
 ## rust-panic-suppression-v1 — internal milestone
 
 NOT a published release. UX hardening of `tldr vuln` JSON output on
