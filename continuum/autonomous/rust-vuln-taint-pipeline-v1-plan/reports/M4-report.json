@@ -9,5 +9,5 @@
     "no_source_code_change": true,
     "no_version_bump": true
   },
-  "head_at_changelog_commit": "<filled in M5 alongside tag commit>"
+  "head_at_changelog_commit": "282ce0b"
 }

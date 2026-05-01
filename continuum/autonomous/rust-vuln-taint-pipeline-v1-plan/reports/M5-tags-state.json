@@ -3,7 +3,10 @@
   "title": "Local tag rust-vuln-taint-pipeline-v1",
   "tag_name": "rust-vuln-taint-pipeline-v1",
   "tag_type": "annotated",
-  "tagged_sha": "<filled in post-tag>",
+  "tagged_sha": "282ce0b",
+  "tag_object_sha": "427732e88b7ee0598d8d345e086800bbd1bc5f1d",
+  "m2_atomic_sha": "8560ab9",
+  "m3_m4_changelog_sha": "282ce0b",
   "tag_message_summary": "rust-vuln-taint-pipeline-v1: closes 4 vuln-source-parity-v1 M5 Bucket A Rust carry-forwards via atomic dispatch flip + dedupe + SSRF bank patch. Reframe C closure.",
   "stop_thresholds_satisfied": {
     "tag_applied_locally": true,
