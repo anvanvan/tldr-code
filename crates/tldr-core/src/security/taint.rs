@@ -1961,12 +1961,20 @@ static TYPESCRIPT_AST_SINKS: &[AstSinkPattern] = &[
         sink_type: TaintSinkType::SqlQuery,
     },
     // W1-M1: NextJS framework sinks (parity-add for Wave 2 regex deletion).
-    // NextResponse.redirect / .json — App Router response helpers.
+    // NextResponse.redirect — App Router response helper.
+    //
+    // js-res-json-fp-narrowing-v1 DROPPED `("NextResponse", "json")` from
+    // this bank: NextResponse.json writes a JSON HTTP response body with
+    // `Content-Type: application/json`. There is no file open, no path
+    // traversal, and no XSS vector when the browser respects the content
+    // type. Pre-fix it was wired here as FileWrite which projected to
+    // PathTraversal via `vuln_type_from_sink`, producing a high-severity
+    // FP class on every Next.js App Router handler that emitted tainted
+    // input back as JSON.
     AstSinkPattern {
         call_names: &[],
         member_patterns: &[
             ("NextResponse", "redirect"),
-            ("NextResponse", "json"),
             ("Response", "redirect"),
         ],
         sink_type: TaintSinkType::FileWrite,
@@ -2021,14 +2029,35 @@ static TYPESCRIPT_AST_SINKS: &[AstSinkPattern] = &[
     // HtmlOutput AstSinkPattern below. Reflected `.send(tainted)` is
     // semantically Xss (the response body is interpreted as HTML by the
     // browser), not PathTraversal/FileWrite.
+    //
+    // js-res-json-fp-narrowing-v1 DROPPED the `.json` entries
+    // (`('res','json')`, `('Response','json')`, `('response','json')`)
+    // from this bank for the same reason as the parallel NextJS
+    // `('NextResponse','json')` removal above. `res.json(tainted)` /
+    // `Response.json(tainted)` / `response.json(tainted)` write a JSON
+    // HTTP response body with `Content-Type: application/json` — no
+    // file open, no path traversal, no XSS (browser respects the
+    // content type). Pre-fix these were wired as FileWrite which
+    // projected to PathTraversal via `vuln_type_from_sink`, emitting
+    // a high-severity FP on every Express/NestJS handler that echoed
+    // tainted input back as JSON. Empirical repro:
+    //   /tmp/repos/express/test/express.raw.js:506
+    //   res.json({ buf: req.body.toString('hex') })
+    // (the file-suppression mask in js-test-file-suppression-v1 hides
+    // this specific case at test scope, but the underlying pattern
+    // bank would still re-fire on PRODUCTION code anywhere `res.json`
+    // appeared with tainted input — this fix closes the class.)
+    //
+    // Only the redirect entries remain wired here as FileWrite:
+    // navigation responses CAN be path-traversal-equivalent when the
+    // tainted target is a server-side path / route resolution. The
+    // `*.send` entries live in the HtmlOutput bank below (M3
+    // reclassification).
     AstSinkPattern {
         call_names: &[],
         member_patterns: &[
             ("res", "redirect"),
-            ("res", "json"),
-            ("Response", "json"),
             ("response", "redirect"),
-            ("response", "json"),
         ],
         sink_type: TaintSinkType::FileWrite,
     },

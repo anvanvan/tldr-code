@@ -1,5 +1,142 @@
 # Changelog
 
+## js-res-json-fp-narrowing-v1 — internal milestone
+
+NOT a published release. Medium-severity false-positive class fix in
+the JavaScript/TypeScript taint engine: framework JSON-response
+writers (`res.json` / `response.json` / `Response.json` /
+`NextResponse.json`) were wired in the JS/TS sink bank as
+`TaintSinkType::FileWrite`, which projects to `VulnType::PathTraversal`
+via `vuln_type_from_sink`. The result: every Express / NestJS /
+Next.js App Router handler that echoed user input back as JSON
+emitted a high-severity `path_traversal` finding even though no
+file open and no path is involved.
+
+Empirical pre-fix repro on `/tmp/repos/express`:
+
+```
+$ tldr vuln --lang javascript /tmp/repos/express --include-tests 2>/dev/null \
+    | jq '.findings[] | {file:(.file|split("/")|last), line, vuln_type, snip:(.taint_flow[0].code_snippet|.[:80])}'
+{ "file": "express.raw.js", "line": 506, "vuln_type": "path_traversal",
+  "snip": "res.json({ buf: req.body.toString('hex') })" }
+{ "file": "app.engine.js",  "line":   9, "vuln_type": "path_traversal",
+  "snip": "fs.readFile(path, 'utf8', function(err, str){" }
+```
+
+The first finding (line 506, `res.json({ buf: ... })`) is a pure FP:
+`res.json` writes a JSON HTTP response body with `Content-Type:
+application/json` — there is no file open, no path, and no XSS
+vector when the browser respects the content type. The second
+finding is the legitimate `fs.readFile(path, ...)` shape (file open
+on tainted path) — that one is a real path traversal and is
+RETAINED.
+
+Note: js-test-file-suppression-v1 (the prior atomic milestone)
+already suppresses test-file findings by default — but the
+underlying pattern bank still classified `res.json` as a FileWrite
+sink, so the FP would re-fire on PRODUCTION code anywhere
+`res.json` appeared with tainted input. This milestone fixes the
+bank itself, closing the FP class for both test and production
+scope.
+
+`vuln_migration_v1_red`: 168/168 stays GREEN.
+
+### Changed
+
+- **taint** (`tldr_core::security::taint::TYPESCRIPT_AST_SINKS`):
+  dropped four entries from the FileWrite sink bank:
+  `("NextResponse", "json")`, `("res", "json")`,
+  `("Response", "json")`, `("response", "json")`. The pattern bank
+  is shared between Language::JavaScript and Language::TypeScript
+  (single dispatch entry at `taint.rs:3766`), so this fix applies
+  uniformly to both. Inline comment block updated to document the
+  rationale and reference the empirical repro.
+
+  The `("NextResponse", "redirect")` and `("Response", "redirect")`
+  entries are RETAINED (separate AstSinkPattern in the same bank):
+  navigation responses CAN be path-traversal-equivalent when the
+  tainted target is a server-side path / route resolution.
+
+- **vuln** (test): two new RED guards in
+  `crates/tldr-cli/tests/vuln_js_res_json_fp_narrowing_v1_test.rs`:
+  - `js_path_traversal_res_json_fp_zero_findings` — synthetic JS
+    fixture exercising all four shapes (`res.json(req.body)`,
+    `res.json({name: req.query.name})`, `response.json(req.body)`,
+    `Response.json(req.body)`, `NextResponse.json({data: req.query.id})`)
+    asserts ZERO `path_traversal` findings post-fix. Pre-fix
+    capture: 2 findings (the entries that cleared the canonical
+    HttpParam-source check via `req.query.X`).
+  - `ts_path_traversal_res_json_fp_zero_findings` — TypeScript
+    parity fixture and assertion.
+
+  The corresponding fixtures are added at:
+  - `crates/tldr-cli/tests/fixtures/vuln_migration_v1/javascript/path_traversal_res_json_fp.js`
+  - `crates/tldr-cli/tests/fixtures/vuln_migration_v1/typescript/path_traversal_res_json_fp.ts`
+
+### Architectural note
+
+NO public API change. `VulnFinding`, `TaintSinkType`, JSON output
+shape unchanged. `vuln_type_from_sink`'s `FileWrite -> PathTraversal`
+projection unchanged (still load-bearing for `fs.writeFile`,
+`fs.writeFileSync`, the legitimate FileWrite/PathTraversal
+detection class). The fix is entirely in the source-of-truth sink
+pattern bank: a previously emitted set of pattern matches is now
+absent, so no findings are constructed in the first place.
+
+The `*.send` reclassification from VULN-MIGRATION-V1 M3
+(`reply.send`, `res.send`, `Response.send`, `response.send` →
+HtmlOutput / Xss) is RETAINED unchanged. Reflected `.send(tainted)`
+is semantically Xss — the response body is interpreted as HTML by
+the browser. `res.json(tainted)` is NOT Xss for the same reason it
+is NOT path traversal: the `application/json` content type tells
+the browser not to render the body as HTML.
+
+### Retained
+
+- `vuln_migration_v1_red` 168/168 GREEN — none of the existing
+  positive fixtures rely on `res.json` / `response.json` /
+  `Response.json` / `NextResponse.json` for their detection. The
+  JavaScript / TypeScript path_traversal_positive fixtures use
+  `fs.readFileSync(p, 'utf8')` (FileOpen sink), which is in a
+  separate AstSinkPattern (`("fs", "readFile")` etc.) untouched by
+  this milestone.
+- `*.send` HtmlOutput entries (M3) — semantically distinct.
+- `*.redirect` FileWrite entries — semantically distinct (route
+  resolution).
+
+### Validation
+
+- `cargo test --release --features semantic -p tldr-cli --test vuln_js_res_json_fp_narrowing_v1_test`
+  — 2/2 GREEN (was RED pre-fix, captured 2 path_traversal findings
+  on each fixture).
+- `cargo test --release --features semantic -p tldr-cli --test vuln_migration_v1_red`
+  — 168/168 GREEN.
+- `cargo test --release --features semantic -p tldr-cli --test vuln_migration_v1_composite_red`
+  — 1/1 GREEN.
+- `cargo test --release --features semantic -p tldr-core --lib security::`
+  — 125/125 GREEN.
+- Binary verify on `/tmp/repos/express`:
+  - `tldr vuln --lang javascript /tmp/repos/express` →
+    **0** findings (default; same as post-M4.1).
+  - `tldr vuln --lang javascript /tmp/repos/express --include-tests` →
+    **1** path_traversal finding (was 2). The remaining finding is
+    the legitimate `fs.readFile(path, 'utf8', ...)` flow at
+    `test/app.engine.js:9`; the `res.json({buf: req.body.toString('hex')})`
+    FP at `test/express.raw.js:506` is gone.
+- Binary verify on the synthetic FP fixture:
+  - `tldr vuln --lang javascript .../javascript/path_traversal_res_json_fp.js` →
+    **0** findings.
+
+### Standing rules upheld
+
+- No version bump. No publish. No push.
+- Cargo.lock NOT staged.
+- Atomic commit + annotated tag.
+- No fixture rewrites — both
+  `path_traversal_positive.{js,ts}` continue to detect (the
+  positive shape is `fs.readFileSync`, completely orthogonal to
+  the dropped `.json` entries).
+
 ## js-test-file-suppression-v1 — internal milestone
 
 NOT a published release. Medium-severity hardening of `tldr vuln`
