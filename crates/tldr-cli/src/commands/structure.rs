@@ -35,6 +35,13 @@ impl StructureArgs {
     pub fn run(&self, format: OutputFormat, quiet: bool) -> Result<()> {
         let writer = OutputWriter::new(format, quiet);
 
+        // Validate path exists BEFORE language detection / progress banner
+        // (lang-detect-default-v1: avoid printing misleading "(Python)" banner
+        // when the path doesn't exist and from_directory silently returns None.)
+        if !self.path.exists() {
+            anyhow::bail!("Path not found: {}", self.path.display());
+        }
+
         // Determine language (auto-detect from directory, default to Python)
         let language = self
             .lang

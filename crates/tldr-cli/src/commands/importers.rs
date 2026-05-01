@@ -39,6 +39,12 @@ impl ImportersArgs {
     pub fn run(&self, format: OutputFormat, quiet: bool) -> Result<()> {
         let writer = OutputWriter::new(format, quiet);
 
+        // Validate path exists BEFORE daemon route / language detection / progress banner
+        // (lang-detect-default-v1)
+        if !self.path.exists() {
+            anyhow::bail!("Path not found: {}", self.path.display());
+        }
+
         // Try daemon first for cached result
         if let Some(mut result) = try_daemon_route::<ImportersReport>(
             &self.path,

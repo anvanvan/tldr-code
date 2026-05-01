@@ -1,5 +1,74 @@
 # Changelog
 
+## lang-detect-default-v1 — internal milestone
+
+NOT a published release. Low-severity UX/error-message correctness
+fix: the directory-rooted CLI subcommands printed a "(Python)"
+language banner BEFORE checking that the supplied path actually
+exists. The banner came from the lang-auto-detect call site
+
+```rust
+let language = self.lang
+    .unwrap_or_else(|| Language::from_directory(&self.path)
+                          .unwrap_or(Language::Python));
+```
+
+When `self.path` does not exist, `Language::from_directory` walks
+an empty tree and silently returns `None`, then `.unwrap_or(Python)`
+hands back `Language::Python` regardless. The progress writer then
+emitted a misleading prelude:
+
+```
+$ tldr structure /tmp/this/does/not/exist
+Extracting structure from /tmp/this/does/not/exist (Python)...
+Error: Path not found: /tmp/this/does/not/exist
+```
+
+The "(Python)" parenthetical falsely implied that the lang detector
+had run successfully and decided "Python" — eroding user trust on
+error messages.
+
+Fix shape (Option 1, narrow): validate the path BEFORE language
+detection or any progress banner in every directory-rooted
+subcommand that uses the `Language::from_directory(...)
+.unwrap_or(Language::Python)` pattern. The fix mirrors the
+reference pattern already in place for `tldr vuln` and
+`tldr health`:
+
+```rust
+if !self.path.exists() {
+    anyhow::bail!("Path not found: {}", self.path.display());
+}
+```
+
+Subcommands fixed (6): `structure`, `calls`, `dead`, `impact`,
+`importers`, `search`. Single-file subcommands (`imports`,
+`complexity`, `halstead`) already validate via
+`validate_file_path` / `is_file`/`is_dir` branches and were not
+affected.
+
+Lang-detect semantics in `Language::from_path` /
+`Language::from_directory` are intentionally left unchanged — the
+defaulting to `Python` is preserved for valid paths with no
+detectable manifest/extension majority. Only the missing-path
+case is corrected.
+
+Validation: 6 integration tests in
+`tldr-cli/tests/lang_detect_default_v1_test.rs` assert that for
+each fixed subcommand, no `(Python)` / `(TypeScript)` / etc.
+banner appears in stdout or stderr, and a `Path not found: <path>`
+error message IS present. `vuln_migration_v1_red` 168/168 stays
+GREEN. `language_autodetect_tests` 18/18 GREEN.
+`language_command_matrix` 234/234 GREEN.
+
+Binary verify (post-fix):
+```
+$ tldr structure /tmp/this/does/not/exist
+Error: Path not found: /tmp/this/does/not/exist
+```
+
+No banner. Clean error. Exit code 1.
+
 ## js-res-json-fp-narrowing-v1 — internal milestone
 
 NOT a published release. Medium-severity false-positive class fix in
