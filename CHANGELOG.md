@@ -1,5 +1,90 @@
 # Changelog
 
+## ruby-backtick-extraction-v1 — internal milestone
+
+NOT a published release. Closes 1 of the 6 remaining carry-forwards from
+vuln-source-parity-v1 M5 Bucket A — Ruby subset
+(`ruby_command_injection_positive`). Builds on
+`var-extract-nested-constructor-v1` (commit `b577796`).
+
+### Added
+
+- AST dispatch arm in `detect_sinks_ast`
+  (`crates/tldr-core/src/security/taint.rs`) for Ruby `subshell` nodes.
+  tree-sitter-ruby 0.23.1 collapses both backtick `` `cmd` `` and
+  `%x{cmd}` / `%x[cmd]` / `%x(cmd)` lexical forms onto the single
+  `subshell` named-node kind (children: `interpolation` /
+  `string_content` / `escape_sequence`). subshell is NOT call-shaped —
+  `extract_call_name_ruby` returns `None` and the existing
+  `for pattern in patterns.sinks` loop cannot match it. The new arm
+  treats any `subshell` descendant in Ruby code as a `ShellExec` sink;
+  var-extraction reuses
+  `extract_first_identifier_arg_ast` (extended in this milestone — see
+  Changed below) with a 3-fallback chain (extract_first_identifier_arg_ast
+  → extract_assignment_rhs_ident → extract_source_var_from_statement).
+  `TaintSink` is constructed with all 5 fields per the canonical site
+  at `taint.rs:4456-4462` (var, line, sink_type: ShellExec,
+  tainted: false, statement).
+- Two new fixture pairs covering the `%x{...}` shape:
+  `crates/tldr-cli/tests/fixtures/vuln_migration_v1/ruby/command_injection_percent_x_positive.rb`
+  (asserts ≥1 command_injection finding) and
+  `command_injection_percent_x_string_literal_fp.rb` (FP regression
+  guard — asserts zero findings on a `%x{cmd}` mention inside a
+  string literal). Locks both lexical forms into the test suite.
+
+### Changed
+
+- `extract_first_identifier_arg_ast`
+  (`crates/tldr-core/src/security/taint.rs`) gained a Ruby-specific
+  arm gated on `descendant.kind() == "subshell"`. The generic
+  args-list path requires either `child_by_field_name("arguments")`
+  OR a child whose kind contains `"argument"` or equals
+  `"call_suffix"` — `subshell` has NEITHER. Without the extension the
+  helper returns `None` and the new dispatch arm above would emit
+  zero sinks. Implementation is BFS-over-named-descendants seeking
+  the first non-self `identifier`'s text via `node_text` + 
+  `is_valid_identifier`; skips `string_node_kinds(language)` subtrees
+  defensively. Mirrors the PHP `echo_statement` BFS at
+  `taint.rs:3954-3982` stylistically (NOT the OCaml
+  `application_expression` flat 1-level scan).
+
+### Architectural note
+
+The dispatch arm is keyed on the tree-sitter-ruby `subshell` node-kind
+directly, NOT via `call_node_kinds(Ruby)` extension. This isolates the
+change to ShellExec sink detection and avoids polluting
+`call_node_kinds` / `extract_call_name_ruby` consumers (sources,
+sanitizers, `references.rs` is_call gate, `rr_baseline_per_language_test`).
+Predecessor pattern reference: `field_access_info-extension-v1`
+retained `\bgets\b` for the bare-call AST shape gap — same shape of
+carry-forward (raw-substring/AST node-kind mismatch), different
+localized resolution.
+
+### Retained
+
+- `call_node_kinds(Ruby)` unchanged (still `["call", "method_call"]`).
+- `extract_call_name_ruby` unchanged (still matches
+  `"call" | "method_call"`).
+- `RUBY_AST_SINKS` unchanged (no new `AstSinkPattern` entry — the
+  dispatch arm IS the entire matcher for subshell shapes; an entry
+  would be silently dead).
+- Public API unchanged.
+
+### Closes carry-forwards
+
+- vuln-source-parity-v1 M5 Bucket A Ruby subset:
+  `ruby_command_injection_positive` — `\`#{cmd}\`` with
+  `cmd = params[:cmd]` source. RED → GREEN.
+  `vuln_migration_v1_red` count: 160/166 → 163/168 (closes 1
+  carry-forward; +2 NEW tests, both GREEN).
+
+### Deferred
+
+- 5 remaining carry-forwards: 4 Rust (deserialization, command
+  injection, path traversal, SSRF) and 1 Cpp (deserialization,
+  deferred to `cpp-deser-declaration-v1` per
+  `var-extract-nested-constructor-v1` premortem A1).
+
 ## var-extract-nested-constructor-v1 — internal milestone
 
 NOT a published release. Closes 2 of the 3 carry-forwards from
