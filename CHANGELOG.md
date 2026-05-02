@@ -1,5 +1,79 @@
 # Changelog
 
+## definition-workspace-cross-file-v1 — internal milestone
+
+NOT a published release. Extends `tldr definition` to resolve symbols
+across files automatically, without requiring the caller to pass an
+explicit `--project <root>` flag.
+
+### Repro pre-fix
+
+```text
+# Workspace: pkg/util.py defines `helper`; app.py does
+#   from pkg.util import helper
+#   def main(): helper()
+# Cursor on the `helper()` USAGE at app.py:4:4
+$ tldr definition /tmp/wsx_test/app.py 4 4
+{ "symbol": { "name": "helper", "kind": "module",
+  "location": { "file": ".../app.py", "line": 1 } } }
+# ↑ falls through to the import line (kind=module) — never crosses files.
+```
+
+The pre-fix behaviour was: cross-file resolution only ran when the user
+remembered to pass `--project <root>`. Without it, every imported usage
+fell through to Pass 3 (`resolve_import_scope`) and surfaced the import
+line as a `kind=module` result.
+
+### Fix
+
+Auto-detect the project root by walking up ancestors of the source
+file looking for repository / package markers (`.git`, `Cargo.toml`,
+`pyproject.toml`, `setup.py`, `package.json`, `go.mod`, `pom.xml`,
+`build.gradle`, `build.gradle.kts`, `composer.json`, `Gemfile`,
+`mix.exs`). The first ancestor containing any marker becomes the
+implicit `--project` value.
+
+A new `--workspace` flag (default `true`) controls auto-detection.
+Pass `--workspace=false` to opt out and keep the legacy file-only
+behaviour. An explicit `--project <root>` always takes precedence over
+auto-detection.
+
+The cross-file resolver itself was already wired up for all 18
+languages — Python uses an import-tracing walker
+(`resolve_cross_file_python`) and the other 17 use a project-wide walk
+(`resolve_cross_file_walk`). Both were dormant without a workspace
+root; auto-detection unlocks them.
+
+### Validation
+
+* Repro post-fix: cursor on `helper()` usage now resolves to
+  `pkg/util.py:1` (`kind=function`) without `--project`.
+* Real repo (flask): cursor on `current_app` at `flask/cli.py:396:15`
+  resolves to `flask/globals.py:44` (the actual definition), not the
+  import line.
+* New integration test file
+  `crates/tldr-cli/tests/definition_workspace_cross_file_v1.rs` —
+  6 tests covering Python, TypeScript, Rust, Java, plus a backward-compat
+  test for `--workspace=false` and a deeper-nested-root test.
+* `vuln_migration_v1_red` 168/168 GREEN.
+* M-B3 `definition-name-resolution-v1` and M-Z2
+  `definition-additional-langs-v1` regression suites
+  (`exhaustive_matrix::test_definition_on_*` 18/18 plus
+  `remaining_test::definition_command::*` 11/11) all pass.
+
+### Carry-forward
+
+* For projects without any marker file (and no `--project`),
+  resolution still falls back to in-file scope. Document `--project`
+  as the explicit override.
+* Third-party packages that live outside the workspace (e.g. `click`
+  imported into flask) still resolve to the import line — by design;
+  external dependency resolution requires venv/site-packages
+  introspection, deferred.
+* `resolve_cross_file_walk` is a brute-force project walk for
+  non-Python languages. For very large monorepos a daemon-backed
+  ModuleIndex would be more efficient — carry-forward.
+
 ## definition-additional-langs-v1 — internal milestone
 
 NOT a published release. Extends the M-B3 (`definition-name-resolution-v1`)

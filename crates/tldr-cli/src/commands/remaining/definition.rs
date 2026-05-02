@@ -187,6 +187,20 @@ pub struct DefinitionArgs {
     #[arg(long)]
     pub project: Option<PathBuf>,
 
+    /// Enable workspace-wide cross-file resolution.
+    ///
+    /// When enabled (default), if `--project` is not provided the project
+    /// root is auto-detected from the source file by walking up looking for
+    /// repository / package markers (`.git`, `Cargo.toml`, `pyproject.toml`,
+    /// `package.json`, `go.mod`, `pom.xml`, `build.gradle`). Set to `false`
+    /// (`--workspace=false`) to disable auto-detection and keep resolution
+    /// strictly within the source file unless an explicit `--project` is
+    /// provided.
+    ///
+    /// `definition-workspace-cross-file-v1`.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub workspace: bool,
+
     /// Output file (optional, stdout if not specified)
     #[arg(long, short = 'O')]
     pub output: Option<PathBuf>,
@@ -221,7 +235,18 @@ impl DefinitionArgs {
                 file.display()
             ));
 
-            find_definition_by_name(symbol_name, file, self.project.as_deref(), &lang_hint)?
+            // Workspace cross-file resolution (definition-workspace-cross-file-v1):
+            // when no explicit --project is supplied AND --workspace is on
+            // (the default), auto-detect the project root by walking up
+            // ancestors looking for repository / package markers.
+            let auto_project: Option<PathBuf> = if self.project.is_none() && self.workspace {
+                find_workspace_root(file)
+            } else {
+                None
+            };
+            let effective_project = self.project.as_deref().or(auto_project.as_deref());
+
+            find_definition_by_name(symbol_name, file, effective_project, &lang_hint)?
         } else {
             // Position-based mode
             let file = self
@@ -242,11 +267,20 @@ impl DefinitionArgs {
                 column
             ));
 
+            // Workspace cross-file resolution (definition-workspace-cross-file-v1):
+            // auto-detect project root if not explicitly provided.
+            let auto_project: Option<PathBuf> = if self.project.is_none() && self.workspace {
+                find_workspace_root(file)
+            } else {
+                None
+            };
+            let effective_project = self.project.as_deref().or(auto_project.as_deref());
+
             match find_definition_by_position(
                 file,
                 line,
                 column,
-                self.project.as_deref(),
+                effective_project,
                 &lang_hint,
             ) {
                 Ok(result) => result,
@@ -3397,6 +3431,53 @@ fn resolve_cross_file_walk(
     }
 
     Ok(None)
+}
+
+/// Walk up ancestors of `file` looking for the closest directory that
+/// contains a repository or package marker. Used by the
+/// `definition-workspace-cross-file-v1` workspace flag to auto-detect a
+/// project root when `--project` is not explicitly supplied.
+///
+/// Markers (in priority order): `.git`, `Cargo.toml`, `pyproject.toml`,
+/// `package.json`, `go.mod`, `pom.xml`, `build.gradle`,
+/// `build.gradle.kts`, `composer.json`. The first ancestor that
+/// contains any of these wins.
+///
+/// Returns `None` if no marker is found before reaching the filesystem
+/// root, in which case the caller falls back to in-file resolution.
+pub(crate) fn find_workspace_root(file: &Path) -> Option<PathBuf> {
+    const MARKERS: &[&str] = &[
+        ".git",
+        "Cargo.toml",
+        "pyproject.toml",
+        "setup.py",
+        "package.json",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "composer.json",
+        "Gemfile",
+        "mix.exs",
+    ];
+
+    // Start from the file's directory (or the file itself if it's a dir).
+    let start = if file.is_dir() {
+        file.to_path_buf()
+    } else {
+        file.parent()?.to_path_buf()
+    };
+
+    let mut current: Option<&Path> = Some(start.as_path());
+    while let Some(dir) = current {
+        for marker in MARKERS {
+            if dir.join(marker).exists() {
+                return Some(dir.to_path_buf());
+            }
+        }
+        current = dir.parent();
+    }
+    None
 }
 
 /// Skip well-known non-source directories during the project walk.
