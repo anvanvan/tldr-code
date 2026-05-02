@@ -1,5 +1,83 @@
 # Changelog
 
+## references-clap-conflict-v1 — internal milestone
+
+NOT a published release. Fixes a CRITICAL unhandled Rust panic in the
+`tldr references` subcommand whenever `--lang` (or `-l`) was supplied.
+
+### Bug fixed
+
+- **CRITICAL — `tldr references SYMBOL PATH --lang LANG` panicked at
+  exit code 101 with:**
+  ```
+  thread 'main' panicked at clap_builder/src/parser/error.rs:32:9:
+  Mismatch between definition and access of `lang`. Could not downcast
+  to TypeId(...), need to downcast to TypeId(...).
+  ```
+  Reproduced on every one of the 17 supported languages. The command
+  worked without `-l/--lang`, but any user who tried to pin the language
+  hit the panic. Also reproduced when the global flag came before the
+  subcommand (`tldr -l rust references ...`) since the global flag is
+  declared with `global = true`.
+
+### Root cause
+
+`crates/tldr-cli/src/main.rs` declares the global `--lang/-l` argument
+as `Option<Language>` (typed enum). `crates/tldr-cli/src/commands/references.rs`
+re-declared its own local `--lang/-l` field as `Option<String>`. clap
+4.5 detects the type mismatch at runtime when the same argument id is
+accessed with two different `TypeId`s and panics with a downcast error.
+
+This was the **only** subcommand with a type mismatch — every other
+subcommand that exposes a local `--lang/-l` (calls, dead, structure,
+smells, loc, search, deps, diagnostics, hubs, extract, inheritance,
+halstead, imports, impact, importers, reaching_defs, slice, taint,
+whatbreaks, change_impact, complexity, available, context, cognitive,
+detect_patterns) declares it as `Option<Language>`, matching the global.
+
+### Fix
+
+`crates/tldr-cli/src/commands/references.rs`:
+- Removed the local `lang: Option<String>` field from `ReferencesArgs`.
+- Updated `ReferencesArgs::run` to accept `cli_lang: Option<Language>`
+  (passed from the global flag).
+- Convert the `Language` enum to the canonical lowercase string via
+  `Language::as_str()` for `ReferencesOptions::language` (which
+  remains `Option<String>` in `tldr-core`).
+
+`crates/tldr-cli/src/main.rs`:
+- Updated the `Command::References` dispatch to forward `cli.lang`
+  through to `args.run`.
+
+### Tests added
+
+`crates/tldr-cli/tests/cli_remaining_tests.rs`:
+- `test_references_with_lang_no_panic` — `tldr references helper PATH
+  --lang python -q` exits non-101 and stderr contains no clap downcast
+  text.
+- `test_references_with_short_lang_flag_no_panic` — same with `-l python`.
+- `test_no_other_subcommand_panics_on_lang` — sanity matrix that
+  `calls`, `dead`, `structure`, `smells`, `loc`, `search` with `-l python`
+  all exit non-101.
+
+### Validation
+
+- All 17 languages × `tldr references SomeName /tmp/repos/<repo> --lang $LANG`:
+  exit 0 for every language (was panic 101 on every language pre-fix).
+- `cargo test -p tldr-cli --lib`: 1392/1392 pass.
+- `cargo test -p tldr-cli --test cli_remaining_tests`: 80/80 pass
+  (was 77 before; +3 regression tests added).
+- `cargo test -p tldr-cli --test vuln_migration_v1_red`: 168/168 stays GREEN.
+
+### Carry-forwards
+
+None. This was a localized type-mismatch bug specific to `references`.
+The fix verified that no other subcommand has the same issue (audit
+in the "Root cause" section). The new
+`test_no_other_subcommand_panics_on_lang` test guards against future
+regressions if a contributor re-introduces a per-subcommand `lang` with
+a non-matching type.
+
 ## structure-method-infos-all-langs-v1 — internal milestone
 
 NOT a published release. Closes the medium-severity follow-up gap left

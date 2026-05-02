@@ -27,6 +27,7 @@ use clap::Args;
 use tldr_core::analysis::references::{
     find_references, ReferenceKind, ReferencesOptions, ReferencesReport, SearchScope,
 };
+use tldr_core::Language;
 
 use crate::output::{common_path_prefix, strip_prefix_display, OutputFormat, OutputWriter};
 
@@ -63,10 +64,6 @@ pub struct ReferencesArgs {
     #[arg(long = "output", short = 'o', hide = true)]
     pub output: Option<String>,
 
-    /// Language filter: python, typescript, go, rust
-    #[arg(long, short = 'l')]
-    pub lang: Option<String>,
-
     /// Include definition location in results
     #[arg(long)]
     pub include_definition: bool,
@@ -94,7 +91,12 @@ pub struct ReferencesArgs {
 
 impl ReferencesArgs {
     /// Run the references command
-    pub fn run(&self, cli_format: OutputFormat, quiet: bool) -> Result<()> {
+    pub fn run(
+        &self,
+        cli_format: OutputFormat,
+        quiet: bool,
+        cli_lang: Option<Language>,
+    ) -> Result<()> {
         // Validate path exists
         if !self.path.exists() {
             // S7-R56: Path not found error - include tried path in message
@@ -125,7 +127,7 @@ impl ReferencesArgs {
             include_definition: self.include_definition,
             kinds,
             scope,
-            language: self.lang.clone(),
+            language: cli_lang.map(|l| l.as_str().to_string()),
             limit: Some(self.limit),
             definition_file: None,
             context_lines: self.context_lines,

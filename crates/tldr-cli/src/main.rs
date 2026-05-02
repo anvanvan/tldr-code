@@ -493,7 +493,7 @@ fn run_command(cli: &Cli) -> Result<()> {
         Command::Diagnostics(args) => args.run(cli.format, cli.quiet),
         // Doctor respects --format like all other commands
         Command::Doctor(args) => args.run(cli.format, cli.quiet),
-        Command::References(args) => args.run(cli.format, cli.quiet),
+        Command::References(args) => args.run(cli.format, cli.quiet, cli.lang),
         Command::Clones(args) => args.run(cli.format, cli.quiet),
         Command::Dice(args) => args.run(cli.format, cli.quiet),
         // Session 15: Metrics commands

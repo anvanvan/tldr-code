@@ -1238,6 +1238,117 @@ fn test_references_limit() {
     );
 }
 
+/// Regression test for `references-clap-conflict-v1`.
+///
+/// Before the fix, the references subcommand defined its own `--lang/-l`
+/// argument with type `Option<String>` while the global `--lang/-l` is
+/// `Option<Language>`. clap detected the type mismatch at runtime and
+/// panicked with exit code 101 ("Mismatch between definition and access of
+/// `lang`"). This test ensures that `tldr references ... --lang rust` exits
+/// cleanly (not 101) — i.e. that no clap downcast panic occurs.
+#[test]
+fn test_references_with_lang_no_panic() {
+    let temp_dir = create_test_project();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
+        .args([
+            "references",
+            "helper",
+            temp_dir.path().to_str().unwrap(),
+            "--lang",
+            "python",
+            "-q",
+        ])
+        .output()
+        .expect("Failed to execute tldr references --lang");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let code = output.status.code().unwrap_or(-1);
+    assert_ne!(
+        code, 101,
+        "references --lang must not panic (exit 101). stderr: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("Mismatch between definition and access of"),
+        "references --lang must not produce clap downcast panic. stderr: {}",
+        stderr
+    );
+}
+
+/// Regression test: short flag form `-l rust` must also not panic.
+#[test]
+fn test_references_with_short_lang_flag_no_panic() {
+    let temp_dir = create_test_project();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
+        .args([
+            "references",
+            "helper",
+            temp_dir.path().to_str().unwrap(),
+            "-l",
+            "python",
+            "-q",
+        ])
+        .output()
+        .expect("Failed to execute tldr references -l");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let code = output.status.code().unwrap_or(-1);
+    assert_ne!(
+        code, 101,
+        "references -l must not panic (exit 101). stderr: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("Mismatch between definition and access of"),
+        "references -l must not produce clap downcast panic. stderr: {}",
+        stderr
+    );
+}
+
+/// Sanity check: ensure that several other subcommands also accept `-l rust`
+/// without panicking (101). This guards against future regressions where a
+/// subcommand redefines `--lang` with a different type than the global.
+#[test]
+fn test_no_other_subcommand_panics_on_lang() {
+    let temp_dir = create_test_project();
+    let path = temp_dir.path().to_str().unwrap();
+
+    // Subcommands that take a directory and accept --lang.
+    let cases: &[&[&str]] = &[
+        &["calls", path],
+        &["dead", path],
+        &["structure", path],
+        &["smells", path],
+        &["loc", path],
+        &["search", "helper", path],
+    ];
+
+    for args in cases {
+        let mut full_args: Vec<&str> = args.to_vec();
+        full_args.push("-l");
+        full_args.push("python");
+        full_args.push("-q");
+
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
+            .args(&full_args)
+            .output()
+            .unwrap_or_else(|_| panic!("Failed to execute tldr {:?}", full_args));
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code().unwrap_or(-1);
+        assert_ne!(
+            code, 101,
+            "tldr {:?} must not panic with exit 101. stderr: {}",
+            full_args, stderr
+        );
+        assert!(
+            !stderr.contains("Mismatch between definition and access of"),
+            "tldr {:?} must not produce clap downcast panic. stderr: {}",
+            full_args, stderr
+        );
+    }
+}
+
 #[test]
 fn test_references_help() {
     let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
