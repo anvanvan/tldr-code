@@ -27,6 +27,7 @@ use crate::walker::walk_project;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::ast::count::count_functions_canonical;
 use crate::ast::extract::extract_file;
 use crate::error::TldrError;
 use crate::metrics::calculate_all_complexities_file;
@@ -273,8 +274,23 @@ pub fn analyze_complexity(
 
     let hotspot_count = all_functions.iter().filter(|f| f.is_hotspot).count();
 
+    // canonical-function-enumerator-v1: report the canonical function count
+    // as `functions_analyzed` so health/structure/dead all agree. The
+    // per-function complexity rows (`functions`/`hotspots`) intentionally
+    // remain the metrics-derived subset (functions for which cyclomatic
+    // metrics could be computed); only the headline count is canonicalized.
+    let canonical_lang = language.unwrap_or_else(|| {
+        Language::from_directory(path).unwrap_or(Language::Python)
+    });
+    let canonical_count = count_functions_canonical(path, canonical_lang) as usize;
+    let report_functions_analyzed = if canonical_count > 0 {
+        canonical_count
+    } else {
+        total_functions
+    };
+
     let summary = ComplexitySummary {
-        total_functions,
+        total_functions: report_functions_analyzed,
         avg_cyclomatic,
         max_cyclomatic,
         hotspot_count,
@@ -282,7 +298,7 @@ pub fn analyze_complexity(
     };
 
     Ok(ComplexityReport {
-        functions_analyzed: total_functions,
+        functions_analyzed: report_functions_analyzed,
         avg_cyclomatic,
         max_cyclomatic,
         hotspot_count,
@@ -783,11 +799,20 @@ class MyClass:
 
         let report = analyze_complexity(dir.path(), Some(Language::Python), None).unwrap();
 
-        // Should only find 'process', not __init__ or __repr__
+        // canonical-function-enumerator-v1: `functions_analyzed` is the
+        // canonical count (all 3 methods, including __init__ and __repr__),
+        // while the per-function rows still skip dunders for hotspot
+        // analysis. Only `process` should appear in report.functions.
         assert_eq!(
-            report.functions_analyzed, 1,
-            "Expected 1 function (process only), got {}",
+            report.functions_analyzed, 3,
+            "Expected canonical count of 3 (incl. dunders), got {}",
             report.functions_analyzed
+        );
+        assert_eq!(
+            report.functions.len(),
+            1,
+            "Expected 1 hotspot-analysis row (process only), got {}",
+            report.functions.len()
         );
         assert_eq!(report.functions[0].name, "MyClass.process");
     }

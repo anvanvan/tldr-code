@@ -1,5 +1,130 @@
 # Changelog
 
+## canonical-function-enumerator-v1 — internal milestone
+
+NOT a published release. Closes deferred BUG-01: `health`, `structure`,
+and `dead` reported three different function totals on the same input.
+
+### Bug fixed
+
+- **BUG-01 — function counts disagreed across commands.** Example on
+  `/tmp/repos/flask`:
+  - `tldr health` → `summary.functions_analyzed = 854`
+    (complexity hotspot subset, dunders excluded, only functions with
+    a metrics-map hit counted)
+  - `tldr structure` → sum(`functions`) + sum(`methods`) = 857
+    (separate AST walk in `extractor.rs`, missing some assigned
+    function-expressions)
+  - `tldr dead` → `total_functions = 918`
+    (full `extract_file`-based enumeration via `collect_all_functions`)
+  Three different numbers on the same input.
+
+### Fix
+
+Introduce a single canonical enumerator and route the three wrappers
+through it.
+
+- New: `tldr_core::ast::count_functions_canonical(path, language) -> u32`
+  and `count_functions_canonical_from_modules(&module_infos) -> u32`
+  in `crates/tldr-core/src/ast/count.rs`. The canonical enumerator
+  walks files via `extract_file` and sums
+  `info.functions.len() + Σ class.methods.len()`.
+- `health` (via `quality::complexity::analyze_complexity`):
+  `functions_analyzed` is now sourced from the canonical enumerator.
+  Per-function complexity rows (`functions`, `hotspots`) keep their
+  metrics-derived subset semantics — only the headline count is
+  canonicalized.
+- `structure` (via `ast::extractor::extract_file_structure`): the
+  `functions` and `methods` arrays are now derived from
+  `extract_from_tree`'s `ModuleInfo`, so
+  `sum(files[].functions) + sum(files[].methods)` agrees with the
+  canonical count. `classes` (string list) and `definitions` are
+  unchanged.
+- `dead` (via `quality::dead_code::analyze_dead_code`): already used
+  the canonical enumeration through `collect_all_functions` — no
+  change needed; the new shared utility documents and codifies that
+  policy.
+
+### Inclusion policy (canonical)
+
+A "function" for canonical-count purposes is anything that
+`extract_file` surfaces in `ModuleInfo.functions` (top-level) or
+`ClassInfo.methods` (class members). This includes:
+
+- All top-level `def` / `function` / `fn` / `func` declarations.
+- All class methods (including dunder methods like `__init__`,
+  `__repr__`).
+- All assigned function-expression / arrow-function values from
+  `js-extract-function-expressions-v1` (`const f = () => {}`,
+  `const f = function() {}`).
+
+It does NOT include:
+
+- Anonymous lambdas / inline arrow callbacks not bound to a name.
+- Computed-property method names that the AST extractor cannot
+  resolve to a stable string identifier.
+- Decorated stubs without a body.
+
+### Out of scope: `verify`
+
+`tldr verify` reports `coverage.total_functions` and is intentionally
+NOT unified with the canonical count. That field is a *different*
+metric — the count of functions whose contracts (pre/postconditions)
+are extractable. It will routinely be smaller than the canonical
+function count and that is correct: it measures contract coverage,
+not raw function enumeration. Users comparing `verify`'s number to
+`health`/`structure`/`dead` are comparing apples to oranges.
+
+### Validation (binary verify, post-install)
+
+| Repo | health | structure (Σ funcs+methods) | dead | agree? |
+|------|-------:|----------------------------:|-----:|:------:|
+| flask         | 918  | 918  | 918  | ✓ |
+| ripgrep       | 2739 | 2739 | 2739 | ✓ |
+| express       | 283  | 283  | 283  | ✓ |
+| c-sds         | 51   | 51   | 51   | ✓ |
+| elixir-plug   | 1788 | 1788 | 1788 | ✓ |
+
+### Tests
+
+- New: `crates/tldr-core/tests/canonical_function_count_v1.rs` with
+  `test_canonical_count_agrees_health_structure_dead_python`,
+  `_rust`, `_javascript` — each constructs a small fixture and
+  asserts all four producers (canonical, health/complexity,
+  structure, dead) return identical counts.
+- Updated: `quality::complexity::tests::test_complexity_skips_dunder_methods`
+  now asserts the new (correct) semantics: `functions_analyzed`
+  reports the canonical count of 3 (incl. `__init__`/`__repr__`),
+  while `report.functions` (per-function rows) still skips dunders
+  for hotspot analysis. The original assertion was conflating the
+  two — now disambiguated.
+- All 4677 `tldr-core` lib tests pass.
+- `vuln_migration_v1_red`: 168/168 GREEN.
+
+### Files modified
+
+- `crates/tldr-core/src/ast/mod.rs` (export the new module)
+- `crates/tldr-core/src/ast/count.rs` (new)
+- `crates/tldr-core/src/ast/extractor.rs` (route structure through
+  `extract_from_tree`)
+- `crates/tldr-core/src/quality/complexity.rs` (canonical
+  `functions_analyzed`)
+- `crates/tldr-core/tests/canonical_function_count_v1.rs` (new)
+- `CHANGELOG.md` (this entry, top)
+
+### Honest carry-forwards
+
+- The `health` / `complexity` per-function rows still skip dunder
+  methods for hotspot analysis. This is intentional and documented
+  — only the headline count is canonical; the analysis subset is
+  retained for usability.
+- 54 pre-existing `test_embed_*` / `test_semantic_*` /
+  `test_similar_*` failures in `crates/tldr-cli/tests/exhaustive_matrix.rs`
+  are unrelated (build does not include the optional `embedding` /
+  `semantic` subcommands; the matrix invokes `tldr semantic …`
+  which the CLI rejects with "unrecognized subcommand"). My change
+  touches no semantic / embedding code paths.
+
 ## vuln-fastpath-substring-prefilter-v1 — internal milestone
 
 NOT a published release. Closes deferred BUG-26 (perf): `tldr vuln`

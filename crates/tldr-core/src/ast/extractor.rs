@@ -100,9 +100,26 @@ fn extract_file_structure(
 
     let relative_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
 
-    let functions = extract_functions(&tree, &source, language);
+    // canonical-function-enumerator-v1: derive `functions` and `methods` from
+    // the canonical `extract_file` enumerator so that
+    // `sum(files[].functions) + sum(files[].methods)` agrees with
+    // `health.summary.functions_analyzed` and `dead.total_functions` on the
+    // same input. Class names still come from the legacy AST walk because
+    // structure historically emits them as bare strings.
+    let module_info =
+        super::extract::extract_from_tree(&tree, &source, language, path, Some(root))?;
+    let functions: Vec<String> = module_info
+        .functions
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    let methods: Vec<String> = module_info
+        .classes
+        .iter()
+        .flat_map(|c| c.methods.iter().map(|m| m.name.clone()))
+        .collect();
+
     let classes = extract_classes(&tree, &source, language);
-    let methods = extract_methods(&tree, &source, language);
     let imports = extract_imports_from_tree(&tree, &source, language)?;
     let definitions = extract_definitions(&tree, &source, language);
 
