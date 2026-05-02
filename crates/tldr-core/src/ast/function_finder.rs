@@ -30,8 +30,75 @@ fn find_function_in_node<'a>(node: Node<'a>, max_depth: usize) -> Option<Node<'a
     None
 }
 
-/// Find a function node by name in the AST
+/// Find a function node by name in the AST.
+///
+/// Accepts either a bare function name (`run`) or a qualified
+/// `Class.method` form (`Flask.run`). When a qualified name is supplied:
+///
+/// 1. The class is located first via [`find_class_node`].
+/// 2. The method is searched within the class body.
+/// 3. If the class is not found, the search falls back to the bare
+///    method name (the segment after the final `.`). This preserves
+///    backward compatibility when the user passes a dotted name that
+///    does not actually correspond to a class scope (for example, the
+///    Lua/Luau dot-indexed pattern `M.request` is handled directly by
+///    the bare-name branch via the existing `dot_index_expression`
+///    matching below).
+///
+/// For overloaded methods (rare in Python but common in Java, C++,
+/// Kotlin, and Scala), the FIRST match wins. To disambiguate, callers
+/// should resolve ambiguity by line range or signature at a higher
+/// level — this function does not attempt overload resolution.
 pub fn find_function_node<'a>(
+    root: Node<'a>,
+    function_name: &str,
+    language: Language,
+    source: &str,
+) -> Option<Node<'a>> {
+    // Qualified `Class.method` lookup — try class-scoped resolution first.
+    // We deliberately skip this for Lua/Luau because their dot-indexed
+    // function form (`function Kong.init() ... end`) is matched directly
+    // by the bare-name branch below using `dot_index_expression`, and
+    // there is no class node to descend into.
+    if function_name.contains('.') && !matches!(language, Language::Lua | Language::Luau) {
+        let parts: Vec<&str> = function_name.split('.').collect();
+        // Multi-component: at least one class segment + final method name.
+        // Take the FIRST segment as the class to scope into; the LAST
+        // segment is the method name to look up inside the class body.
+        // This handles both `Class.method` and deeper nestings like
+        // `Outer.Inner.method` (we descend into the leftmost class and
+        // recursively re-resolve `Inner.method` inside it).
+        if parts.len() >= 2 {
+            let class_name = parts[0];
+            let remainder = parts[1..].join(".");
+            if let Some(class_node) = find_class_node(root, class_name, language, source) {
+                // Search inside the class body (or the class node itself if
+                // the body field isn't present for this language).
+                let scope = class_node
+                    .child_by_field_name("body")
+                    .unwrap_or(class_node);
+                if let Some(found) =
+                    find_function_node_in_subtree(scope, &remainder, language, source)
+                {
+                    return Some(found);
+                }
+            }
+            // Fallback: class not found, or method not found inside class —
+            // try resolving the LAST component as a bare name. This is the
+            // documented graceful degradation behavior.
+            let last = *parts.last().unwrap();
+            return find_function_node_in_subtree(root, last, language, source);
+        }
+    }
+
+    find_function_node_in_subtree(root, function_name, language, source)
+}
+
+/// Internal: original bare-name function lookup. Splitting this out lets
+/// `find_function_node` first try `Class.method` resolution and then
+/// delegate the per-name search either to the full AST (bare-name) or
+/// to a class body subtree (qualified).
+fn find_function_node_in_subtree<'a>(
     root: Node<'a>,
     function_name: &str,
     language: Language,
@@ -256,6 +323,138 @@ pub fn get_function_node_kinds(language: Language) -> &'static [&'static str] {
         Language::Swift => &["function_declaration", "init_declaration"],
         Language::Ocaml => &["let_binding", "value_definition"],
     }
+}
+
+/// Get the node kinds that represent classes/structs/objects/traits in
+/// each language. Used by [`find_class_node`] to scope qualified
+/// `Class.method` lookups.
+///
+/// The selection is intentionally broad: anything that can act as a
+/// container of methods is included (classes, structs with methods,
+/// interfaces, traits, impls, enums with methods, objects, modules with
+/// member functions). Languages where there is no dedicated class node
+/// (C, OCaml, Elixir, Lua/Luau) return an empty slice — qualified
+/// lookups for those languages will fall back to the bare-name search.
+pub fn get_class_node_kinds(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Python => &["class_definition"],
+        Language::TypeScript | Language::JavaScript => {
+            &["class_declaration", "class", "interface_declaration"]
+        }
+        Language::Go => &["type_declaration"],
+        Language::Rust => &[
+            "struct_item",
+            "enum_item",
+            "trait_item",
+            "impl_item",
+            "union_item",
+        ],
+        Language::Java => &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "record_declaration",
+        ],
+        Language::Cpp => &[
+            "class_specifier",
+            "struct_specifier",
+            "union_specifier",
+        ],
+        Language::C => &[],
+        Language::Ruby => &["class", "module"],
+        Language::Php => &[
+            "class_declaration",
+            "interface_declaration",
+            "trait_declaration",
+            "enum_declaration",
+        ],
+        Language::CSharp => &[
+            "class_declaration",
+            "struct_declaration",
+            "interface_declaration",
+            "record_declaration",
+            "enum_declaration",
+        ],
+        Language::Kotlin => &["class_declaration", "object_declaration"],
+        Language::Scala => &[
+            "class_definition",
+            "object_definition",
+            "trait_definition",
+        ],
+        // No class container in these languages (Elixir uses defmodule but
+        // the resolver here doesn't model it; Lua/Luau dotted names are
+        // handled directly in the bare-name branch).
+        Language::Elixir | Language::Lua | Language::Luau | Language::Ocaml => &[],
+        Language::Swift => &[
+            "class_declaration",
+            "protocol_declaration",
+            "extension_declaration",
+        ],
+    }
+}
+
+/// Find a class/struct/trait node by name in the AST.
+///
+/// Walks the tree depth-first and returns the FIRST node whose kind is
+/// in [`get_class_node_kinds`] and whose name matches `class_name`. If
+/// the language has no class node kinds (e.g. C, Lua), returns `None`
+/// immediately.
+pub fn find_class_node<'a>(
+    root: Node<'a>,
+    class_name: &str,
+    language: Language,
+    source: &str,
+) -> Option<Node<'a>> {
+    let class_kinds = get_class_node_kinds(language);
+    if class_kinds.is_empty() {
+        return None;
+    }
+
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if class_kinds.contains(&node.kind()) {
+            // Try the standard "name" field (Python, TS/JS, Java, Kotlin,
+            // Scala, Swift, Ruby, PHP, C#).
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source.as_bytes()).unwrap_or("");
+                if name == class_name {
+                    return Some(node);
+                }
+            } else {
+                // Fallback: scan named children for an identifier-shaped
+                // name node (covers grammars where the name isn't
+                // exposed as a field, e.g. Rust struct/enum/trait/impl
+                // and C++ class/struct specifiers).
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if matches!(
+                        child.kind(),
+                        "identifier"
+                            | "type_identifier"
+                            | "constant"
+                            | "scoped_type_identifier"
+                    ) {
+                        let name = child.utf8_text(source.as_bytes()).unwrap_or("");
+                        // For Rust impl_item the type_identifier IS the
+                        // class-equivalent name. For scoped names, only
+                        // exact match counts.
+                        if name == class_name {
+                            return Some(node);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+
+    None
 }
 
 /// Recursively extract the function name from a C/C++ declarator chain.
@@ -1230,5 +1429,286 @@ void process(int x) {
                 kind
             );
         }
+    }
+
+    // =========================================================================
+    // Class.method qualified-name lookup tests (complexity-class-method-qualified-v1)
+    // =========================================================================
+
+    #[test]
+    fn test_qualified_class_method_python() {
+        // Python: Flask.run-style qualified lookup must find the method
+        // INSIDE the class (not the bare-name fallback).
+        let source = r#"
+class Flask:
+    def run(self):
+        x = 1
+        return x
+
+def run():
+    pass
+"#;
+        let tree = parse(source, Language::Python).unwrap();
+        let root = tree.root_node();
+        let node = find_function_node(root, "Flask.run", Language::Python, source);
+        assert!(node.is_some(), "Should resolve Flask.run to class method");
+        let node = node.unwrap();
+        // The matched node should be inside the class body — its parent
+        // chain must include a class_definition with name "Flask".
+        let mut p = node.parent();
+        let mut found_class = false;
+        while let Some(parent) = p {
+            if parent.kind() == "class_definition" {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    if name_node.utf8_text(source.as_bytes()).unwrap_or("") == "Flask" {
+                        found_class = true;
+                        break;
+                    }
+                }
+            }
+            p = parent.parent();
+        }
+        assert!(
+            found_class,
+            "Resolved method must be lexically inside class Flask (not the bare top-level run)"
+        );
+    }
+
+    #[test]
+    fn test_complexity_unqualified_still_works() {
+        // Regression: bare-name lookup must continue to work.
+        let source = r#"
+class Flask:
+    def run(self):
+        if True:
+            pass
+"#;
+        let tree = parse(source, Language::Python).unwrap();
+        let root = tree.root_node();
+        let node = find_function_node(root, "run", Language::Python, source);
+        assert!(node.is_some(), "Bare-name 'run' must still resolve");
+    }
+
+    #[test]
+    fn test_qualified_class_not_found_falls_back_to_method() {
+        // When the class part doesn't exist, we should fall back to the
+        // last component as a bare name.
+        let source = r#"
+def standalone():
+    return 42
+"#;
+        let tree = parse(source, Language::Python).unwrap();
+        let root = tree.root_node();
+        let node = find_function_node(
+            root,
+            "NonexistentClass.standalone",
+            Language::Python,
+            source,
+        );
+        assert!(
+            node.is_some(),
+            "Should fall back to bare 'standalone' when class doesn't exist"
+        );
+    }
+
+    #[test]
+    fn test_qualified_class_method_typescript() {
+        let source = r#"
+class Server {
+    start(): void {
+        const port = 8080;
+    }
+}
+
+class Logger {
+    start(): void {}
+}
+"#;
+        let tree = parse(source, Language::TypeScript).unwrap();
+        let root = tree.root_node();
+        let node = find_function_node(root, "Server.start", Language::TypeScript, source);
+        assert!(node.is_some(), "Should resolve Server.start in TS");
+        // Verify lexical scope: parent class should be Server.
+        let node = node.unwrap();
+        let mut p = node.parent();
+        let mut found = false;
+        while let Some(parent) = p {
+            if parent.kind() == "class_declaration" {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    if name_node.utf8_text(source.as_bytes()).unwrap_or("") == "Server" {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            p = parent.parent();
+        }
+        assert!(found, "Resolved method must be inside class Server");
+    }
+
+    #[test]
+    fn test_qualified_class_method_rust_impl() {
+        let source = r#"
+struct Foo;
+
+impl Foo {
+    fn process(&self) -> i32 {
+        let x = 1;
+        x
+    }
+}
+"#;
+        let tree = parse(source, Language::Rust).unwrap();
+        let root = tree.root_node();
+        let node = find_function_node(root, "Foo.process", Language::Rust, source);
+        assert!(node.is_some(), "Should resolve Foo.process via impl block");
+    }
+
+    #[test]
+    fn test_qualified_class_method_java() {
+        let source = r#"
+class Calculator {
+    int add(int a, int b) {
+        return a + b;
+    }
+}
+"#;
+        let tree = parse(source, Language::Java).unwrap();
+        let root = tree.root_node();
+        let node = find_function_node(root, "Calculator.add", Language::Java, source);
+        assert!(node.is_some(), "Should resolve Calculator.add in Java");
+    }
+
+    #[test]
+    fn test_qualified_lookup_via_complexity_python() {
+        // Integration: complexity calculation through qualified name.
+        use crate::metrics::calculate_complexity;
+        let source = r#"
+class Flask:
+    def run(self, debug=False):
+        if debug:
+            print("debug")
+        else:
+            print("normal")
+        return 0
+"#;
+        let metrics = calculate_complexity(source, "Flask.run", Language::Python).unwrap();
+        // if/else => cyclomatic >= 2
+        assert!(
+            metrics.cyclomatic >= 2,
+            "Flask.run cyclomatic should be >= 2, got {}",
+            metrics.cyclomatic
+        );
+    }
+
+    #[test]
+    fn test_qualified_lookup_via_dfg_python() {
+        // Integration: DFG (used by taint, slice, available, dead-stores,
+        // reaching-defs) through qualified name.
+        use crate::dfg::get_dfg_context;
+        let source = r#"
+class Service:
+    def handler(self, req):
+        x = req.data
+        y = x + 1
+        return y
+"#;
+        let result = get_dfg_context(source, "Service.handler", Language::Python);
+        assert!(
+            result.is_ok(),
+            "DFG should succeed for Service.handler, got: {:?}",
+            result.err()
+        );
+        let dfg = result.unwrap();
+        assert_eq!(dfg.function, "Service.handler");
+    }
+
+    #[test]
+    fn test_qualified_lookup_via_cfg_python() {
+        // Integration: CFG (used by taint, slice, chop) through qualified name.
+        use crate::cfg::get_cfg_context;
+        let source = r#"
+class Worker:
+    def run(self):
+        if True:
+            return 1
+        return 0
+"#;
+        let result = get_cfg_context(source, "Worker.run", Language::Python);
+        assert!(
+            result.is_ok(),
+            "CFG should succeed for Worker.run, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_qualified_class_method_disambiguates_overloaded() {
+        // Two classes with the same method name. Qualified lookup must
+        // pick the one in the named class, not the first one in source order.
+        let source = r#"
+class Alpha:
+    def shared(self):
+        a = 1
+        return a
+
+class Beta:
+    def shared(self):
+        b = 2
+        c = b + 1
+        return c
+"#;
+        let tree = parse(source, Language::Python).unwrap();
+        let root = tree.root_node();
+        let beta_method =
+            find_function_node(root, "Beta.shared", Language::Python, source).unwrap();
+        // Verify it is the Beta version: walk up to enclosing class.
+        let mut p = beta_method.parent();
+        let mut enclosing = None;
+        while let Some(parent) = p {
+            if parent.kind() == "class_definition" {
+                enclosing = parent
+                    .child_by_field_name("name")
+                    .map(|n| n.utf8_text(source.as_bytes()).unwrap_or("").to_string());
+                break;
+            }
+            p = parent.parent();
+        }
+        assert_eq!(
+            enclosing.as_deref(),
+            Some("Beta"),
+            "Beta.shared must resolve to the method inside class Beta"
+        );
+    }
+
+    #[test]
+    fn test_find_class_node_python() {
+        let source = r#"
+class Outer:
+    pass
+
+class Inner:
+    pass
+"#;
+        let tree = parse(source, Language::Python).unwrap();
+        let root = tree.root_node();
+        let inner = find_class_node(root, "Inner", Language::Python, source);
+        assert!(inner.is_some(), "Should find class Inner");
+        let nonexistent = find_class_node(root, "DoesNotExist", Language::Python, source);
+        assert!(
+            nonexistent.is_none(),
+            "Nonexistent class should return None"
+        );
+    }
+
+    #[test]
+    fn test_find_class_node_languages_without_classes() {
+        // C, OCaml, Elixir, Lua, Luau have no class container — must
+        // return None unconditionally.
+        let source = "int foo() { return 0; }";
+        let tree = parse(source, Language::C).unwrap();
+        let root = tree.root_node();
+        let result = find_class_node(root, "Anything", Language::C, source);
+        assert!(result.is_none(), "C has no class kinds — must return None");
     }
 }

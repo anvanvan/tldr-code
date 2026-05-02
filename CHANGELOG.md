@@ -1,5 +1,99 @@
 # Changelog
 
+## complexity-class-method-qualified-v1 — internal milestone
+
+NOT a published release. Per-function commands (`complexity`, `explain`,
+`taint`, `slice`, `chop`, `dead-stores`, `available`, `reaching-defs`,
+`contracts`) previously rejected `Class.method` qualified names with
+`Function not found`. Real codebases — Flask, Django, Rails, Spring,
+React class components — frequently have many classes that share a
+method name (e.g. `run`, `init`, `handle`, `start`). Without
+class-scoped resolution the user could only target the FIRST match,
+which is a correctness footgun.
+
+### Repro pre-fix
+
+```text
+$ tldr complexity /tmp/repos/flask/src/flask/app.py "Flask.run"
+Error: Function not found
+$ tldr complexity /tmp/repos/flask/src/flask/app.py "run"
+{ "function": "run", ... }   # ambiguous — Flask.run vs MapAdapter.run vs ...
+```
+
+### Fix
+
+Extend the canonical AST resolver
+`crates/tldr-core/src/ast/function_finder.rs::find_function_node` to
+recognise dotted names. When the input contains a `.`:
+
+1. Split into `Class.method` (or `Outer.Inner.method` — leftmost is
+   the class, the remainder is searched recursively inside it).
+2. Locate the class via the new `find_class_node` /
+   `get_class_node_kinds` helpers, which know about class-equivalent
+   containers across all 18 supported languages (classes, structs,
+   traits, impls, interfaces, records, enums, objects, protocols,
+   extensions).
+3. Search the method INSIDE the class body. First match wins.
+4. **Graceful fallback:** if the class doesn't exist, OR the method
+   isn't inside the class, fall back to bare-name lookup using the
+   LAST component (`Class.method` → `method`). This preserves
+   backward compatibility for users who pass dotted names that
+   don't actually correspond to a class scope.
+
+Lua/Luau are deliberately skipped from class scoping because their
+dot-indexed function form (`function Kong.init() … end`) is matched
+directly by the existing bare-name branch (no class node to descend
+into). The new code path therefore never disturbs that resolution.
+
+The two CLI-side duplicate resolvers
+(`crates/tldr-cli/src/commands/remaining/explain.rs::find_function_node`
+and `crates/tldr-cli/src/commands/contracts/contracts.rs::find_function_node`)
+get the same dispatch logic so `explain` and `contracts` inherit the
+fix. All other per-function commands (taint/slice/chop/dead-stores/
+available/reaching-defs) route through CFG/DFG/PDG extractors which
+use the canonical resolver — they inherit transparently.
+
+### Limitation: overloaded methods
+
+Java, C++, Kotlin, and Scala all permit method overloading. When two
+methods in the same class share a name, FIRST match wins. This is the
+same behaviour as the existing bare-name lookup. To disambiguate by
+line range or signature, callers must add that resolution at a higher
+level — `find_function_node` does NOT attempt overload resolution.
+
+### Verification
+
+```text
+$ tldr complexity /tmp/repos/flask/src/flask/app.py "Flask.run"
+{
+  "function": "Flask.run",
+  "cyclomatic": 13,
+  "cognitive": 20,
+  "nesting_depth": 3,
+  "lines_of_code": 122
+}
+```
+
+### Tests added
+
+11 new tests in `function_finder::tests` covering:
+- `test_qualified_class_method_python`
+- `test_complexity_unqualified_still_works` (regression)
+- `test_qualified_class_not_found_falls_back_to_method`
+- `test_qualified_class_method_typescript`
+- `test_qualified_class_method_rust_impl`
+- `test_qualified_class_method_java`
+- `test_qualified_lookup_via_complexity_python`
+- `test_qualified_lookup_via_dfg_python` (covers taint/slice/dead-stores/available/reaching-defs)
+- `test_qualified_lookup_via_cfg_python` (covers chop)
+- `test_qualified_class_method_disambiguates_overloaded`
+- `test_find_class_node_python` and `test_find_class_node_languages_without_classes`
+
+`vuln_migration_v1_red`: 168/168 GREEN. All other lib + integ tests
+unchanged (the 18 `test_imports_on_*` failures predate this milestone
+and are unrelated to function lookup — see `git log` for
+`language_command_matrix`).
+
 ## elixir-method-infos-v1 — internal milestone
 
 NOT a published release. MED extractor parity fix completing the

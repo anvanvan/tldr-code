@@ -991,14 +991,105 @@ fn parse_source(source: &str, language: Language, file: &Path) -> ContractsResul
 // =============================================================================
 
 /// Find a function definition node by name (multi-language).
+///
+/// Accepts either a bare function name (`run`) or a qualified
+/// `Class.method` form (`Flask.run`). When a qualified name is given:
+///   1. Locate the class via [`find_class_node_contracts`].
+///   2. Search the method inside the class subtree.
+///   3. If the class is missing or the method is not inside it, fall
+///      back to resolving the LAST component as a bare name across the
+///      whole AST.
 fn find_function_node<'a>(
     root: Node<'a>,
     function_name: &str,
     source: &[u8],
     config: &LanguageConfig,
 ) -> Option<Node<'a>> {
+    if function_name.contains('.') {
+        let parts: Vec<&str> = function_name.split('.').collect();
+        if parts.len() >= 2 {
+            let class_name = parts[0];
+            let remainder = parts[1..].join(".");
+            if let Some(class_node) = find_class_node_contracts(root, class_name, source) {
+                let scope = class_node
+                    .child_by_field_name("body")
+                    .unwrap_or(class_node);
+                if let Some(found) =
+                    find_function_recursive(scope, &remainder, source, config, 0)
+                {
+                    return Some(found);
+                }
+            }
+            // Fallback: bare-name lookup with the last component.
+            let last = *parts.last().unwrap();
+            return find_function_recursive(root, last, source, config, 0);
+        }
+    }
     // Recursive search through the entire AST
     find_function_recursive(root, function_name, source, config, 0)
+}
+
+/// Locate a class/struct/trait/interface container by name. Used to
+/// scope `Class.method` lookups in [`find_function_node`].
+fn find_class_node_contracts<'a>(
+    root: Node<'a>,
+    class_name: &str,
+    source: &[u8],
+) -> Option<Node<'a>> {
+    const CLASS_KINDS: &[&str] = &[
+        "class_definition",
+        "class_declaration",
+        "class",
+        "interface_declaration",
+        "struct_item",
+        "enum_item",
+        "trait_item",
+        "impl_item",
+        "union_item",
+        "class_specifier",
+        "struct_specifier",
+        "union_specifier",
+        "enum_declaration",
+        "record_declaration",
+        "trait_declaration",
+        "struct_declaration",
+        "object_declaration",
+        "object_definition",
+        "trait_definition",
+        "protocol_declaration",
+        "extension_declaration",
+        "module",
+    ];
+
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if CLASS_KINDS.contains(&node.kind()) {
+            let name_match = node.child_by_field_name("name").is_some_and(|n| {
+                get_node_text(n, source) == class_name
+            });
+            if name_match {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if matches!(
+                    child.kind(),
+                    "identifier" | "type_identifier" | "constant"
+                ) {
+                    if get_node_text(child, source) == class_name {
+                        return Some(node);
+                    }
+                    break;
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    None
 }
 
 /// Recursively search for a function node by name.
