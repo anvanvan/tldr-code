@@ -66,6 +66,8 @@ pub fn extract_python_api_surface(
             language: "python".to_string(),
             total,
             apis,
+            files_skipped: 0,
+            warnings: Vec::new(),
         });
     }
 
@@ -157,6 +159,8 @@ pub fn extract_python_api_surface(
         language: "python".to_string(),
         total,
         apis,
+        files_skipped: 0,
+        warnings: Vec::new(),
     })
 }
 

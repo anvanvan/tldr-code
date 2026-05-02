@@ -1,5 +1,54 @@
 # Changelog
 
+## luau-utf8-tolerance-v1 — internal milestone
+
+NOT a published release. Fixes a MED-severity walker bug where a single
+file with non-UTF-8 bytes inside a scanned directory aborted the entire
+scan with `stream did not contain valid UTF-8`.
+
+### Bug fixed
+
+- **MEDIUM — `tldr surface --lang luau /tmp/repos/luau-luau` (and the
+  Lua surface scanner) aborted on the first non-UTF-8 file.** The
+  upstream Luau parser-test corpus intentionally embeds raw `0xFF`
+  bytes in `tests/conformance/literals.luau`, `pm.luau`, and
+  `sort.luau` to exercise the lexer; `std::fs::read_to_string` rejects
+  these and the surface extractor's `?` propagated the parse error
+  out, killing the whole-repo scan. Repro on luau-luau before the
+  fix: `tldr surface /tmp/repos/luau-luau --lang luau 2>&1 | tail -1`
+  emitted `Error: Parse error in
+  /tmp/repos/luau-luau/tests/conformance/literals.luau: Cannot read:
+  stream did not contain valid UTF-8`. Fix: introduced
+  `tldr_core::fs::read_to_string_tolerant`, which classifies a
+  non-UTF-8 file as a skippable condition (`ReadOutcome::NonUtf8 {
+  byte_offset }`) rather than a hard error, and wired the Lua + Luau
+  per-file extractors to skip those files, accumulating an entry in
+  the new `ApiSurface.warnings: Vec<String>` field plus an increment
+  on `ApiSurface.files_skipped: usize`. Genuine I/O failures still
+  propagate. After the fix, the same scan exits 0, surfaces the
+  valid `.lua`/`.luau` files, and reports the three skipped files in
+  `warnings`:
+  `["Skipped …/literals.luau: invalid UTF-8 at byte 2112", …]`. We
+  deliberately did not use `from_utf8_lossy` because U+FFFD
+  replacement bytes confuse the tree-sitter grammar and yield
+  garbage symbols. The new fields are `#[serde(default)]` so older
+  consumers that round-trip the JSON keep working. Test coverage:
+  `surface::luau::tests::test_walker_skips_non_utf8_files`,
+  `surface::luau::tests::test_walker_continues_when_all_files_are_non_utf8`,
+  and three unit tests on the helper
+  (`fs::tests::read_to_string_tolerant_*`).
+
+### Carry-forward / deferred
+
+- The same per-file UTF-8 tolerance pattern is wired through Lua and
+  Luau — the only languages where the bug actually manifested in the
+  field. The remaining 16 surface modules now expose
+  `files_skipped`/`warnings` fields (defaulted to `0`/`[]` for serde
+  back-compat) but still use the original strict `read_to_string`.
+  They have not been observed to fail this way; if a future scan
+  turns up non-UTF-8 source in those languages, the helper is one
+  drop-in away.
+
 ## schema-completeness-v1 — internal milestone
 
 NOT a published release. Closes the "schema completeness" anti-product

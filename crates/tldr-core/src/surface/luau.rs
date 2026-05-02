@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ast::extract::extract_from_tree;
 use crate::ast::parser::parse;
+use crate::fs::{read_to_string_tolerant, ReadOutcome};
 use crate::types::Language;
 use crate::TldrResult;
 
@@ -44,14 +45,20 @@ pub fn extract_luau_api_surface(
     limit: Option<usize>,
 ) -> TldrResult<ApiSurface> {
     let mut apis = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut files_skipped: usize = 0;
 
     for file_path in find_luau_files(&resolved.root_dir) {
-        apis.extend(extract_from_luau_file(
+        if let Some(entries) = extract_from_luau_file(
             &file_path,
             &resolved.root_dir,
             &resolved.package_name,
             include_private,
-        )?);
+            &mut warnings,
+            &mut files_skipped,
+        )? {
+            apis.extend(entries);
+        }
     }
 
     sort_apis_by_static_preference(&mut apis, "luau");
@@ -66,6 +73,8 @@ pub fn extract_luau_api_surface(
         language: "luau".to_string(),
         total,
         apis,
+        files_skipped,
+        warnings,
     })
 }
 
@@ -107,14 +116,27 @@ fn extract_from_luau_file(
     root_dir: &Path,
     package_name: &str,
     include_private: bool,
-) -> TldrResult<Vec<ApiEntry>> {
-    let source = std::fs::read_to_string(file_path).map_err(|e| {
+    warnings: &mut Vec<String>,
+    files_skipped: &mut usize,
+) -> TldrResult<Option<Vec<ApiEntry>>> {
+    let source = match read_to_string_tolerant(file_path).map_err(|e| {
         crate::error::TldrError::parse_error(
             file_path.to_path_buf(),
             None,
             format!("Cannot read: {}", e),
         )
-    })?;
+    })? {
+        ReadOutcome::Ok(s) => s,
+        ReadOutcome::NonUtf8 { byte_offset } => {
+            *files_skipped += 1;
+            warnings.push(format!(
+                "Skipped {}: invalid UTF-8 at byte {}",
+                file_path.display(),
+                byte_offset
+            ));
+            return Ok(None);
+        }
+    };
 
     // Pick the right grammar: .luau files use the Luau grammar; .lua files
     // in a Luau project are still parsed as Lua (the Luau grammar is a strict
@@ -241,7 +263,7 @@ fn extract_from_luau_file(
         });
     }
 
-    Ok(apis)
+    Ok(Some(apis))
 }
 
 fn compute_module_path(file_path: &Path, root_dir: &Path, package_name: &str) -> String {
@@ -575,5 +597,104 @@ mod tests {
             "underscore-prefixed function should be private by default; got: {:?}",
             names
         );
+    }
+
+    /// Regression test for `luau-utf8-tolerance-v1`.
+    ///
+    /// The Luau test corpus (`tests/conformance/literals.luau`, `pm.luau`,
+    /// `sort.luau`) intentionally contains raw non-UTF-8 bytes for the
+    /// parser's lexer fixtures. Before this milestone, encountering such a
+    /// file caused the entire `tldr surface --lang luau` scan to abort with
+    /// `stream did not contain valid UTF-8`. The walker must now skip the
+    /// offending file with a warning and continue scanning the remainder.
+    #[test]
+    fn test_walker_skips_non_utf8_files() {
+        let dir = TempDir::new().unwrap();
+
+        // Valid Luau file - should be extracted normally.
+        write_file(
+            &dir,
+            "good.luau",
+            "function hello(name: string): string\n    return name\nend\n",
+        );
+
+        // Synthetic bad file: raw 0xFF bytes are never valid as UTF-8 leading
+        // bytes. Mimics tests/conformance/literals.luau.
+        let bad_path = dir.path().join("bad.luau");
+        std::fs::write(&bad_path, b"-- header\n\xFF\xFE garbage\n").unwrap();
+
+        let resolved = ResolvedPackage {
+            root_dir: dir.path().to_path_buf(),
+            package_name: "example".to_string(),
+            is_pure_source: true,
+            public_names: None,
+        };
+
+        let surface = extract_luau_api_surface(&resolved, false, None)
+            .expect("scan must succeed despite the non-UTF-8 file");
+
+        // Valid file's APIs should still surface.
+        let names: Vec<&str> = surface
+            .apis
+            .iter()
+            .map(|api| api.qualified_name.as_str())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with(".hello")),
+            "expected `hello` from good.luau to surface; got {:?}",
+            names
+        );
+
+        // Bad file is reflected only in warnings + files_skipped, not apis.
+        assert_eq!(
+            surface.files_skipped, 1,
+            "exactly one file should have been skipped"
+        );
+        assert_eq!(
+            surface.warnings.len(),
+            1,
+            "exactly one warning should have been emitted"
+        );
+        let warning = &surface.warnings[0];
+        assert!(
+            warning.contains("bad.luau"),
+            "warning should name the skipped file path; got {:?}",
+            warning
+        );
+        assert!(
+            warning.contains("invalid UTF-8"),
+            "warning should explain the cause; got {:?}",
+            warning
+        );
+        assert!(
+            warning.contains("byte"),
+            "warning should include the byte offset; got {:?}",
+            warning
+        );
+    }
+
+    /// Companion regression test: even when EVERY file in the directory is
+    /// non-UTF-8 (the pathological case), the scan must not error out — it
+    /// should return an empty surface with all files accounted for in
+    /// `files_skipped` and `warnings`.
+    #[test]
+    fn test_walker_continues_when_all_files_are_non_utf8() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.luau"), b"\xFF\xFF").unwrap();
+        std::fs::write(dir.path().join("b.luau"), b"\xC0\xC1").unwrap();
+
+        let resolved = ResolvedPackage {
+            root_dir: dir.path().to_path_buf(),
+            package_name: "broken".to_string(),
+            is_pure_source: true,
+            public_names: None,
+        };
+
+        let surface =
+            extract_luau_api_surface(&resolved, false, None).expect("scan must not abort");
+        assert_eq!(surface.apis.len(), 0);
+        assert_eq!(surface.total, 0);
+        assert_eq!(surface.files_skipped, 2);
+        assert_eq!(surface.warnings.len(), 2);
     }
 }

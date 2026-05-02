@@ -59,6 +59,8 @@ pub fn extract_go_api_surface(
         language: "go".to_string(),
         total,
         apis,
+        files_skipped: 0,
+        warnings: Vec::new(),
     })
 }
 

@@ -47,6 +47,8 @@ pub fn extract_cpp_api_surface(
         language: "cpp".to_string(),
         total,
         apis,
+        files_skipped: 0,
+        warnings: Vec::new(),
     })
 }
 

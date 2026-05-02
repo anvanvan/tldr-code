@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ast::extract::extract_from_tree;
 use crate::ast::parser::parse;
+use crate::fs::{read_to_string_tolerant, ReadOutcome};
 use crate::types::Language;
 use crate::TldrResult;
 
@@ -21,13 +22,19 @@ pub fn extract_lua_api_surface(
     limit: Option<usize>,
 ) -> TldrResult<ApiSurface> {
     let mut apis = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut files_skipped: usize = 0;
 
     for file_path in find_lua_files(&resolved.root_dir) {
-        apis.extend(extract_from_lua_file(
+        if let Some(entries) = extract_from_lua_file(
             &file_path,
             &resolved.root_dir,
             &resolved.package_name,
-        )?);
+            &mut warnings,
+            &mut files_skipped,
+        )? {
+            apis.extend(entries);
+        }
     }
 
     if let Some(max) = limit {
@@ -40,6 +47,8 @@ pub fn extract_lua_api_surface(
         language: "lua".to_string(),
         total,
         apis,
+        files_skipped,
+        warnings,
     })
 }
 
@@ -76,14 +85,27 @@ fn extract_from_lua_file(
     file_path: &Path,
     root_dir: &Path,
     package_name: &str,
-) -> TldrResult<Vec<ApiEntry>> {
-    let source = std::fs::read_to_string(file_path).map_err(|e| {
+    warnings: &mut Vec<String>,
+    files_skipped: &mut usize,
+) -> TldrResult<Option<Vec<ApiEntry>>> {
+    let source = match read_to_string_tolerant(file_path).map_err(|e| {
         crate::error::TldrError::parse_error(
             file_path.to_path_buf(),
             None,
             format!("Cannot read: {}", e),
         )
-    })?;
+    })? {
+        ReadOutcome::Ok(s) => s,
+        ReadOutcome::NonUtf8 { byte_offset } => {
+            *files_skipped += 1;
+            warnings.push(format!(
+                "Skipped {}: invalid UTF-8 at byte {}",
+                file_path.display(),
+                byte_offset
+            ));
+            return Ok(None);
+        }
+    };
 
     let tree = parse(&source, Language::Lua)?;
     let module_info = extract_from_tree(&tree, &source, Language::Lua, file_path, Some(root_dir))?;
@@ -156,7 +178,7 @@ fn extract_from_lua_file(
         }
     }
 
-    Ok(apis)
+    Ok(Some(apis))
 }
 
 fn compute_module_path(file_path: &Path, root_dir: &Path, package_name: &str) -> String {

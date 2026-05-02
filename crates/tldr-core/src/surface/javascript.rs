@@ -98,6 +98,8 @@ pub fn extract_javascript_api_surface(
         language: "javascript".to_string(),
         total,
         apis,
+        files_skipped: 0,
+        warnings: Vec::new(),
     })
 }
 

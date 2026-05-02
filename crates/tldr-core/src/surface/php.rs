@@ -41,6 +41,8 @@ pub fn extract_php_api_surface(
         language: "php".to_string(),
         total,
         apis,
+        files_skipped: 0,
+        warnings: Vec::new(),
     })
 }
 

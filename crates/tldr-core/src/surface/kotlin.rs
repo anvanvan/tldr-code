@@ -41,6 +41,8 @@ pub fn extract_kotlin_api_surface(
         language: "kotlin".to_string(),
         total,
         apis,
+        files_skipped: 0,
+        warnings: Vec::new(),
     })
 }
 

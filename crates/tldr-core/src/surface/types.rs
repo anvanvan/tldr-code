@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Contains all public API entries extracted from the package source or type stubs,
 /// along with metadata about the package and language.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ApiSurface {
     /// Package name (e.g., "flask", "json", "serde")
     pub package: String,
@@ -23,6 +23,16 @@ pub struct ApiSurface {
     pub total: usize,
     /// Individual API entries
     pub apis: Vec<ApiEntry>,
+    /// Number of files skipped during extraction (e.g. invalid UTF-8 fixture
+    /// files in parser test corpora). The skipped files are NOT counted in
+    /// any per-language file totals.
+    #[serde(default)]
+    pub files_skipped: usize,
+    /// Human-readable warnings collected during extraction. Each entry names
+    /// a file that was skipped and why (e.g. "Skipped <path>: invalid UTF-8
+    /// at byte 1234"). Empty for clean scans.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// A single public API entry (function, method, class, constant, type alias).
@@ -228,6 +238,8 @@ mod tests {
                     }),
                 },
             ],
+            files_skipped: 0,
+            warnings: Vec::new(),
         };
 
         let json = serde_json::to_string_pretty(&surface).expect("serialize");

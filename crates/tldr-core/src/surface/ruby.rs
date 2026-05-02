@@ -45,6 +45,8 @@ pub fn extract_ruby_api_surface(
         language: "ruby".to_string(),
         total,
         apis,
+        files_skipped: 0,
+        warnings: Vec::new(),
     })
 }
 

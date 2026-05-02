@@ -46,6 +46,8 @@ pub fn extract_elixir_api_surface(
         language: "elixir".to_string(),
         total,
         apis,
+        files_skipped: 0,
+        warnings: Vec::new(),
     })
 }
 

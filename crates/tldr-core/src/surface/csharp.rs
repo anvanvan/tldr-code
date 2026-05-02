@@ -40,6 +40,8 @@ pub fn extract_csharp_api_surface(
         language: "csharp".to_string(),
         total,
         apis,
+        files_skipped: 0,
+        warnings: Vec::new(),
     })
 }
 

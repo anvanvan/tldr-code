@@ -90,6 +90,8 @@ pub fn extract_typescript_api_surface(
         language: "typescript".to_string(),
         total,
         apis,
+        files_skipped: 0,
+        warnings: Vec::new(),
     })
 }
 

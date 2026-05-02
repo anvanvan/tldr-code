@@ -96,6 +96,8 @@ pub fn extract_ocaml_api_surface(
         language: "ocaml".to_string(),
         total,
         apis,
+        files_skipped: 0,
+        warnings: Vec::new(),
     })
 }
 
