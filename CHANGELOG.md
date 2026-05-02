@@ -1,5 +1,89 @@
 # Changelog
 
+## elixir-method-infos-v1 — internal milestone
+
+NOT a published release. MED extractor parity fix completing the
+intent of `structure-method-infos-all-langs-v1`. After that prior
+fix, `tldr structure --lang elixir` still emitted
+`method_infos: []` on every file even when the legacy
+`methods: [String]` array was populated — across all 77 files of
+the `elixir-plug` corpus (840 legacy methods → 0 `method_infos`).
+
+### Bug
+
+`crates/tldr-core/src/ast/extractor.rs::try_elixir_call_definition`
+unconditionally tagged `def`/`defp` calls with `kind: "function"`.
+The downstream filter
+`definitions.filter(|d| d.kind == "method")` (lines 203–211 of the
+same file) therefore returned an empty `Vec<MethodInfo>` for every
+Elixir file — even for `def`/`defp` declared inside a
+`defmodule … do … end` block, which is the conventional Elixir
+analogue of class-scoped methods in Ruby/Python/Java.
+
+Concrete repro pre-fix:
+
+```text
+$ tldr structure --lang elixir /tmp/repos/elixir-plug \
+    | jq '[.files[].method_infos | length] | add'
+0
+$ tldr structure --lang elixir /tmp/repos/elixir-plug \
+    | jq '[.files[].methods | length] | add'
+840
+```
+
+### Fix
+
+Mirror the Ruby/Python "class-scoped def is a method" classification
+in the Elixir branch. A new helper `is_inside_elixir_defmodule`
+walks the parent chain of a `def`/`defp` `call` node and returns
+true iff any ancestor `call` has its first identifier child equal to
+`defmodule`. When true, `try_elixir_call_definition` now emits
+`kind: "method"` instead of `"function"`. Top-level `def`/`defp`
+(legal in Mix scripts and `iex` sessions) keep the `function` tag.
+
+Post-fix on the same corpus:
+
+```text
+$ tldr structure --lang elixir /tmp/repos/elixir-plug \
+    | jq '[.files[].method_infos | length] | add'
+939
+```
+
+The legacy `methods: [String]` array is unchanged (same names,
+same length per file) — the contract is purely additive.
+
+### Tests
+
+- `crates/tldr-cli/tests/elixir_method_infos_v1.rs`:
+  - `test_structure_elixir_method_infos_populated` — synthetic
+    `defmodule Foo do ; def bar(x) ; defp baz ; end` fixture
+    asserts both names appear in `method_infos` with positive
+    `line` and a `def `/`defp ` signature, and both names also
+    appear in the legacy `methods: [String]` array.
+  - `test_structure_elixir_method_infos_count_matches_methods`
+    pins `methods.len() == method_infos.len()` for the same
+    fixture (count parity inside a single defmodule).
+
+### Validation
+
+- 168/168 GREEN: `vuln_migration_v1_red`.
+- 4691/4691 GREEN: `tldr-core` lib.
+- 1400/1400 GREEN: `tldr-cli` lib.
+- M-NEW2 regression `test_structure_method_infos_emitted_all_langs`
+  remains GREEN.
+- Binary verify on `/tmp/repos/elixir-plug`: 77 files, 939
+  `method_infos` (was 0), 840 legacy `methods` (unchanged).
+
+### Carry-forward
+
+- The pre-existing
+  `test_structure_method_infos_distinguishes_overloads_cpp_kotlin_scala`
+  test fails on the cpp leg with empty-string method names from
+  the legacy `methods` array. The failure is unrelated to this
+  milestone — only the Elixir branch of `extract_definitions` was
+  touched, and the fixture/assertion paths in that test never
+  exercise Elixir. Tracked separately.
+
 ## typescript-large-file-perf-v1 — internal milestone
 
 NOT a published release. HIGH perf ship-blocker fix: six commands

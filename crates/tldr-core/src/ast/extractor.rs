@@ -2326,9 +2326,19 @@ fn try_elixir_call_definition(node: Node, source: &str) -> Option<DefinitionInfo
                 let line_start = node.start_position().row as u32 + 1;
                 let line_end = node.end_position().row as u32 + 1;
                 let signature = extract_def_signature(node, source);
+                // elixir-method-infos-v1: def/defp inside a `defmodule … do … end`
+                // block are emitted with kind="method" so the `method_infos` view
+                // (filtered by kind=="method") is populated for Elixir, mirroring
+                // how Ruby methods inside `module`/`class` blocks are classified.
+                // Top-level def/defp (rare but legal in scripts) remain "function".
+                let kind_str = if is_inside_elixir_defmodule(&node, source) {
+                    "method"
+                } else {
+                    "function"
+                };
                 return Some(DefinitionInfo {
                     name: name.to_string(),
-                    kind: "function".to_string(),
+                    kind: kind_str.to_string(),
                     line_start,
                     line_end,
                     signature,
@@ -2352,6 +2362,31 @@ fn try_elixir_call_definition(node: Node, source: &str) -> Option<DefinitionInfo
         }
     }
     None
+}
+
+/// elixir-method-infos-v1: Returns true if `node` (an Elixir def/defp `call`
+/// node) has an ancestor `call` whose first identifier child is `defmodule`.
+/// Walks parents only — does not recurse into siblings — so cost is O(depth).
+fn is_inside_elixir_defmodule(node: &Node, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "call" {
+            let mut cursor = parent.walk();
+            for child in parent.children(&mut cursor) {
+                if child.kind() == "identifier" {
+                    if let Ok(text) = child.utf8_text(source.as_bytes()) {
+                        if text == "defmodule" {
+                            return true;
+                        }
+                    }
+                    // Only the first identifier child is the keyword; stop.
+                    break;
+                }
+            }
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 /// Classify a tree-sitter node kind as function-like or class-like.
