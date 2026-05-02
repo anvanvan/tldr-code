@@ -2410,6 +2410,62 @@ def safe_file_handling():
             "Should report Rust API misuse findings"
         );
     }
+
+    /// analysis-precision-v1, BUG-07: PY004 weak-hash-sha1 must NOT match
+    /// function definition signatures or docstring lines that merely
+    /// *mention* `sha1` / `hashlib.sha1`. Only the actual `hashlib.sha1(...)`
+    /// call site should be flagged.
+    ///
+    /// Reproduces flask's `src/flask/sessions.py:276-281` shape exactly:
+    /// - line 1: `def _lazy_sha1(string: bytes = b"") -> t.Any:` (signature mention)
+    /// - line 2-4: triple-quoted docstring containing ``hashlib.sha1``
+    /// - line 5: `return hashlib.sha1(string)` (the only real call site)
+    #[test]
+    fn test_api_check_py004_skips_def_and_docstring() {
+        let temp = TempDir::new().unwrap();
+        let fixture = "\
+import hashlib
+
+def _lazy_sha1(string: bytes = b\"\") -> object:
+    \"\"\"Don't access ``hashlib.sha1`` until runtime. FIPS builds may not include
+    SHA-1, in which case the import and use as a default would fail before the
+    developer can configure something else.
+    \"\"\"
+    return hashlib.sha1(string)
+";
+        let file_path = create_test_file(&temp, "sessions.py", fixture);
+
+        let output = tldr_cmd()
+            .args(["api-check", file_path.to_str().unwrap()])
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: APICheckReport = serde_json::from_str(&stdout)
+            .expect("Should return valid JSON APICheckReport");
+
+        let py004_lines: Vec<u32> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule.id == "PY004")
+            .map(|f| f.line)
+            .collect();
+
+        assert_eq!(
+            py004_lines.len(),
+            1,
+            "PY004 must fire exactly once (call site only); got lines {:?}",
+            py004_lines
+        );
+        // Real call site is the `return hashlib.sha1(string)` line —
+        // line 8 in the fixture (1-indexed: import=1, blank=2, def=3,
+        // docstring open=4, docstring=5, docstring=6, docstring close=7,
+        // return=8).
+        assert_eq!(
+            py004_lines[0], 8,
+            "PY004 must hit the actual call site, not the def signature or docstring"
+        );
+    }
 }
 
 // =============================================================================
@@ -2850,6 +2906,94 @@ def search():
                 .iter()
                 .any(|f| f.vuln_type == VulnType::MemorySafety),
             "Should detect Rust memory-safety patterns"
+        );
+    }
+
+    /// analysis-precision-v1, BUG-10: vuln must enumerate findings in the
+    /// same order regardless of `--format`. Pre-fix the JSON formatter
+    /// emitted findings in analyzer-emission order (rayon-driven, file
+    /// fan-out non-deterministic) while the text formatter walked the
+    /// same vector — but two runs of the same scan could produce two
+    /// different orderings, and JSON vs text could disagree even within
+    /// a single run. The fix sorts `filtered_findings` by
+    /// `(file, line, vuln_type)` ascending in ONE place (post-suppression,
+    /// pre-output) so JSON, text, and SARIF emitters all walk the same
+    /// canonical sequence.
+    ///
+    /// This test cross-validates the JSON ordering against an
+    /// independently-derived expected ordering (sort by file, then line,
+    /// then vuln_type-as-string). Equality is the strict assertion.
+    #[test]
+    fn test_vuln_findings_sorted_consistently() {
+        // Fixture: 3+ findings across 2 Python files, with deliberately
+        // out-of-order line numbers + alphabetical mismatch between filename
+        // and emission order, so a non-stable scan would produce a
+        // different ordering than (file, line, vuln_type) ascending.
+        // Uses eval/exec on file-read content (the canonical taint engine's
+        // proven sink/source pair) so we get >= 1 finding per file
+        // deterministically.
+        let temp = TempDir::new().unwrap();
+
+        // file `b_query.py` — exec on file content (CommandInjection / CodeExec sink).
+        let _b = create_test_file(
+            &temp,
+            "b_query.py",
+            "\
+import os
+def f(filename):
+    with open(filename) as config_file:
+        exec(compile(config_file.read(), filename, \"exec\"), {})
+",
+        );
+
+        // file `a_render.py` — eval on env-tainted file read.
+        let _a = create_test_file(
+            &temp,
+            "a_render.py",
+            "\
+import os
+def g(ctx):
+    startup = os.environ.get(\"PYTHONSTARTUP\")
+    with open(startup) as f:
+        eval(compile(f.read(), startup, \"exec\"), ctx)
+",
+        );
+
+        let dir_path = temp.path().to_str().unwrap();
+        let output = tldr_cmd()
+            .args(["vuln", dir_path, "--format", "json"])
+            .output()
+            .unwrap();
+
+        // vuln returns exit 2 (findings detected) - that's fine, parse stdout.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let report: VulnReport =
+            serde_json::from_str(&stdout).expect("vuln must emit valid JSON");
+
+        // Fixture is calibrated to the canonical Python taint engine's
+        // exec/eval sinks. We require >= 2 findings (one per file) so the
+        // ordering check below is non-trivial (cross-file comparison).
+        assert!(
+            report.findings.len() >= 2,
+            "fixture should produce >= 2 findings; got {} ({:?})",
+            report.findings.len(),
+            report.findings
+        );
+
+        // Independently derive the expected order: (file, line, vuln_type-debug).
+        let actual: Vec<(String, u32, String)> = report
+            .findings
+            .iter()
+            .map(|f| (f.file.clone(), f.line, format!("{:?}", f.vuln_type)))
+            .collect();
+        let mut expected = actual.clone();
+        expected.sort();
+
+        assert_eq!(
+            actual, expected,
+            "vuln JSON findings must be sorted by (file, line, vuln_type) ascending — \
+             got {:?}, expected {:?}",
+            actual, expected
         );
     }
 }

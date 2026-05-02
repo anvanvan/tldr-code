@@ -1357,7 +1357,16 @@ impl GVNReport {
 // =============================================================================
 
 /// Types of vulnerabilities detected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
+///
+/// `Ord`/`PartialOrd` are derived (analysis-precision-v1, BUG-10) so that
+/// `VulnFinding` lists can be sorted by `(file, line, vuln_type)` ascending
+/// — producing the same enumeration order across JSON, text, and SARIF
+/// output formats. Variant declaration order defines the `Ord` ranking;
+/// callers SHOULD treat the relative ordering as opaque (only stability
+/// matters).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ValueEnum,
+)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum VulnType {

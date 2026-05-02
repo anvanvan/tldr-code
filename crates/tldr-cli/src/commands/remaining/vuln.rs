@@ -234,6 +234,18 @@ impl VulnArgs {
             filtered_findings.retain(|f| !is_js_test_file(Path::new(&f.file)));
         }
 
+        // analysis-precision-v1, BUG-10: sort findings by (file, line,
+        // vuln_type) ascending in ONE place — post-suppression, pre-output —
+        // so JSON, text, and SARIF emitters all enumerate findings in the
+        // same order. Pre-fix the JSON output preserved analyzer-emission
+        // order while the text formatter walked the same vector — but the
+        // ordering was non-deterministic across runs (rayon-driven file
+        // analysis fan-out) and visibly differed between runs on the same
+        // repo, creating the illusion of different findings between
+        // `--format json` and `--format text`.
+        filtered_findings
+            .sort_by(|a, b| (&a.file, a.line, a.vuln_type).cmp(&(&b.file, b.line, b.vuln_type)));
+
         // Build summary.
         //
         // vuln-summary-correctness-v1 (Bug 1 + Bug 2): `files_with_vulns`

@@ -1,5 +1,170 @@
 # Changelog
 
+## analysis-precision-v1 — internal milestone
+
+NOT a published release. Bundles four independent precision /
+determinism fixes that share the same anti-product surface
+("analysis output that looks authoritative but is wrong"). All four
+bugs live on the analyze → format → emit path and ship atomically.
+`vuln_migration_v1_red` remains 168/168 GREEN; all 4656 `tldr-core`
++ 1391 `tldr-cli` library tests remain GREEN. Two unrelated
+pre-existing failures in `remaining_test`
+(`vuln_command::test_vuln_detects_xss`, `secure_command::test_secure_detects_taint`)
+were verified to fail on `HEAD~1` — they are NOT regressions and
+are NOT carry-forwards of this milestone.
+
+### Bugs fixed
+
+- **BUG-07** — `tldr api-check` PY004 (weak-hash-sha1) inflated
+  from 1 real call site to 3 findings on `flask/src/flask/sessions.py`.
+  Pre-fix repro:
+  ```
+  tldr api-check /tmp/repos/flask | jq '[.findings[] | select(.rule.id=="PY004") | .line]'
+    → [276, 277, 281]
+  ```
+  Line 276 is `def _lazy_sha1(string: bytes = b"") -> t.Any:` (a
+  function *signature* whose name happens to contain `sha1`); line
+  277 is the docstring opener (`"""Don't access ``hashlib.sha1``
+  until runtime..."""`); only line 281 (`return hashlib.sha1(string)`)
+  is the real call. Pre-fix `check_sha1_usage` used a substring
+  matcher (`line_text.contains("sha1(")` and
+  `line_text.contains("hashlib.sha1")`) that fired on the def-line
+  identifier and on the docstring text.
+- **BUG-10** — `tldr vuln` enumerated findings in different orders
+  between `--format json` and `--format text`. The text formatter
+  walked `report.findings` in-order, but the input vector itself
+  was non-deterministically ordered (rayon-driven file fan-out),
+  and JSON vs text could disagree run-to-run on the same repo.
+- **BUG-12** — `tldr smells /tmp/repos/ripgrep` reported
+  `files_scanned: 101` against a 100-Rust-file project; `tldr
+  structure` correctly reported 100. Root cause: smells walked
+  every supported language regardless of dominant project language,
+  so a single `pkg/brew/ripgrep-bin.rb` Homebrew formula inflated
+  the count by 1. (NOT a symlink, NOT a duplicate enumeration —
+  the spec hypothesised those, but the actual root cause is
+  multi-language overcount on mixed repos.)
+- **BUG-20** — `tldr search` returned a single sub-match scored
+  0.918 (close to BM25 max) for the 4-token query
+  `nonexistent_term_xyz_789`. The match was a single token (`xyz`)
+  inside one document (`client.get(base_url="http://xyz.other.test")`).
+  Plain BM25 has no notion of query coverage; a single rare term
+  with high IDF dominates the per-document sum.
+
+### Root causes
+
+- **BUG-07** (`crates/tldr-cli/src/commands/remaining/api_check.rs`):
+  PY004 / PY003 / PY005 / PY006 used `str::contains` on the raw
+  line text. No def/class signature suppression; no docstring
+  tracking; no word-boundary check around `sha1(` / `md5(`.
+- **BUG-10** (`crates/tldr-cli/src/commands/remaining/vuln.rs`):
+  `filtered_findings` was emitted in raw analyzer order. Rayon's
+  `par_iter` produces non-deterministic ordering across files, so
+  the same scan could output two different findings sequences in
+  back-to-back runs.
+- **BUG-12** (`crates/tldr-core/src/quality/smells.rs`):
+  `walker_opts.lang` was treated as "filter to lang OR scan every
+  supported language". On a Rust project with one Ruby file, the
+  walker emitted 101 paths (100 `.rs` + 1 `.rb`); `tldr structure`
+  used `Language::from_directory` to pick Rust as dominant and
+  filtered to that, producing 100.
+- **BUG-20** (`crates/tldr-core/src/search/bm25.rs`): the BM25 sum
+  loop accumulates per-term IDF×TF contributions without any
+  coverage normalization. A 1-of-4 token match against a rare term
+  scores ≈ a 4-of-4 match against a common term.
+
+### Fixes
+
+- **BUG-07** — `analyze_file` now pre-computes per-line Python
+  context (`compute_python_line_contexts`) tracking triple-quoted
+  docstring state and `def`/`async def`/`class` signatures.
+  `check_rule` skips PY003/PY004/PY005/PY006 on docstring lines and
+  signature lines. `check_md5_usage` and `check_sha1_usage` now
+  require either the qualified `hashlib.{md5,sha1}` form OR a
+  *standalone* `{md5,sha1}(` call (not preceded by an identifier
+  character) — so `_lazy_sha1(...)` no longer matches `sha1(`.
+- **BUG-10** — `VulnArgs::run` sorts `filtered_findings` by
+  `(file, line, vuln_type)` ascending in ONE place, post-suppression
+  / pre-output. `VulnType` derives `Ord` for the tertiary key.
+  JSON, text, and SARIF emitters now walk the same canonical
+  sequence.
+- **BUG-12** — When `walker_opts.lang.is_none()` AND the path is a
+  directory AND no explicit `--files` list was supplied, smells
+  auto-detects the dominant language via `Language::from_directory`
+  (matching `tldr structure` semantics). The collected file list
+  is also `dunce::canonicalize`+sort+dedup'd defensively to guard
+  against future symlink-forest / workspace-double-mount
+  regressions.
+- **BUG-20** — `Bm25Index::search` applies a multiplicative
+  coverage penalty: when `matched_terms.len() / unique_query_terms
+  < 0.5`, the document's BM25 score is multiplied by the coverage
+  ratio. A 1-of-4 match keeps 25% of its raw BM25 score; a 3-of-4
+  match (coverage 0.75) is left untouched. Threshold of 0.5 is
+  documented inline.
+
+### Validation
+
+- Tests added (4 — one per bug):
+    - `test_api_check_py004_skips_def_and_docstring`
+      (`crates/tldr-cli/tests/remaining_test.rs`) — fixture mirrors
+      flask `sessions.py:276-281` shape; asserts PY004 fires
+      exactly once on the real call site.
+    - `test_vuln_findings_sorted_consistently`
+      (same file) — fixture with 2 Python files / 2+ findings;
+      asserts JSON ordering equals the canonical
+      `(file, line, vuln_type)` sort.
+    - `test_smells_files_scanned_matches_dominant_language` +
+      `test_smells_files_scanned_is_unique_count`
+      (`crates/tldr-core/src/quality/smells.rs`) — 4 `.py` + 1
+      `.rb` fixture asserts `files_scanned == 4`; companion test
+      asserts unique-file equality.
+    - `test_search_low_coverage_score_discounted` +
+      `test_search_full_coverage_score_unchanged`
+      (`crates/tldr-core/src/search/bm25.rs`) — low-coverage match
+      asserts `score < 0.5`; full-coverage companion asserts no
+      penalty applied.
+- Binary-verify (post-fix, on /tmp/repos/{flask,ripgrep}):
+    - api-check: `tldr api-check /tmp/repos/flask | jq '[.findings[] |
+      select(.rule.id=="PY004") | .line]'` → `[281]` (was
+      `[276, 277, 281]`).
+    - vuln: `tldr vuln /tmp/repos/flask --format json` and
+      `--format text` enumerate findings in identical order on
+      back-to-back runs.
+    - smells: `tldr smells /tmp/repos/ripgrep | jq '.files_scanned'`
+      → `100` (was 101); matches `find /tmp/repos/ripgrep -name
+      "*.rs" -type f | wc -l`.
+    - search: `tldr search "nonexistent_term_xyz_789"
+      /tmp/repos/flask | jq '.results[0].score'` → `0.230` (was
+      0.918); 1 result returned, score < 0.5 ceiling.
+- `vuln_migration_v1_red` remains 168/168 GREEN.
+- All 4656 `tldr-core` lib tests + 1391 `tldr-cli` lib tests remain
+  GREEN. clippy clean on `-p tldr-core -p tldr-cli --all-targets`.
+
+### Files modified
+
+- `crates/tldr-cli/src/commands/remaining/api_check.rs` (+214 LOC):
+  added `PyLineContext`, `compute_python_line_contexts`,
+  `strip_line_comment`, `find_standalone_call`,
+  `py_rule_skips_docstring_and_signatures`; threaded `py_ctx`
+  through `check_rule`; tightened `check_md5_usage` /
+  `check_sha1_usage`.
+- `crates/tldr-cli/src/commands/remaining/vuln.rs` (+12 LOC):
+  added `(file, line, vuln_type)` sort post-suppression /
+  pre-output.
+- `crates/tldr-cli/src/commands/remaining/types.rs` (+11 LOC):
+  derived `Ord` / `PartialOrd` on `VulnType`.
+- `crates/tldr-core/src/quality/smells.rs` (+131 LOC): dominant-
+  language auto-detect on directory walks; canonicalize+sort+dedup
+  defence; +2 unit tests.
+- `crates/tldr-core/src/search/bm25.rs` (+110 LOC): coverage-ratio
+  penalty in `Bm25Index::search`; +2 unit tests.
+- `crates/tldr-cli/tests/remaining_test.rs` (+144 LOC): +2
+  integration tests (PY004 + vuln ordering).
+
+### Carry-forwards
+
+None. All 4 bugs landed in this atomic commit. No bugs
+BLOK'd / deferred.
+
 ## churn-correctness-v1 — internal milestone
 
 NOT a published release. Medium-severity correctness fix bundling

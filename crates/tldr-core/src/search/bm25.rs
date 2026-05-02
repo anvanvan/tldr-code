@@ -145,6 +145,24 @@ impl Bm25Index {
     ///
     /// # Returns
     /// Vector of search results sorted by relevance score (descending)
+    ///
+    /// # Coverage penalty (analysis-precision-v1, BUG-20)
+    ///
+    /// Plain BM25 scores documents purely by per-term contribution: a query
+    /// `nonexistent_term_xyz_789` (4 query tokens after camel/snake split:
+    /// `nonexistent`, `term`, `xyz`, `789`) that matches a single rare token
+    /// (`xyz`) in one document still ranks that document close to a
+    /// hypothetical "all four matched" maximum, because the IDF of a single
+    /// rare term dominates the per-document sum.
+    ///
+    /// To prevent a single-token sub-match from masquerading as a near-perfect
+    /// hit, we apply a coverage penalty: when fewer than half of the query
+    /// tokens matched a document, multiply that document's BM25 score by the
+    /// coverage ratio (`matched / total`). The threshold is set at 0.5 so that
+    /// documents matching the majority of the query are not penalized — only
+    /// thin matches are discounted. The penalty is *multiplicative*, so a
+    /// 1-of-4 match (coverage 0.25) keeps 25% of its original score; a 3-of-4
+    /// match (coverage 0.75) is left untouched.
     pub fn search(&self, query: &str, top_k: usize) -> Vec<Bm25Result> {
         let query_tokens = self.tokenizer.tokenize(query);
 
@@ -154,6 +172,26 @@ impl Bm25Index {
 
         let n = self.documents.len() as f64;
 
+        // Total *unique* query tokens — duplicates in the user query should not
+        // inflate the denominator of the coverage ratio. matched_terms below
+        // is also unique-per-document by construction (one append per term).
+        // We preserve insertion order (deterministic output) while deduping.
+        let unique_query_tokens: Vec<String> = {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut out: Vec<String> = Vec::with_capacity(query_tokens.len());
+            for t in &query_tokens {
+                if seen.insert(t.as_str()) {
+                    out.push(t.clone());
+                }
+            }
+            out
+        };
+        let total_query_terms = unique_query_tokens.len() as f64;
+
+        // analysis-precision-v1: penalty kicks in when coverage < this ratio.
+        // 0.5 = half of query tokens must match to avoid the penalty.
+        const COVERAGE_THRESHOLD: f64 = 0.5;
+
         // Score each document
         let mut scores: Vec<(usize, f64, Vec<String>)> = Vec::new();
 
@@ -161,7 +199,7 @@ impl Bm25Index {
             let mut score = 0.0;
             let mut matched_terms = Vec::new();
 
-            for term in &query_tokens {
+            for term in &unique_query_tokens {
                 let tf = *doc.term_freqs.get(term).unwrap_or(&0) as f64;
 
                 if tf > 0.0 {
@@ -182,6 +220,15 @@ impl Bm25Index {
             }
 
             if score > 0.0 {
+                // Apply coverage penalty (analysis-precision-v1, BUG-20).
+                let coverage_ratio = if total_query_terms > 0.0 {
+                    matched_terms.len() as f64 / total_query_terms
+                } else {
+                    1.0
+                };
+                if coverage_ratio < COVERAGE_THRESHOLD {
+                    score *= coverage_ratio;
+                }
                 scores.push((doc_idx, score, matched_terms));
             }
         }
@@ -448,6 +495,67 @@ mod tests {
         assert!(
             !upper_results.is_empty(),
             "BM25 search for 'IService' against IService-containing fixture must return >= 1 result; got 0 results"
+        );
+    }
+
+    /// analysis-precision-v1, BUG-20: a 4-token query that only matches a
+    /// single rare token in a single document must NOT score near the
+    /// hypothetical 4-of-4 maximum. The coverage penalty multiplies the
+    /// BM25 sum by `matched_terms.len() / total_query_terms` whenever
+    /// coverage < 0.5.
+    ///
+    /// Before the fix: `nonexistent_term_xyz_789` (tokens: nonexistent,
+    /// term, xyz, 789) against a corpus containing only `xyz` in one doc
+    /// scored ~0.92 (close to BM25 max). After the fix the same hit gets
+    /// multiplied by 1/4 = 0.25, dropping well below 0.5.
+    #[test]
+    fn test_search_low_coverage_score_discounted() {
+        let mut index = Bm25Index::new(1.5, 0.75);
+        // 5 unrelated documents to give "xyz" a real IDF weight.
+        index.add_document("file1", "client.get(base_url=\"http://xyz.other.test\")");
+        index.add_document("file2", "fn main() { println!(\"hello world\"); }");
+        index.add_document("file3", "let total = compute_sum(items);");
+        index.add_document("file4", "import os; from pathlib import Path");
+        index.add_document("file5", "struct Config { timeout: u64 }");
+
+        let results = index.search("nonexistent_term_xyz_789", 10);
+
+        // Only file1 contains a matching token (`xyz`). 1-of-4 coverage = 0.25.
+        // Top result must exist (we still want to surface a hit) but its
+        // score must be heavily discounted (< 0.5 — the test's hard ceiling).
+        assert_eq!(
+            results.len(),
+            1,
+            "expected exactly 1 sub-match, got {}",
+            results.len()
+        );
+        assert_eq!(results[0].matched_terms, vec!["xyz".to_string()]);
+        assert!(
+            results[0].score < 0.5,
+            "low-coverage BM25 score must be < 0.5 (BUG-20 coverage penalty); got {}",
+            results[0].score
+        );
+    }
+
+    /// Companion test: a query whose tokens ALL match must NOT be penalized.
+    /// Coverage = 1.0, so the score equals plain BM25.
+    #[test]
+    fn test_search_full_coverage_score_unchanged() {
+        let mut index = Bm25Index::new(1.5, 0.75);
+        index.add_document("file1", "process user data items");
+        index.add_document("file2", "render html template");
+        index.add_document("file3", "compile rust code");
+
+        // 2-token query, both tokens in file1 → coverage = 1.0, no penalty.
+        let results = index.search("process data", 10);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].matched_terms.len(), 2);
+        // Score should be the un-penalized BM25 sum (well above the
+        // 0.5 ceiling that low-coverage hits get clamped under).
+        assert!(
+            results[0].score > 0.5,
+            "full-coverage match must keep BM25 score (no penalty); got {}",
+            results[0].score
         );
     }
 }

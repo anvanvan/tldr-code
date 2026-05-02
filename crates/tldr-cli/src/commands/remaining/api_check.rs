@@ -1429,6 +1429,19 @@ pub(crate) fn analyze_file(
     let mut prev_trimmed = String::new();
     let file_has_hashmap = matches!(language, ApiLanguage::Rust) && content.contains("HashMap");
 
+    // analysis-precision-v1, BUG-07: for Python, mark lines that are
+    // function/class signatures or live inside a triple-quoted docstring
+    // so per-line identifier matchers (PY003 / PY004 / PY006 / ...) skip
+    // them. Pre-fix `check_sha1_usage` matched the substring `sha1(` on
+    // `def _lazy_sha1(...)` (a function *signature* mentioning the name)
+    // and matched `hashlib.sha1` inside a docstring (`"""... ``hashlib.sha1``
+    // at runtime ..."""`), inflating PY004 from 1 real call site to 3.
+    let py_line_ctx: Vec<PyLineContext> = if matches!(language, ApiLanguage::Python) {
+        compute_python_line_contexts(&content)
+    } else {
+        Vec::new()
+    };
+
     for (line_num, line) in content.lines().enumerate() {
         let line_number = (line_num + 1) as u32;
         let trimmed = line.trim();
@@ -1438,12 +1451,16 @@ pub(crate) fn analyze_file(
             previous_is_loop: prev_trimmed.starts_with("for ")
                 || prev_trimmed.starts_with("while "),
         };
+        let py_ctx = py_line_ctx
+            .get(line_num)
+            .copied()
+            .unwrap_or_default();
 
         // Check each rule
         for rule in rules {
-            if let Some(finding) =
-                check_rule(rule, &file_str, line_number, line, language, &rust_ctx)
-            {
+            if let Some(finding) = check_rule(
+                rule, &file_str, line_number, line, language, &rust_ctx, py_ctx,
+            ) {
                 findings.push(finding);
             }
         }
@@ -1451,6 +1468,121 @@ pub(crate) fn analyze_file(
     }
 
     Ok(findings)
+}
+
+/// Per-line Python context computed once per file (analysis-precision-v1, BUG-07).
+///
+/// Used to suppress identifier-style API misuse matchers on lines that are
+/// not actual call sites:
+/// - `in_docstring`: line lives inside a triple-quoted (`"""` or `'''`)
+///   string literal; identifier mentions inside docstrings (e.g.
+///   ``"""...``hashlib.sha1``..."""``) are documentation, not calls.
+/// - `is_def_or_class_signature`: line opens a `def `/`async def `/`class `
+///   signature (the line itself, not its body); identifier mentions in the
+///   *name* of a function (e.g. `def _lazy_sha1(string)`) must not be
+///   treated as a call to `sha1(`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PyLineContext {
+    pub in_docstring: bool,
+    pub is_def_or_class_signature: bool,
+}
+
+/// Pre-pass: compute [`PyLineContext`] for every line of a Python file.
+///
+/// Tracks triple-quote state across lines (handles both `"""` and `'''`,
+/// including the case where the closing triple lives on the *same* line
+/// that opens it — that line is treated as fully inside a docstring for
+/// suppression purposes). The detector is conservative: when in doubt
+/// (e.g. nested string-literal edge cases the simple scanner cannot
+/// disambiguate without a real parser), it suppresses the line, since
+/// suppressing a docstring is cheaper than emitting a false positive.
+///
+/// This is **not** a full Python parser — it intentionally does NOT
+/// understand escapes, raw strings, or f-strings. It handles the
+/// docstring shape well enough to fix the BUG-07 reproducer (and the
+/// vast majority of real-world docstrings) without pulling in a
+/// tree-sitter pass for every line of every Python file.
+pub(crate) fn compute_python_line_contexts(content: &str) -> Vec<PyLineContext> {
+    let mut out = Vec::new();
+    // 0 = not in docstring; 1 = in `"""`; 2 = in `'''`.
+    let mut state: u8 = 0;
+    for line in content.lines() {
+        let stripped = strip_line_comment(line);
+        let line_starts_in_docstring = state != 0;
+
+        // Walk the line looking for triple-quote toggles.
+        let bytes = stripped.as_bytes();
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            let triple_dq = bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"';
+            let triple_sq = bytes[i] == b'\'' && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\'';
+            match state {
+                0 if triple_dq => {
+                    state = 1;
+                    i += 3;
+                    continue;
+                }
+                0 if triple_sq => {
+                    state = 2;
+                    i += 3;
+                    continue;
+                }
+                1 if triple_dq => {
+                    state = 0;
+                    i += 3;
+                    continue;
+                }
+                2 if triple_sq => {
+                    state = 0;
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        // also handle bytes 0..2 for the trailing window
+        let line_ends_in_docstring = state != 0;
+
+        // A line is "in_docstring" if it starts inside one OR ends inside one
+        // (i.e. the line opens/lives inside a triple-quoted block). A line
+        // that *only contains* the opening triple-quote and content (without
+        // closing) starts at state=0, ends at state=1 → marked as docstring.
+        let in_docstring = line_starts_in_docstring || line_ends_in_docstring;
+
+        let trimmed = line.trim_start();
+        let is_def_or_class_signature = trimmed.starts_with("def ")
+            || trimmed.starts_with("async def ")
+            || trimmed.starts_with("class ");
+
+        out.push(PyLineContext {
+            in_docstring,
+            is_def_or_class_signature,
+        });
+    }
+    out
+}
+
+/// Strip a trailing `#` comment (best-effort; ignores `#` inside string
+/// literals only at a syntactic level we can detect — we treat any `#`
+/// outside an obvious string as a comment start). Used by
+/// [`compute_python_line_contexts`] to avoid scanning triple-quotes that
+/// appear inside line comments.
+fn strip_line_comment(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    for c in line.chars() {
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+        } else if c == '"' && !in_single {
+            in_double = !in_double;
+        } else if c == '#' && !in_single && !in_double {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 struct RustLineContext<'a> {
@@ -1467,11 +1599,23 @@ fn check_rule(
     line_text: &str,
     language: ApiLanguage,
     rust_ctx: &RustLineContext<'_>,
+    py_ctx: PyLineContext,
 ) -> Option<MisuseFinding> {
     let trimmed = line_text.trim();
 
     // Skip comments
     if is_comment_line(trimmed, language) {
+        return None;
+    }
+
+    // analysis-precision-v1, BUG-07: Python identifier-style rules must
+    // not match docstring lines or `def`/`class` signature lines (only
+    // real call sites). Apply the suppression centrally so individual
+    // checkers don't have to re-implement it.
+    if matches!(language, ApiLanguage::Python)
+        && py_rule_skips_docstring_and_signatures(rule.id.as_str())
+        && (py_ctx.in_docstring || py_ctx.is_def_or_class_signature)
+    {
         return None;
     }
 
@@ -1490,6 +1634,43 @@ fn check_rule(
         "RS006" => check_clone_in_hot_loop(rule, file, line, trimmed, rust_ctx),
         _ => check_regex_rule(rule, file, line, trimmed, language),
     }
+}
+
+/// Find an occurrence of `name(` in `line_text` that is *not* preceded by
+/// an identifier character (`a-z`, `A-Z`, `0-9`, `_`). Returns the byte
+/// offset of `name(` if such an occurrence exists. This rules out
+/// substring matches against bigger identifiers (e.g. `_lazy_sha1(` for
+/// `name = "sha1"`).
+///
+/// (analysis-precision-v1, BUG-07)
+fn find_standalone_call(line_text: &str, name: &str) -> Option<usize> {
+    let needle = format!("{}(", name);
+    let bytes = line_text.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = line_text[start..].find(&needle) {
+        let abs = start + rel;
+        let prev_ok = abs == 0
+            || {
+                let p = bytes[abs - 1];
+                !(p.is_ascii_alphanumeric() || p == b'_')
+            };
+        if prev_ok {
+            return Some(abs);
+        }
+        start = abs + 1;
+    }
+    None
+}
+
+/// Whether a Python rule's matcher should be suppressed on docstring /
+/// `def`/`class` signature lines. Returns `true` for rules whose detection
+/// is identifier-style (substring of an API name) — false for rules that
+/// inherently require a body-statement context (like `PY002` bare-except,
+/// which already requires `except:` syntax).
+///
+/// (analysis-precision-v1, BUG-07)
+fn py_rule_skips_docstring_and_signatures(rule_id: &str) -> bool {
+    matches!(rule_id, "PY003" | "PY004" | "PY005" | "PY006")
 }
 
 fn is_comment_line(trimmed: &str, language: ApiLanguage) -> bool {
@@ -1613,11 +1794,18 @@ fn check_md5_usage(
     line: u32,
     line_text: &str,
 ) -> Option<MisuseFinding> {
-    // Look for hashlib.md5 usage
-    if line_text.contains("hashlib.md5") || line_text.contains("md5(") {
+    // analysis-precision-v1, BUG-07: require either the `hashlib.md5`
+    // qualified form (with the leading dot, so `hashlib.md5(...)` matches
+    // but `_my_hashlib.md5_helper` does not) OR a *standalone* `md5(`
+    // call — i.e. `md5(` not preceded by an identifier character. This
+    // blocks substring matches against function names that *contain*
+    // `md5` (e.g. `def compute_md5(...)`).
+    let has_qualified = line_text.contains("hashlib.md5");
+    let has_standalone_call = find_standalone_call(line_text, "md5").is_some();
+    if has_qualified || has_standalone_call {
         let column = line_text
             .find("hashlib.md5")
-            .or_else(|| line_text.find("md5("))
+            .or_else(|| find_standalone_call(line_text, "md5"))
             .unwrap_or(0) as u32;
         return Some(MisuseFinding {
             file: file.to_string(),
@@ -1643,11 +1831,18 @@ fn check_sha1_usage(
     line: u32,
     line_text: &str,
 ) -> Option<MisuseFinding> {
-    // Look for hashlib.sha1 usage
-    if line_text.contains("hashlib.sha1") || line_text.contains("sha1(") {
+    // analysis-precision-v1, BUG-07: require either the `hashlib.sha1`
+    // qualified form (with the leading dot) OR a *standalone* `sha1(`
+    // call — i.e. `sha1(` not preceded by an identifier character. This
+    // blocks substring matches against function names that *contain*
+    // `sha1` (e.g. `def _lazy_sha1(string)` from flask's
+    // `src/flask/sessions.py:276`, which was the original BUG-07 FP).
+    let has_qualified = line_text.contains("hashlib.sha1");
+    let has_standalone_call = find_standalone_call(line_text, "sha1").is_some();
+    if has_qualified || has_standalone_call {
         let column = line_text
             .find("hashlib.sha1")
-            .or_else(|| line_text.find("sha1("))
+            .or_else(|| find_standalone_call(line_text, "sha1"))
             .unwrap_or(0) as u32;
         return Some(MisuseFinding {
             file: file.to_string(),
