@@ -4516,32 +4516,66 @@ fn extract_c_function_name(node: &Node, source: &str) -> Option<String> {
 }
 
 /// Extract the identifier name from a function_declarator node.
-/// Handles pointer_declarator wrapping (e.g., `*get_ptr`).
+///
+/// Handles the C and C++ tree-sitter grammars' declarator chains.
+/// For plain C: `int foo(...)` -> declarator is `identifier`.
+/// For C with pointer: `void *get_ptr(...)` -> `pointer_declarator(identifier)`.
+/// For C++ inline class methods: `void bar() {}` inside a class body emits
+/// `field_identifier` (NOT `identifier`) — cpp-method-name-extraction-v1.
+/// For C++ out-of-class definitions: `void Foo::bar() {}` emits
+/// `qualified_identifier` (we extract the unqualified `name` field so the
+/// returned name matches the inline-method form, which is what overload
+/// distinction and `methods: [String]` consumers expect).
+/// For C++ destructors: `~Foo()` -> `destructor_name`.
+/// For C++ operators: `operator+()` -> `operator_name`.
 fn extract_name_from_function_declarator(func_decl: &Node, source: &str) -> Option<String> {
-    if let Some(name_node) = func_decl.child_by_field_name("declarator") {
-        if name_node.kind() == "identifier" {
-            return Some(get_node_text(&name_node, source));
+    let name_node = func_decl.child_by_field_name("declarator")?;
+    extract_name_from_declarator_inner(&name_node, source)
+}
+
+/// Recursively unwrap a declarator chain to find the leaf identifier.
+/// Walks through `pointer_declarator` / `reference_declarator` wrappers
+/// (e.g., `*get_ptr`, `&value`) and resolves C++ qualified / destructor /
+/// operator names. Returns `None` if the chain bottoms out on something
+/// we don't recognise (caller substitutes "" — see `extract_c_function_name`).
+fn extract_name_from_declarator_inner(node: &Node, source: &str) -> Option<String> {
+    match node.kind() {
+        // Plain identifier (C functions, parameter names).
+        "identifier" => Some(get_node_text(node, source)),
+        // C++ class/struct member declarator (inline method bodies).
+        // tree-sitter-cpp 0.23.x emits `field_identifier` here, not `identifier`.
+        "field_identifier" => Some(get_node_text(node, source)),
+        // C++ destructor: `~Foo`.
+        "destructor_name" => Some(get_node_text(node, source)),
+        // C++ operator: `operator+`, `operator()`, etc. Stored verbatim.
+        "operator_name" => Some(get_node_text(node, source)),
+        // C++ qualified out-of-class method: `void Foo::bar() {}`.
+        // We return the unqualified name so it matches the inline form
+        // (and so `methods: [String]` shows "bar" not "Foo::bar").
+        "qualified_identifier" | "scoped_identifier" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                return extract_name_from_declarator_inner(&name, source);
+            }
+            // Fallback: full text (preserves backward-compat for unusual cases).
+            Some(get_node_text(node, source))
         }
-        // pointer_declarator wrapping: void *get_ptr(...)
-        if name_node.kind() == "pointer_declarator" {
-            let mut cursor = name_node.walk();
-            for child in name_node.children(&mut cursor) {
-                if child.kind() == "identifier" {
-                    return Some(get_node_text(&child, source));
+        // Wrappers: `*name`, `&name`, etc. Recurse on inner declarator field.
+        "pointer_declarator" | "reference_declarator" => {
+            if let Some(inner) = node.child_by_field_name("declarator") {
+                return extract_name_from_declarator_inner(&inner, source);
+            }
+            // Some grammars don't expose a `declarator` field on these
+            // wrappers — fall back to scanning children.
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(name) = extract_name_from_declarator_inner(&child, source) {
+                    return Some(name);
                 }
             }
+            None
         }
-        // qualified_identifier for C++ (e.g., ClassName::method)
-        if name_node.kind() == "qualified_identifier" {
-            // Return the full qualified name
-            return Some(get_node_text(&name_node, source));
-        }
-        // destructor_name for C++ (e.g., ~ClassName)
-        if name_node.kind() == "destructor_name" {
-            return Some(get_node_text(&name_node, source));
-        }
+        _ => None,
     }
-    None
 }
 
 fn extract_c_params(node: &Node, source: &str) -> Vec<String> {

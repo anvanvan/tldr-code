@@ -1,5 +1,104 @@
 # Changelog
 
+## cpp-method-name-extraction-v1 — internal milestone
+
+NOT a published release. Fixes `tldr structure --lang cpp` emitting empty
+strings (`""`) in the legacy flat `methods: [String]` field for inline
+class methods. Pre-fix, `class Foo { void bar() {} void bar(int x) {} };`
+yielded `methods: ["", "", ""]` while the companion
+`method_infos: [{name,line}]` view (added by
+`structure-method-infos-all-langs-v1`) correctly showed three `bar`
+entries — a confusing inconsistency for JSON consumers.
+
+### Root cause
+
+`extract_name_from_function_declarator` in
+`crates/tldr-core/src/ast/extract.rs` only matched `identifier`,
+`pointer_declarator`, `qualified_identifier`, and `destructor_name` as
+the leaf of a `function_declarator`'s `declarator` field. The
+tree-sitter-cpp 0.23.x grammar emits `field_identifier` (NOT
+`identifier`) for class-body inline method definitions:
+
+```
+function_definition
+  function_declarator field=declarator
+    field_identifier field=declarator: "bar"   ← leaf
+```
+
+So the chain bottomed out unmatched and returned `None`, which the
+caller substituted with an empty string into
+`ClassInfo.methods[].name` — which `extractor.rs::extract_structure`
+then flattened into the legacy `methods: [String]` array. The
+`definitions` view (which feeds `method_infos`) takes a different code
+path that already handles `field_identifier`, so the two views
+disagreed.
+
+### Fix
+
+Refactored `extract_name_from_function_declarator` to delegate to a new
+recursive helper `extract_name_from_declarator_inner` that walks the
+declarator chain explicitly. The helper now matches all six leaf forms
+the cpp grammar can produce:
+
+- `identifier` — plain C functions and parameters.
+- `field_identifier` — C++ class/struct member declarators (the bug).
+- `destructor_name` — `~Foo`.
+- `operator_name` — `operator+`, `operator()`, etc. (newly handled).
+- `qualified_identifier` / `scoped_identifier` — out-of-class definitions
+  like `void Foo::bar() {}`. The helper recurses into the `name` field
+  and returns the unqualified name (`"bar"`, not `"Foo::bar"`) so the
+  out-of-class form collates with the inline form in `methods`.
+- `pointer_declarator` / `reference_declarator` — recurse on inner
+  `declarator`, with a children-scan fallback for grammars that omit
+  the field.
+
+The C-only call sites (`int foo(...)`, `void *get_ptr(...)`) keep
+working because `identifier` and `pointer_declarator(identifier)` are
+still on the matched-leaves list. No call-site changes — the helper
+preserves the same `Option<String>` contract.
+
+### Verification
+
+```text
+$ tldr structure --lang cpp /tmp/cpp_overloads.cpp \
+    | jq '.files[0].methods'
+# pre-fix:  ["", "", ""]
+# post-fix: ["bar", "bar", "bar"]
+
+$ tldr structure --lang cpp /tmp/repos/cpp-tinyxml2 \
+    | jq '[.files[].methods[]?] | unique | .[:5]'
+# post-fix: ["CloseElement","Push","TestDocLines","TestFileLines","TestParseError"]
+```
+
+Tests added:
+
+- `crates/tldr-cli/tests/cpp_method_name_extraction_v1.rs::test_cpp_overload_method_names_extracted`
+  — three-overload class, asserts `methods == ["bar","bar","bar"]` and
+  three `method_infos` entries with distinct `line` values.
+- `crates/tldr-cli/tests/cpp_method_name_extraction_v1.rs::test_cpp_qualified_method_name`
+  — out-of-class `void Foo::bar() {}`, asserts unqualified name `"bar"`
+  appears in `functions` and that no entries are empty strings.
+
+The pre-existing
+`structure_method_infos_all_langs_v1::test_structure_method_infos_distinguishes_overloads_cpp_kotlin_scala`
+test now passes on its cpp leg (was failing pre-fix on the legacy
+`methods` count assertion). Kotlin and Scala legs were unaffected.
+
+Files modified:
+
+- `crates/tldr-core/src/ast/extract.rs` — refactored helper, added doc
+  comments documenting the cpp grammar shape.
+- `crates/tldr-cli/tests/cpp_method_name_extraction_v1.rs` — new
+  regression coverage.
+
+### Carry-forwards
+
+The `tldr secure -f json` test
+`secure_sweep_tests::test_secure_sub_results_structure` is failing on
+HEAD `b80cb9a` (pre-existing, unrelated to this milestone — caused by
+the fast-path commit changing the `secure` JSON shape). Triage left to
+the M-Z-FINAL re-audit.
+
 ## fastpath-extend-non-vuln-v1 — internal milestone
 
 NOT a published release. Extends the per-function substring fast-path
