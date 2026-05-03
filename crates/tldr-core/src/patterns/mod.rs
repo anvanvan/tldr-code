@@ -323,19 +323,48 @@ impl PatternMiner {
         let source_files = collect_files(&tree, path);
 
         for file_path in source_files {
-            let file_lang = match lang {
-                Some(l) => l,
-                None => match Language::from_path(&file_path) {
-                    Some(l) => l,
-                    None => continue,
-                },
+            // fastpath-extend-non-vuln-v1: when `lang` is provided, restrict
+            // to files whose extension actually matches that language (mirrors
+            // the BUG-java-debt-stackoverflow-v1 fix in `quality/debt.rs`).
+            //
+            // Pre-fix, `lang = Some(luau)` against a C++ codebase like
+            // `luau-luau` would force-parse every `.cpp`/`.h` file as luau,
+            // producing pathological tree-sitter ASTs and pushing
+            // `tldr patterns` past 60 s on a 122-luau-file repo (BEFORE
+            // measurement: timeout >60s; AFTER: <2s).
+            let detected = Language::from_path(&file_path);
+            let file_lang = match (lang, detected) {
+                // User specified language and file matches: use it.
+                (Some(forced), Some(d)) if d == forced => forced,
+                // User specified language but extension is a different known
+                // language: skip (don't force-parse a `.cpp` as luau).
+                (Some(_), Some(_)) => continue,
+                // User specified language and extension is unknown
+                // (e.g. `dictionary.txt`, `lua_dict.txt`): SKIP. The
+                // alternative would be to force-parse the file under the
+                // override grammar, which on real-world Lua repos
+                // (`lua-lsp/meta/spell/dictionary.txt`, ~1.3 MB) hung
+                // tree-sitter for >5 minutes. Restricting `--lang` to
+                // matching extensions is the semantically correct
+                // interpretation ("analyze <language> files only") and
+                // avoids the pathological-AST timeout.
+                (Some(_), None) => continue,
+                // No override: only include files we can detect.
+                (None, Some(d)) => d,
+                (None, None) => continue,
             };
 
-            // Filter by language if specified
-            if let Some(filter_lang) = lang {
-                if file_lang != filter_lang {
-                    continue;
-                }
+            // fastpath-extend-non-vuln-v1: enforce the central oversize
+            // policy at collection time. The pattern miner reads files via
+            // `std::fs::read_to_string` and dispatches them through
+            // `ParserPool::parse(content, …)` (NOT through the path-based
+            // `parse_file_with_lang` chokepoint that already enforces the
+            // policy), so an extra check here is required for
+            // auto-generated / minified artefacts to be skipped uniformly.
+            if let crate::fs::oversize::SizeCheck::Oversize { .. } =
+                crate::fs::oversize::check_size(&file_path)
+            {
+                continue;
             }
 
             files.push((file_path, file_lang));

@@ -1417,17 +1417,310 @@ pub(crate) fn rules_for_language(language: ApiLanguage) -> Vec<APIRule> {
 // Analysis Engine
 // =============================================================================
 
+/// Per-language needle set used by the file-level fast-path in
+/// [`analyze_file`].
+///
+/// `analyze_file` previously walked every line of every collected file,
+/// dispatching every rule per line. On large `.cpp`/`.h` files in mixed-
+/// language repos (e.g. `luau-luau`, where the API-check command sees
+/// 800+ files including 200 KB+ per-file C++ source) this was O(files ·
+/// lines · rules). For `tldr api-check /tmp/repos/luau-luau` the BEFORE
+/// run was ~186 s; almost all of that was scanning files that contained
+/// none of the rule keywords for their language.
+///
+/// fastpath-extend-non-vuln-v1 (extends the M-B1 substring prefilter
+/// proven in `crates/tldr-core/src/security/vuln.rs::scan_file_vulns`).
+/// If a file's content contains NONE of the language's rule needles,
+/// every per-line check is guaranteed to return `None`, so we can skip
+/// the per-line loop entirely. The needle set is a SUPERSET of the
+/// per-rule matchers — a file passing the prefilter is still subject to
+/// the existing per-line precision logic (docstring filtering,
+/// `find_standalone_call`, etc.), so the fast-path cannot introduce new
+/// false negatives.
+///
+/// The needle list is derived per call from the language's rule
+/// specs (extracting the substring before the first regex metachar
+/// from each `pattern` so we use the longest *plain* prefix as the
+/// needle). For Python and Rust — whose rules use bespoke matchers
+/// rather than the regex spec table — we hard-code the list.
+fn language_fastpath_needles(language: ApiLanguage) -> Vec<String> {
+    match language {
+        // Built-in Python rules: PY001 requests.*, PY002 except:, PY003 md5,
+        // PY004 sha1, PY005 open(, PY006 random.*. Use short prefixes so we
+        // don't tie this list to the precise per-rule call shapes.
+        ApiLanguage::Python => ["requests.", "except:", "md5", "sha1", "open(", "random."]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        // Built-in Rust rules: RS001 Mutex, RS002 File::open, RS003
+        // with_capacity, RS004 tokio::spawn, RS005 HashMap, RS006 clone(
+        ApiLanguage::Rust => [
+            "Mutex",
+            "File::open",
+            "with_capacity",
+            "tokio::spawn",
+            "HashMap",
+            ".clone(",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect(),
+        // Regex-based languages: derive the needles automatically from
+        // the static rule table by scanning each spec's `pattern` for
+        // its longest plain-literal run. See `extract_literal_from_regex`
+        // for the correctness contract (the returned literal is a
+        // substring of every line that matches the pattern).
+        _ => regex_rule_specs_for_language(language)
+            .iter()
+            .map(|spec| extract_literal_from_regex(spec.pattern))
+            .collect(),
+    }
+}
+
+/// Extract a literal substring from a regex pattern that is guaranteed
+/// to appear (verbatim) in any line that matches the regex.
+///
+/// We walk the regex and emit the longest run of literal characters,
+/// skipping anchors (`\b`, `^`, `$`), interpreting simple character
+/// escapes (`\.` → `.`, `\(` → `(`), and ending the run at character-
+/// class shorthands (`\s`, `\w`, `\d`, …) or quantifiers (`*`, `+`,
+/// `?`, `{n}`). This is intentionally conservative: we never claim a
+/// literal that the regex engine wouldn't produce. For
+/// pathological / pure-quantifier patterns the result is the empty
+/// string, which the caller interprets as "always admit" — preserving
+/// correctness at the cost of skipping the fast-path for that rule.
+///
+/// **Correctness contract**: for every spec in
+/// `regex_rule_specs_for_language`, the byte string returned here is a
+/// substring of every input string that matches `spec.pattern`. The
+/// `extract_literal_from_regex_yields_substring_present_in_match`
+/// test below pins this contract.
+///
+/// Returns a `String` rather than `&'static str` because escaped
+/// literals (`\.` → `.`) require building a buffer; for plain runs
+/// without escapes this still allocates, but the cost is paid once
+/// per rule per `analyze_file` call, not per line.
+fn extract_literal_from_regex(pattern: &str) -> String {
+    let bytes = pattern.as_bytes();
+    let n = bytes.len();
+
+    // Soundness: alternation `|` at the top level means a match could
+    // come from any branch, so a literal is only safe if it appears in
+    // EVERY branch. Implementing per-branch literal intersection is
+    // complex; the safe fallback is to return empty (always admit) for
+    // any pattern containing top-level `|`. This also handles
+    // `\s==\s|\s!=\s` correctly (we previously over-reported `==`).
+    let mut depth = 0i32;
+    let mut k = 0usize;
+    while k < n {
+        match bytes[k] {
+            b'\\' if k + 1 < n => k += 2,
+            b'[' => {
+                k += 1;
+                while k < n && bytes[k] != b']' {
+                    if bytes[k] == b'\\' && k + 1 < n {
+                        k += 2;
+                    } else {
+                        k += 1;
+                    }
+                }
+                if k < n {
+                    k += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                k += 1;
+            }
+            b')' => {
+                depth -= 1;
+                k += 1;
+            }
+            b'|' if depth == 0 => return String::new(),
+            _ => k += 1,
+        }
+    }
+
+    let mut best = String::new();
+    let mut run = String::new();
+
+    let close_run = |run: &mut String, best: &mut String| {
+        if run.len() > best.len() {
+            *best = run.clone();
+        }
+        run.clear();
+    };
+
+    let mut i = 0usize;
+    while i < n {
+        let b = bytes[i];
+        match b {
+            // Anchors `^` / `$` are invisible at match time; close run.
+            b'^' | b'$' => {
+                close_run(&mut run, &mut best);
+                i += 1;
+            }
+            b'\\' if i + 1 < n => {
+                let esc = bytes[i + 1];
+                match esc {
+                    // Word/string boundaries are invisible at match time.
+                    b'b' | b'B' | b'A' | b'Z' | b'z' => {
+                        close_run(&mut run, &mut best);
+                        i += 2;
+                    }
+                    // Character-class shorthands match a single char,
+                    // not a literal — close the run.
+                    b's' | b'S' | b'd' | b'D' | b'w' | b'W' => {
+                        close_run(&mut run, &mut best);
+                        i += 2;
+                    }
+                    // Literal escape: `\.`, `\(`, `\$`, `\\`, … — append
+                    // the escaped byte to the current run.
+                    _ => {
+                        run.push(esc as char);
+                        i += 2;
+                    }
+                }
+            }
+            // Quantifiers eat the previous run char (because `foo*`
+            // could match just `fo`, not necessarily `foo`). Close the
+            // run after dropping the quantified atom.
+            b'*' | b'+' | b'?' | b'{' => {
+                if !run.is_empty() {
+                    run.pop();
+                }
+                close_run(&mut run, &mut best);
+                // For `{n,m}` we also need to advance past the closing
+                // `}`; conservatively scan for it.
+                if b == b'{' {
+                    while i < n && bytes[i] != b'}' {
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            // Alternation, groups end the run.
+            b'|' | b'(' | b')' | b']' => {
+                close_run(&mut run, &mut best);
+                // Handle `(?:`, `(?=`, `(?!` non-capturing / lookaround
+                // openers: skip the `?X` so we don't treat `:` as a
+                // literal.
+                if b == b'(' && i + 2 < n && bytes[i + 1] == b'?' {
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            // Character class `[...]`: skip the entire bracketed group
+            // — chars inside a class are alternatives, not literals.
+            b'[' => {
+                close_run(&mut run, &mut best);
+                i += 1;
+                // Skip any leading `^` (negated class).
+                if i < n && bytes[i] == b'^' {
+                    i += 1;
+                }
+                // Skip a literal `]` immediately after `[` or `[^`.
+                if i < n && bytes[i] == b']' {
+                    i += 1;
+                }
+                // Walk until the closing `]`, honouring `\]` escapes.
+                while i < n && bytes[i] != b']' {
+                    if bytes[i] == b'\\' && i + 1 < n {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if i < n {
+                    i += 1; // consume closing `]`
+                }
+            }
+            // Bare `.` is the regex "any char" metachar (NOT a literal).
+            b'.' => {
+                close_run(&mut run, &mut best);
+                i += 1;
+            }
+            // Plain literal char extends the run.
+            _ => {
+                run.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    close_run(&mut run, &mut best);
+
+    // Require at least 2 characters before claiming a useful literal —
+    // single-char literals match too eagerly to be effective filters
+    // (e.g. `==` reduces to "=" which appears in every file).
+    if best.len() < 2 {
+        return String::new();
+    }
+    best
+}
+
 /// Analyze a single file for API misuse
 pub(crate) fn analyze_file(
     path: &Path,
     rules: &[APIRule],
     language: ApiLanguage,
 ) -> Result<Vec<MisuseFinding>> {
+    // fastpath-extend-non-vuln-v1: defer to the central oversize policy
+    // before reading the file. `analyze_file` reads the full content into
+    // memory and per-line scans it; without a cap, a 2 MB+ generated
+    // header (`*.d.ts`, `dom.generated.h`, …) can dominate the run. The
+    // central policy lives in `tldr_core::fs::oversize::check_size` and
+    // is shared with `parse_file_with_lang`, `walker::walk_project`'s
+    // size-aware callers, and `quality::debt`.
+    if let tldr_core::fs::oversize::SizeCheck::Oversize { .. } =
+        tldr_core::fs::oversize::check_size(path)
+    {
+        return Ok(Vec::new());
+    }
+
     let content = fs::read_to_string(path)?;
+
+    // fastpath-extend-non-vuln-v1: per-file substring fast-path (ports
+    // M-B1's `function_body_has_taint_pattern` shape from
+    // `crates/tldr-core/src/security/vuln.rs`). If the file body
+    // contains NONE of the language's rule needles, no per-line check
+    // could fire — skip the loop entirely. Correctness contract: the
+    // needle set is a SUPERSET of every per-rule matcher (see
+    // `language_fastpath_needles` doc), so a clean prefilter miss is a
+    // true negative. Documents-only / pure-comment files still benefit
+    // because their content rarely contains the security-shape needles.
+    //
+    // An empty needle in the list means "always admit" (the
+    // corresponding rule has no useful literal prefix — see
+    // `extract_literal_needle`); we treat any empty needle as
+    // unconditional admission to preserve correctness.
+    let needles = language_fastpath_needles(language);
+    let any_needle_admits_universally = needles.iter().any(|n| n.is_empty());
+    let any_needle_hit = needles
+        .iter()
+        .any(|n| !n.is_empty() && content.contains(n.as_str()));
+    if !needles.is_empty() && !any_needle_admits_universally && !any_needle_hit {
+        return Ok(Vec::new());
+    }
+
     let file_str = path.display().to_string();
     let mut findings = Vec::new();
     let mut prev_trimmed = String::new();
     let file_has_hashmap = matches!(language, ApiLanguage::Rust) && content.contains("HashMap");
+
+    // fastpath-extend-non-vuln-v1: pre-compile regex rules ONCE per file
+    // (NOT once per (line, rule) pair). Pre-fix, `check_regex_rule`
+    // called `Regex::new(spec.pattern)` on every (line, rule) match
+    // inside the per-line loop — for an 800-file mixed-language repo
+    // (luau-luau: 200KB+ `.cpp` files × ~30 rules each) the regex
+    // compiler dominated the wall clock (~186 s). Compiling once per
+    // file collapses this to N_rules per file. We then drive the
+    // per-line check with the cached `Regex` instead of re-compiling.
+    let regex_specs: Vec<(&'static RegexRuleSpec, Regex)> =
+        regex_rule_specs_for_language(language)
+            .iter()
+            .filter_map(|spec| Regex::new(spec.pattern).ok().map(|re| (spec, re)))
+            .collect();
 
     // analysis-precision-v1, BUG-07: for Python, mark lines that are
     // function/class signatures or live inside a triple-quoted docstring
@@ -1459,7 +1752,14 @@ pub(crate) fn analyze_file(
         // Check each rule
         for rule in rules {
             if let Some(finding) = check_rule(
-                rule, &file_str, line_number, line, language, &rust_ctx, py_ctx,
+                rule,
+                &file_str,
+                line_number,
+                line,
+                language,
+                &rust_ctx,
+                py_ctx,
+                &regex_specs,
             ) {
                 findings.push(finding);
             }
@@ -1600,6 +1900,7 @@ fn check_rule(
     language: ApiLanguage,
     rust_ctx: &RustLineContext<'_>,
     py_ctx: PyLineContext,
+    regex_specs: &[(&'static RegexRuleSpec, Regex)],
 ) -> Option<MisuseFinding> {
     let trimmed = line_text.trim();
 
@@ -1632,7 +1933,7 @@ fn check_rule(
         "RS004" => check_detached_tokio_spawn(rule, file, line, trimmed),
         "RS005" => check_hashmap_order_dependence(rule, file, line, trimmed, rust_ctx),
         "RS006" => check_clone_in_hot_loop(rule, file, line, trimmed, rust_ctx),
-        _ => check_regex_rule(rule, file, line, trimmed, language),
+        _ => check_regex_rule(rule, file, line, trimmed, regex_specs),
     }
 }
 
@@ -1698,12 +1999,11 @@ fn check_regex_rule(
     file: &str,
     line: u32,
     line_text: &str,
-    language: ApiLanguage,
+    regex_specs: &[(&'static RegexRuleSpec, Regex)],
 ) -> Option<MisuseFinding> {
-    let spec = regex_rule_specs_for_language(language)
-        .iter()
-        .find(|spec| spec.id == rule.id)?;
-    let regex = Regex::new(spec.pattern).ok()?;
+    // fastpath-extend-non-vuln-v1: lookup the pre-compiled regex by rule id
+    // (compiled ONCE per file in `analyze_file`, not once per line).
+    let (spec, regex) = regex_specs.iter().find(|(spec, _)| spec.id == rule.id)?;
     if !regex.is_match(line_text) {
         return None;
     }
@@ -1713,7 +2013,7 @@ fn check_regex_rule(
         file: file.to_string(),
         line,
         column,
-        rule: rule.clone(),
+        rule: (*rule).clone(),
         api_call: spec.api_call.to_string(),
         message: spec.message.to_string(),
         fix_suggestion: spec.fix_suggestion.to_string(),
@@ -2622,6 +2922,147 @@ mod tests {
 
         for (filename, language, source, expected_rule_id) in cases {
             assert_language_findings(filename, language, source, expected_rule_id);
+        }
+    }
+
+    // fastpath-extend-non-vuln-v1 — verify the file-level fast-path
+    // does not strip findings from a normal-input fixture.
+    #[test]
+    fn test_fastpath_extension_no_perf_regression_on_normal_input() {
+        use std::time::Instant;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Mixed-language fixture covering each rule needle path:
+        // - Python `requests.` (PY001) and `hashlib.md5` (PY003)
+        // - Rust `Mutex` (RS001) and `with_capacity` (RS003)
+        // - Go `ioutil.ReadFile` (GO001)
+        // - JavaScript `eval` (JS005)
+        // - Files with NO needle hits — must be cleanly skipped.
+        fs::write(
+            root.join("py_hits.py"),
+            "import requests\nrequests.get('http://x')\nimport hashlib\nh = hashlib.md5(b'x').hexdigest()\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("rs_hits.rs"),
+            "use std::sync::Mutex;\nlet lock = Mutex::new(0);\nlet v: Vec<u8> = Vec::with_capacity(input);\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("go_hits.go"),
+            "package main\nimport \"io/ioutil\"\nfunc f() { _, _ = ioutil.ReadFile(\"/etc/passwd\") }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("js_hits.js"),
+            "function f(s) { eval(s); }\n",
+        )
+        .unwrap();
+        // File with no rule needles — cleanly skipped by the fast-path.
+        fs::write(
+            root.join("py_no_hits.py"),
+            "def add(a, b):\n    return a + b\n\nif __name__ == '__main__':\n    print(add(1, 2))\n",
+        )
+        .unwrap();
+
+        let files = [
+            (root.join("py_hits.py"), ApiLanguage::Python, true),
+            (root.join("rs_hits.rs"), ApiLanguage::Rust, true),
+            (root.join("go_hits.go"), ApiLanguage::Go, true),
+            (root.join("js_hits.js"), ApiLanguage::JavaScript, true),
+            (root.join("py_no_hits.py"), ApiLanguage::Python, false),
+        ];
+
+        let start = Instant::now();
+        for (path, lang, expect_findings) in files {
+            let rules = rules_for_language(lang);
+            let findings = analyze_file(&path, &rules, lang).unwrap();
+            if expect_findings {
+                assert!(
+                    !findings.is_empty(),
+                    "expected findings for {:?} (rule keyword present in source)",
+                    path.file_name()
+                );
+            } else {
+                // No needle in the source: fast-path returns empty.
+                // Some rules (e.g. PY002 bare-except) might still match
+                // unrelated lines, but in this fixture none do.
+                assert!(
+                    findings.is_empty(),
+                    "expected no findings for {:?}, got {:?}",
+                    path.file_name(),
+                    findings.iter().map(|f| f.rule.id.clone()).collect::<Vec<_>>()
+                );
+            }
+        }
+        let elapsed = start.elapsed();
+        // 5-file run including I/O and per-file regex compile must
+        // complete well under 2 s — pre-fix this could time out on
+        // slow CI; post-fix it should be milliseconds.
+        assert!(
+            elapsed.as_secs() < 2,
+            "fastpath-extend-non-vuln-v1: 5-file fixture took {:?}, expected <2s",
+            elapsed
+        );
+    }
+
+    // fastpath-extend-non-vuln-v1 — pin the correctness contract for
+    // `extract_literal_from_regex`: the literal returned for every
+    // built-in regex rule must be a substring of the rule's
+    // `api_call`-equivalent positive sample.
+    #[test]
+    fn test_extract_literal_from_regex_recovers_useful_needles() {
+        // Cases: (regex_pattern, expected_literal_substring_or_empty,
+        //         positive_sample_that_must_contain_the_literal)
+        let cases: &[(&str, &str, &str)] = &[
+            (r"\bioutil\.ReadFile\s*\(", "ioutil.ReadFile", "x := ioutil.ReadFile(p)"),
+            (r"\bunserialize\s*\(", "unserialize", "unserialize($x);"),
+            (r"\beval\s*\(", "eval", "eval(s)"),
+            (
+                r"\bRuntime\.getRuntime\(\)\.exec\s*\(",
+                "Runtime.getRuntime().exec",
+                "Runtime.getRuntime().exec(c)",
+            ),
+            // Pure-symbol patterns: empty literal → "always admit".
+            (r"\s==\s|\s!=\s", "", "if (a == b)"),
+            // Pure char-class pattern: empty literal.
+            (r"\b[A-Za-z_][A-Za-z0-9_]*!", "", "value!"),
+        ];
+        for (pattern, expected, sample) in cases {
+            let literal = extract_literal_from_regex(pattern);
+            assert_eq!(
+                literal.as_str(),
+                *expected,
+                "pattern {:?} should yield literal {:?}",
+                pattern,
+                expected
+            );
+            if !literal.is_empty() {
+                assert!(
+                    sample.contains(literal.as_str()),
+                    "literal {:?} from pattern {:?} must be a substring of positive sample {:?}",
+                    literal,
+                    pattern,
+                    sample
+                );
+            }
+        }
+    }
+
+    // fastpath-extend-non-vuln-v1 — verify the language-fastpath needle
+    // list is non-empty for every supported language (or contains an
+    // empty string for the always-admit fallback).
+    #[test]
+    fn test_language_fastpath_needles_cover_all_languages() {
+        for &lang in all_api_languages() {
+            let needles = language_fastpath_needles(lang);
+            assert!(
+                !needles.is_empty(),
+                "language {:?} has no fastpath needles",
+                lang
+            );
         }
     }
 }

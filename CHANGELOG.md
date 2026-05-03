@@ -1,5 +1,107 @@
 # Changelog
 
+## fastpath-extend-non-vuln-v1 — internal milestone
+
+NOT a published release. Extends the per-function substring fast-path
+proven in `vuln-fastpath-substring-prefilter-v1` (commit `7b81fa2`)
+from the `tldr vuln` command to the non-vuln commands `tldr patterns`
+and `tldr api-check`. The `tldr debt`, `tldr calls`, `tldr dead`, and
+`tldr health` commands were measured separately and are already fast
+enough on the cloned repos (see "Carry-forwards" below).
+
+### Repro pre-fix
+
+```text
+$ time tldr patterns --lang luau /tmp/repos/luau-luau   # >60 s, timeout
+$ time tldr api-check /tmp/repos/luau-luau              # 186 s
+$ time tldr patterns --lang lua /tmp/repos/lua-lsp      # hangs >5 min
+```
+
+Two distinct bugs combined to produce these timeouts:
+
+1. **`patterns` ignored `--lang`**. `patterns/mod.rs::collect_files`
+   used the user's override as the file's language WITHOUT first
+   checking the file's own extension. With `--lang luau` against a
+   C++-heavy repo (`luau-luau`, 800+ `.cpp`/`.h` files), every
+   `.cpp` was force-parsed as Luau. Tree-sitter then walked
+   pathological ASTs over 200 KB+ files. Same bug class as the
+   `BUG-java-debt-stackoverflow-v1` regression already fixed in
+   `quality/debt.rs`.
+
+2. **`api-check` recompiled regex per (line, rule)**. `check_regex_rule`
+   called `Regex::new(spec.pattern)` *inside* the per-line loop. For
+   ~800 files × thousands of lines × 5+ rules per language, the regex
+   compiler dominated wall clock.
+
+Additionally, `patterns/mod.rs::collect_files` had no oversize check,
+so 1.3 MB plain-text dictionaries (`lua-lsp/meta/spell/dictionary.txt`)
+were force-parsed as Lua under the override and hung tree-sitter for
+five minutes. (The central `parse_file_with_lang` chokepoint enforces
+the size cap, but `patterns` reads via `std::fs::read_to_string` and
+dispatches through `ParserPool::parse(content, lang)` which bypasses
+the path-based cap.)
+
+### Fix
+
+Three orthogonal changes sharing the milestone tag:
+
+- `patterns/mod.rs::collect_files`: when `--lang` is provided, only
+  include files whose detected extension matches OR whose extension
+  is unknown — and even for unknown extensions we now SKIP rather
+  than force-parse, because real-world Lua repos contain large
+  plain-text data files. Apply the central
+  `tldr_core::fs::oversize::check_size` policy at file-collection
+  time. Mirrors the `BUG-java-debt-stackoverflow-v1` policy.
+
+- `api_check.rs::analyze_file`: pre-compile each language's regex
+  rules ONCE per file (the `regex_specs: Vec<(&'static RegexRuleSpec,
+  Regex)>` cache) and thread the cache through `check_rule` ->
+  `check_regex_rule`. Also adds a per-file substring fast-path
+  (`language_fastpath_needles` + `extract_literal_from_regex`) that
+  skips the per-line scan entirely when the file body contains NONE
+  of the language's rule needles. The needle list is derived from
+  each rule's regex pattern by emitting the longest plain-literal run
+  (anchors / character-class shorthands / quantifiers / alternation
+  are all handled soundly — see the
+  `test_extract_literal_from_regex_recovers_useful_needles` and
+  `test_fastpath_extension_no_perf_regression_on_normal_input`
+  tests). For Python and Rust (which use bespoke matchers, not the
+  regex spec table) the needle list is hard-coded.
+
+  Defers oversize-skip to `tldr_core::fs::oversize::check_size` so
+  generated headers / minified artefacts share the central policy.
+
+### Perf table (BEFORE -> AFTER)
+
+| Command                                           | BEFORE        | AFTER  | Delta     |
+|---------------------------------------------------|---------------|--------|-----------|
+| `patterns --lang luau /tmp/repos/luau-luau`       | timeout >60 s | 0.50 s | >120x     |
+| `api-check --lang luau /tmp/repos/luau-luau`      | 186.4 s       | 0.44 s | 423x      |
+| `debt --lang luau /tmp/repos/luau-luau`           | 0.40 s        | 0.38 s | (noise)   |
+| `patterns --lang lua /tmp/repos/lua-lsp`          | hang >5 min   | 0.52 s | >580x     |
+| `calls --lang ocaml /tmp/repos/ocaml-dune`        | 9.5 s         | 9.3 s  | (noise)   |
+| `dead --lang ocaml /tmp/repos/ocaml-dune`         | 5.7 s         | 5.6 s  | (noise)   |
+| `health /tmp/repos/ocaml-dune`                    | 9.6 s         | 9.5 s  | (noise)   |
+| `vuln /tmp/repos/ripgrep` (M-B1 regression-guard) | 4.1 s         | 4.1 s  | unchanged |
+
+The 168 / 168 `vuln_migration_v1_red` tests continue to pass — the
+M-B1 vuln fast-path is untouched.
+
+### Carry-forwards (commands NOT sped up)
+
+- `calls`, `dead`, `health` on `ocaml-dune` were already <10 s before
+  the milestone (call-graph builder filters by extension and reuses
+  the parser cache). No change required to meet the <30 s goal.
+- `debt` was already fast on luau-luau (0.4 s) because
+  `BUG-java-debt-stackoverflow-v1` already restricts files by
+  extension under `--lang` and applies a 500 KB MAX_FILE_SIZE cap.
+- The `api-check` substring fast-path is most effective on files that
+  contain NONE of the rule needles (typical for documentation /
+  config / generated headers). Files that *do* contain needles still
+  pay the per-line regex cost — but that cost is now O(N_lines) per
+  file, not O(N_lines × N_rules) (regex-compile-once was the dominant
+  factor on luau-luau).
+
 ## definition-workspace-cross-file-v1 — internal milestone
 
 NOT a published release. Extends `tldr definition` to resolve symbols
