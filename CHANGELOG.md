@@ -1,5 +1,107 @@
 # Changelog
 
+## detection-gap-fixes-v1 — internal milestone
+
+NOT a published release. Closes two reflected-XSS detection gaps in the
+canonical taint pipeline that allowed tainted user input to flow into
+HTTP response bodies undetected.
+
+### Gap 1 — Python Flask f-string view-function return XSS
+
+The canonical Flask reflected-XSS shape
+
+```python
+@app.route('/echo')
+def echo():
+    name = request.args.get('name')
+    return f"<h1>Hello {name}</h1>"   # XSS — undetected pre-fix
+```
+
+emitted ZERO `xss` findings. Root cause: `detect_sinks_ast`'s descendant
+loop filters every `string`-kind node via the upstream `is_in_string`
+guard (a string IS in a string), so the f-string never reached the
+`AstSinkPattern` matcher. Even if it had, no entry in `PYTHON_AST_SINKS`
+would have matched — the f-string is neither call-shape nor
+member-access shape, just a literal returned from a function.
+
+### Gap 2 — Next.js `NextResponse.json(tainted)` reflected XSS
+
+`js-res-json-fp-narrowing-v1` (commit `f838387`) correctly removed
+`(NextResponse, json)` from the FileWrite/PathTraversal bank — the FP
+class on every Next.js App Router handler that echoed user input as
+JSON. But no replacement HtmlOutput entry was added, so reflected user
+input emitted via `NextResponse.json(...)` went undetected. The
+companion W1-M1 #2 framework integration test
+(`nextjs_response_json_reflected_xss_via_compute_taint`) was orphaned in
+that state — its assertion still filtered for `FileWrite` and stayed
+RED with `result.sinks=[]`.
+
+### Fixes
+
+**Python f-string XSS** — added a localized dispatch arm at the bottom
+of `detect_sinks_ast` (mirrors the Ruby `subshell` arm) that:
+
+1. Triggers on `descendant.kind() == "return_statement"`.
+2. Walks the return's children seeking a direct `string` child.
+3. Walks the string's children seeking at least one `interpolation`
+   child (gates on f-strings — plain string returns carry no runtime
+   variable so emit no sink, keeping FP surface minimal).
+4. Walks the first interpolation's named descendants seeking the first
+   plain `identifier` to extract as the sink's `var` for taint gating.
+5. Pushes a `TaintSink` with `sink_type: TaintSinkType::HtmlOutput`
+   (projects to `VulnType::Xss` / `CWE-79` via `vuln_type_from_sink`).
+
+**NextResponse.json XSS** — added an additive HtmlOutput
+`AstSinkPattern` entry covering BOTH `(NextResponse, json)` and
+`(NextResponse, redirect)`. Wired ONLY to HtmlOutput; the prior
+milestone's FileWrite removal is preserved (the FP regression-guard
+fixture continues to assert ZERO `path_traversal` findings — since
+`HtmlOutput` projects to `Xss`, not `PathTraversal`, the prior
+narrowing is intact). `redirect` keeps its existing FileWrite entry for
+open-redirect detection — the new HtmlOutput entry is additive (the
+post-VULN-MIGRATION-V1-M3 for-pattern loop has no `break`, so a single
+descendant emits both classifications; the downstream
+`dedup_by(discriminant(sink_type))` filters same-type duplicates within
+each bucket).
+
+**Scope discipline**: Express `(res|response|Response).json` is
+deliberately NOT reclassified to HtmlOutput. Express convention enforces
+strict `Content-Type: application/json` and there is no ecosystem-wide
+pattern of downstream HTML-interpretation that would justify the FP
+cost. The narrowing is Next.js App Router-specific, where server
+responses commonly feed client components that DO interpret JSON
+strings as HTML (`dangerouslySetInnerHTML` reading from
+`fetch().then(r => r.json())`).
+
+### Test changes
+
+- `crates/tldr-core/tests/rr_framework_integ_test.rs`:
+  - `nextjs_response_json_reflected_xss_via_compute_taint` — assertion
+    UPDATED from `FileWrite` to `HtmlOutput` (matches the test name's
+    `_reflected_xss_` semantic; not a weakening — `HtmlOutput`
+    projects strictly to `Xss/CWE-79`, more specific than the
+    pre-narrowing `FileWrite -> PathTraversal` projection).
+
+- `crates/tldr-cli/tests/vuln_detection_gap_fixes_v1_test.rs` (NEW):
+  - `test_xss_python_fstring_view_return` — Flask f-string view return
+    emits ≥1 `xss` finding.
+  - `test_xss_nextjs_response_json_reflected` — `NextResponse.json(tainted)`
+    emits ≥1 `xss` finding.
+  - `test_xss_express_res_json_no_path_traversal` — Express
+    `res.json(req.body)` emits ZERO `path_traversal` (preserves
+    `js-res-json-fp-narrowing-v1`).
+
+### Validation
+
+- Pre-existing failing tests now GREEN:
+  - `vuln_command::test_vuln_detects_xss` (Python f-string XSS).
+  - `nextjs_response_json_reflected_xss_via_compute_taint`
+    (NextResponse.json reflected XSS).
+- `vuln_migration_v1_red`: 168/168 GREEN (no regression).
+- `vuln_js_res_json_fp_narrowing_v1_test`: 2/2 GREEN (FP narrowing
+  preserved).
+- New regression-guard tests: 3/3 GREEN.
+
 ## cpp-method-name-extraction-v1 — internal milestone
 
 NOT a published release. Fixes `tldr structure --lang cpp` emitting empty

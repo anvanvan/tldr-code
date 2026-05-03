@@ -2078,6 +2078,57 @@ static TYPESCRIPT_AST_SINKS: &[AstSinkPattern] = &[
         ],
         sink_type: TaintSinkType::HtmlOutput,
     },
+    // detection-gap-fixes-v1 — `(NextResponse, json)` + `(NextResponse, redirect)`
+    // ADDITIVE HtmlOutput entries for reflected-XSS detection on the Next.js
+    // App Router response helpers.
+    //
+    // Background: `js-res-json-fp-narrowing-v1` removed the `(NextResponse, json)`
+    // entry from the FileWrite bank to kill the `path_traversal` FP class on
+    // every Next.js handler that echoed user input as JSON. That removal was
+    // correct: `NextResponse.json(tainted)` is NOT a path-traversal sink (no
+    // file I/O, no path resolution). However, when the SERVER reflects
+    // unsanitized user input as a JSON response body, downstream consumers
+    // that interpret the payload as HTML (template insertion, jQuery `$.html`
+    // on `response.text()`, manual `dangerouslySetInnerHTML` on a fetched
+    // string) DO produce a real reflected-XSS vector — exactly the
+    // CWE-79 shape this entry catches.
+    //
+    // This entry is wired ONLY to HtmlOutput (Xss). The FileWrite/PathTraversal
+    // entry remains REMOVED — `js-res-json-fp-narrowing-v1`'s FP regression
+    // guard (`vuln_js_res_json_fp_narrowing_v1_test::*_path_traversal_*_zero_findings`)
+    // continues to assert ZERO `path_traversal` findings on the FP fixture
+    // (which exercises ALL FOUR receivers: res / response / Response /
+    // NextResponse). Adding NextResponse.json HERE (HtmlOutput, not FileWrite)
+    // does NOT re-introduce the path_traversal FP — it adds an `xss` finding
+    // class that is semantically correct for reflected-input JSON responses.
+    //
+    // SCOPE: ONLY `NextResponse.{json,redirect}` is added. Express
+    // `(res|response|Response).json` is NOT added — the Express convention
+    // strictly enforces `Content-Type: application/json` and there is no
+    // ecosystem-wide pattern of downstream HTML-interpretation of Express
+    // JSON responses that would justify the FP cost. NextResponse is added
+    // because the Next.js App Router is overwhelmingly used in shapes where
+    // server response bodies are rendered into client components that DO
+    // interpret strings as HTML (e.g., `dangerouslySetInnerHTML` reading from
+    // `await fetch(...).then(r => r.json())`).
+    //
+    // `NextResponse.redirect` is also added here as HtmlOutput in addition to
+    // its existing FileWrite entry above (open-redirect detection). The
+    // ADDITIVE wiring (no break in the for-pattern loop, per VULN-MIGRATION-V1
+    // M3 convention) means `NextResponse.redirect(tainted)` now emits BOTH a
+    // FileWrite sink (open-redirect / PathTraversal-equivalent) AND an
+    // HtmlOutput sink (reflected-URL XSS when the redirect target is rendered
+    // by a downstream component before navigation completes). The downstream
+    // dedup_by `discriminant(sink_type)` filters same-type duplicates so this
+    // does not produce duplicate findings within a single sink_type bucket.
+    AstSinkPattern {
+        call_names: &[],
+        member_patterns: &[
+            ("NextResponse", "json"),
+            ("NextResponse", "redirect"),
+        ],
+        sink_type: TaintSinkType::HtmlOutput,
+    },
     // VULN-MIGRATION-V1 M2: HtmlOutput (Xss) sinks per vuln.rs L387-L394.
     // `outerHTML` is a property name (member shape with wildcard receiver).
     // `document.writeln` is member-access. `.html(` is jQuery method.
@@ -4841,6 +4892,127 @@ pub fn detect_sinks_ast(
                 });
                 // Only one sink per node — same convention as the loop above.
                 continue;
+            }
+        }
+
+        // detection-gap-fixes-v1 — Python f-string XSS via view-function return.
+        //
+        // tree-sitter-python 0.23.6 parses
+        //   `return f"<h1>Hello, {name}!</h1>"`
+        // as
+        //   return_statement
+        //     return
+        //     string
+        //       string_start "f\""
+        //       string_content "<h1>Hello, "
+        //       interpolation
+        //         { "{"
+        //         identifier "name"
+        //         } "}"
+        //       string_content "!</h1>"
+        //       string_end "\""
+        //
+        // The `string` descendant is filtered out by the `is_in_string` guard at
+        // the top of the descendant loop (a string IS in a string), so it never
+        // reaches the AstSinkPattern matcher. The PYTHON_AST_SINKS HtmlOutput
+        // bank only fires on `Markup(...)` / `mark_safe(...)` / `|safe` /
+        // `(response, write)` / `(Response, set_data)` shapes — none match a
+        // bare f-string return. Result: pre-fix the taint pipeline saw the
+        // tainted source (`request.args.get`) flow into `name` and then
+        // disappear into a `return` with no sink — producing zero XSS findings
+        // on the canonical Flask f-string-return shape.
+        //
+        // Fix: localized dispatch arm — when a `return_statement` directly
+        // returns a `string` containing one or more `interpolation` children
+        // (i.e., a Python f-string with at least one `{var}`), classify the
+        // return as an HtmlOutput sink. Var-extraction walks the first
+        // interpolation's named children seeking the first plain `identifier`,
+        // mirroring the Ruby subshell BFS arm above.
+        //
+        // Why ONLY f-strings (not plain string returns):
+        //  - Plain string literal returns (`return "<h1>static</h1>"`) carry no
+        //    runtime variable, so no taint can flow through them — emitting a
+        //    sink would be pure-noise (the taint engine would gate firing on a
+        //    tainted var, but there's no var to gate on).
+        //  - F-strings with at least one interpolation child carry a runtime
+        //    variable. If that variable is tainted, the response body reflects
+        //    user input as HTML — exactly the CWE-79 reflected-XSS shape.
+        //  - This narrow predicate (string-with-interpolation, NOT every
+        //    return) keeps the FP surface minimal while closing the gap on
+        //    the canonical Flask/Bottle/Pyramid view shape:
+        //      `@app.route('/x') def view(): return f"...{user}..."`
+        //
+        // Why dispatch arm (not AstSinkPattern entry): AstSinkPattern matches
+        // descendants by call-shape (`call_names`) or member-shape
+        // (`member_patterns`). A `return_statement` has neither shape — it's a
+        // statement keyword. There is no SinkPattern slot that fires on
+        // `return_statement` kind alone. (Compare the Ruby subshell arm above:
+        // same shape of localization for a non-call/non-member statement.)
+        //
+        // Sink-type rationale: HtmlOutput projects to VulnType::Xss / CWE-79
+        // via `vuln_type_from_sink` — the canonical reflected-XSS finding
+        // class. Matches the JS/TS `(reply|res|response|Response).send`
+        // HtmlOutput entries from VULN-MIGRATION-V1 M3 (same semantic: HTTP
+        // response body emitted with default text/html Content-Type).
+        if language == Language::Python && descendant.kind() == "return_statement" {
+            let mut returned_string: Option<tree_sitter::Node> = None;
+            for i in 0..descendant.child_count() {
+                if let Some(child) = descendant.child(i) {
+                    if child.is_named() && child.kind() == "string" {
+                        returned_string = Some(child);
+                        break;
+                    }
+                }
+            }
+            if let Some(string_node) = returned_string {
+                // Find first interpolation child of the string.
+                let mut first_interp: Option<tree_sitter::Node> = None;
+                for i in 0..string_node.child_count() {
+                    if let Some(child) = string_node.child(i) {
+                        if child.is_named() && child.kind() == "interpolation" {
+                            first_interp = Some(child);
+                            break;
+                        }
+                    }
+                }
+                if let Some(interp) = first_interp {
+                    // Walk the interpolation's named descendants seeking the
+                    // first identifier — yields the var name to gate taint on.
+                    let mut stack: Vec<tree_sitter::Node> = vec![interp];
+                    let mut var_name: Option<String> = None;
+                    while let Some(node) = stack.pop() {
+                        if node.kind() == "identifier" {
+                            let text = node_text(&node, source);
+                            let head = text.split('.').next().unwrap_or(text);
+                            if is_valid_identifier(head) {
+                                var_name = Some(head.to_string());
+                                break;
+                            }
+                        }
+                        for i in 0..node.child_count() {
+                            if let Some(child) = node.child(i) {
+                                if child.is_named() {
+                                    stack.push(child);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(var) = var_name {
+                        let stmt_text = std::str::from_utf8(source)
+                            .unwrap_or("")
+                            .lines()
+                            .nth((line - 1) as usize)
+                            .unwrap_or("");
+                        sinks.push(TaintSink {
+                            var,
+                            line,
+                            sink_type: TaintSinkType::HtmlOutput,
+                            tainted: false,
+                            statement: Some(stmt_text.to_string()),
+                        });
+                        continue;
+                    }
+                }
             }
         }
     }

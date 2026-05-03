@@ -69,6 +69,17 @@ export async function POST(request) {
 
 /// W1-M1 #2 — `NextResponse.json(data)` reflects `request.json()` body —
 /// reflected XSS via response body.
+///
+/// detection-gap-fixes-v1: assertion CHANGED from `FileWrite` to `HtmlOutput`.
+/// Pre-fix the test was orphaned: `js-res-json-fp-narrowing-v1` removed
+/// `(NextResponse, json)` from the FileWrite bank (correct: NextResponse.json
+/// is NOT a path-traversal sink), but no replacement HtmlOutput entry was
+/// added — the test stayed RED with `result.sinks=[]`. The milestone closes
+/// the gap by adding `(NextResponse, json)` to the HtmlOutput bank
+/// (semantically: reflected user input emitted as a JSON response body that
+/// downstream HTML-interpreting consumers may treat as XSS payload). The
+/// test name (`..._reflected_xss_...`) already encodes the correct
+/// classification — the assertion now matches the name.
 #[test]
 fn nextjs_response_json_reflected_xss_via_compute_taint() {
     let src = "\
@@ -81,12 +92,12 @@ export async function POST(request) {
     let sink_lines: Vec<_> = result
         .sinks
         .iter()
-        .filter(|s| matches!(s.sink_type, TaintSinkType::FileWrite))
+        .filter(|s| matches!(s.sink_type, TaintSinkType::HtmlOutput))
         .map(|s| s.line)
         .collect();
     assert!(
         !sink_lines.is_empty(),
-        "expected at least one FileWrite sink for NextResponse.json; \
+        "expected at least one HtmlOutput sink for NextResponse.json; \
          got sinks={:?}",
         result.sinks
     );
