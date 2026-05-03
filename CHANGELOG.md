@@ -1,5 +1,94 @@
 # Changelog
 
+## inheritance-and-dead-cleanup-v1 — internal milestone
+
+NOT a published release. Bug-fix milestone fixing three quality issues
+in `tldr inheritance` and `tldr dead` exposed by running them against
+the ts-dom-gen TypeScript corpus.
+
+### Bug 1 — `tldr inheritance` emitted duplicate edges (M5)
+
+```bash
+$ tldr inheritance --lang typescript /tmp/repos/ts-dom-gen | jq '.edges | length'
+6606    # ← inflated; only 1562 nodes in the graph
+```
+
+Multiple language extractors (TS overload signatures, re-emitted
+heritage clauses, Go interface embedding) called `add_edge` for the
+same `(child, parent)` pair 3-4 times, producing duplicate
+`InheritanceEdge` entries. Downstream consumers were forced to
+deduplicate, and counts in summaries were wrong.
+
+### Bug 2 — `tldr inheritance` reported false diamonds (M4)
+
+```bash
+$ tldr inheritance --lang typescript /tmp/repos/ts-dom-gen | jq '.diamonds | length'
+1486    # ← almost all are linear chains, not real diamonds
+```
+
+`detect_diamonds` iterated `graph.parents.get(class)` directly. With
+the M5 bug present, a single-parent class like `CSSTransition` had
+its parent listed 3 times, so `multi_parent_classes()` mis-classified
+it as multi-parent and the BFS reported a "diamond" that was actually
+a linear chain `CSSTransition → Animation → EventTarget`.
+
+A real diamond requires **two distinct immediate parents** that
+converge on the same ancestor.
+
+### Bug 3 — `tldr dead` flagged `.d.ts` symbols as possibly_dead (M6)
+
+```bash
+$ tldr dead /tmp/repos/ts-dom-gen | jq '[.possibly_dead[] | select(.file | endswith(".d.ts"))] | length'
+299     # ← every declared symbol surfaced as a false positive
+```
+
+TypeScript declaration files (`.d.ts`) contain only `interface`,
+`type`, and `declare` statements — no executable code. They cannot
+participate in a call graph and therefore have no meaning in
+dead-code analysis. Every symbol declared in `.d.ts` was inevitably
+"possibly_dead" regardless of how the rest of the program used it.
+
+### Fix
+
+- `crates/tldr-core/src/inheritance/mod.rs::build_edges` — dedupe at
+  the canonical `(child, parent, parent_file)` tuple level, plus a
+  per-child `parents` dedup pass for downstream invariants
+  (notably diamond detection).
+- `crates/tldr-core/src/inheritance/patterns.rs::detect_diamonds` —
+  filter `parents` through a `HashSet` so duplicates can never
+  inflate `parents.len() >= 2`. Also dedupe the resulting `paths`
+  vector so each reported diamond has at least two genuinely distinct
+  paths.
+- `crates/tldr-cli/src/commands/dead.rs` — new
+  `is_typescript_declaration_file` helper. Skip `.d.ts` files in both
+  `collect_module_infos` (call-graph path) and
+  `collect_module_infos_with_refcounts` (born-dead path). Mirrors
+  the M-Y3 oversize-skip pattern.
+
+### Validation
+
+Tests added (all GREEN):
+
+- `crates/tldr-core/tests/inheritance_tests.rs::test_inheritance_edges_deduplicated`
+- `crates/tldr-core/tests/inheritance_tests.rs::test_inheritance_edges_deduplicated_graph_level`
+- `crates/tldr-core/tests/inheritance_tests.rs::test_inheritance_diamond_real_pattern`
+- `crates/tldr-core/tests/inheritance_tests.rs::test_inheritance_no_false_diamond_from_duplicate_parents`
+- `crates/tldr-cli/tests/inheritance_and_dead_cleanup_v1_test.rs::test_dead_skips_dts_files`
+
+Binary verification on `/tmp/repos/ts-dom-gen` (TypeScript DOM corpus):
+
+| Metric                                | Before | After |
+| ------------------------------------- | -----: | ----: |
+| `tldr inheritance` edges              | 6606   | 889   |
+| `tldr inheritance` diamonds           | 1486   | 1     |
+| `tldr dead` `.d.ts` in possibly_dead  | 299    | 0     |
+| `tldr dead` `.d.ts` in dead_functions | (n/a)  | 0     |
+
+The single remaining diamond is the legitimate DOM diamond
+`DocumentType → {Node, ChildNode→Node} → EventTarget`.
+
+`vuln_migration_v1_red`: 168/168 GREEN.
+
 ## vuln-secure-autodetect-parity-v1 — internal milestone
 
 NOT a published release. Bug-fix milestone restoring `tldr vuln` ↔

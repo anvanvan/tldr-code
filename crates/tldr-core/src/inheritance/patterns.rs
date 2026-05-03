@@ -92,12 +92,24 @@ pub fn detect_diamonds(graph: &InheritanceGraph) -> Vec<DiamondPattern> {
     let mut diamonds = Vec::new();
 
     // For each class with 2+ parents
-    for (class_name, parents) in graph.multi_parent_classes() {
+    for (class_name, parents_raw) in graph.multi_parent_classes() {
+        // inheritance-and-dead-cleanup-v1 (M4): require DISTINCT parents.
+        // Duplicate edges (M5 bug) caused linear chains like
+        // `CSSTransition -> Animation -> EventTarget` to be misreported as
+        // diamonds. A real diamond requires two distinct immediate parents
+        // converging on a common ancestor.
+        let mut seen = HashSet::new();
+        let parents: Vec<String> = parents_raw
+            .iter()
+            .filter(|p| seen.insert((*p).clone()))
+            .cloned()
+            .collect();
+
         if parents.len() < 2 {
             continue;
         }
 
-        // Compute ancestor sets for each parent using BFS
+        // Compute ancestor sets for each (distinct) parent using BFS
         let ancestor_sets: Vec<HashSet<String>> = parents
             .iter()
             .map(|parent| graph.ancestors_bfs(parent))
@@ -118,14 +130,26 @@ pub fn detect_diamonds(graph: &InheritanceGraph) -> Vec<DiamondPattern> {
                 })
         };
 
-        // For each common ancestor, create a diamond pattern
+        // For each common ancestor, create a diamond pattern.
+        // A real diamond requires two DISTINCT paths (through different
+        // immediate parents) converging on the same ancestor.
         for ancestor in common {
-            let paths = compute_paths_to_ancestor(graph, class_name, &ancestor, parents);
-            if paths.len() >= 2 {
+            let paths = compute_paths_to_ancestor(graph, class_name, &ancestor, &parents);
+
+            // Deduplicate paths (defensive — different parents may share
+            // intermediate path segments but should yield distinct vectors).
+            let mut unique_paths: Vec<Vec<String>> = Vec::new();
+            for p in paths {
+                if !unique_paths.iter().any(|q| q == &p) {
+                    unique_paths.push(p);
+                }
+            }
+
+            if unique_paths.len() >= 2 {
                 diamonds.push(DiamondPattern {
                     class_name: class_name.clone(),
                     common_ancestor: ancestor,
-                    paths,
+                    paths: unique_paths,
                 });
             }
         }

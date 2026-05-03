@@ -1760,3 +1760,195 @@ fn test_inheritance_options_validation_edge_cases() {
     let result = options.validate();
     assert!(result.is_err()); // Should require --class
 }
+
+// =============================================================================
+// inheritance-and-dead-cleanup-v1 — M5 + M4 regression guards
+// =============================================================================
+
+/// M5 regression: edges from a directory scan must be deduplicated at the
+/// (child, parent, parent_file) tuple level. Pre-fix, TS extractors emitted
+/// the same heritage clause 3-4 times producing 6606 edges across 1562
+/// nodes on the ts-dom-gen corpus.
+#[test]
+fn test_inheritance_edges_deduplicated() {
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    // Two TS files in which the same class extends the same parent.
+    // Even if multiple files re-declare `class Child extends Base`, we
+    // expect distinct (child, parent, parent_file) tuples — one edge per
+    // distinct child-class definition. The bug duplicated within a single
+    // file as well, which we simulate by listing the same parent twice
+    // via a graph-level injection (tested below).
+    let f1 = dir.path().join("a.ts");
+    std::fs::write(
+        &f1,
+        "class Base {}\nclass Child extends Base {}\n",
+    )
+    .unwrap();
+
+    let report = extract_inheritance(
+        dir.path(),
+        Some(Language::TypeScript),
+        &InheritanceOptions::default(),
+    )
+    .unwrap();
+
+    // Count edges with this exact (child, parent) — must be exactly 1.
+    let child_to_base = report
+        .edges
+        .iter()
+        .filter(|e| e.child == "Child" && e.parent == "Base")
+        .count();
+    assert_eq!(
+        child_to_base, 1,
+        "Child->Base edge should not be duplicated, got {} edges total: {:?}",
+        child_to_base,
+        report.edges,
+    );
+
+    // Stronger invariant: every (child, parent, parent_file) tuple is unique.
+    let mut seen = std::collections::HashSet::new();
+    for edge in &report.edges {
+        let key = (edge.child.clone(), edge.parent.clone(), edge.parent_file.clone());
+        assert!(
+            seen.insert(key.clone()),
+            "Duplicate edge tuple detected: {:?}",
+            key,
+        );
+    }
+}
+
+/// M5 regression at the graph level: if an extractor calls add_edge multiple
+/// times with the same (child, parent), build_edges must collapse to one
+/// emitted edge.
+#[test]
+fn test_inheritance_edges_deduplicated_graph_level() {
+    use tldr_core::inheritance::extract_inheritance;
+    use tempfile::TempDir;
+
+    // Construct a fixture where a single class extends a single parent.
+    // We can't easily inject duplicate add_edge calls through the public
+    // API, but we can validate the post-build_edges invariant on a real
+    // scan: NO duplicate (child, parent, parent_file) tuples.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("hier.ts"),
+        r#"
+class A {}
+class B extends A {}
+class C extends B {}
+class D extends C {}
+"#,
+    )
+    .unwrap();
+
+    let report = extract_inheritance(
+        dir.path(),
+        Some(Language::TypeScript),
+        &InheritanceOptions::default(),
+    )
+    .unwrap();
+
+    let mut counts: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for edge in &report.edges {
+        *counts.entry((edge.child.clone(), edge.parent.clone())).or_default() += 1;
+    }
+    for ((c, p), n) in &counts {
+        assert_eq!(*n, 1, "edge {} -> {} appears {} times (expected 1)", c, p, n);
+    }
+}
+
+/// M4 regression: a real diamond requires two DISTINCT immediate parents
+/// converging on the same ancestor. A linear chain (C -> B -> A -> Object)
+/// must NOT be reported as a diamond. Pre-fix, duplicate edges from M5
+/// caused parents.len() >= 2 for what was effectively a single-parent
+/// child, producing 1486 false-positive "diamonds" on ts-dom-gen.
+#[test]
+fn test_inheritance_diamond_real_pattern() {
+    let mut graph = InheritanceGraph::new();
+
+    // Real diamond: D inherits from BOTH B and A; B inherits from A; A
+    // inherits from Object. Two distinct paths from D converge at A.
+    let object = InheritanceNode::new("Object", PathBuf::from("test.ts"), 1, Language::TypeScript);
+    let mut a = InheritanceNode::new("A", PathBuf::from("test.ts"), 2, Language::TypeScript);
+    a.bases = vec!["Object".to_string()];
+    let mut b = InheritanceNode::new("B", PathBuf::from("test.ts"), 3, Language::TypeScript);
+    b.bases = vec!["A".to_string()];
+    let mut c = InheritanceNode::new("C", PathBuf::from("test.ts"), 4, Language::TypeScript);
+    c.bases = vec!["A".to_string(), "B".to_string()];
+
+    graph.add_node(object);
+    graph.add_node(a);
+    graph.add_node(b);
+    graph.add_node(c);
+    graph.add_edge("A", "Object");
+    graph.add_edge("B", "A");
+    graph.add_edge("C", "A");
+    graph.add_edge("C", "B");
+
+    let diamonds = detect_diamonds(&graph);
+    // The detector should report at least one diamond on C with
+    // 2+ distinct paths (one direct C->A, one through B).
+    let real_for_c: Vec<&_> = diamonds.iter().filter(|d| d.class_name == "C").collect();
+    assert!(
+        !real_for_c.is_empty(),
+        "Expected at least one diamond on C; got: {:?}",
+        diamonds,
+    );
+    for d in &real_for_c {
+        assert!(
+            d.paths.len() >= 2,
+            "Diamond on C must have 2+ distinct paths; got {:?}",
+            d.paths,
+        );
+        // All paths should be distinct.
+        let mut sorted = d.paths.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            d.paths.len(),
+            "Diamond paths must be distinct; got {:?}",
+            d.paths,
+        );
+    }
+}
+
+/// M4 regression: linear chain must not be flagged as a diamond, even if
+/// duplicate parent entries are accidentally injected (mirrors the
+/// pre-M5-fix data shape that produced the 1486 false positives).
+#[test]
+fn test_inheritance_no_false_diamond_from_duplicate_parents() {
+    let mut graph = InheritanceGraph::new();
+
+    // Linear chain: CSSTransition -> Animation -> EventTarget
+    let event_target =
+        InheritanceNode::new("EventTarget", PathBuf::from("d.ts"), 1, Language::TypeScript);
+    let mut animation =
+        InheritanceNode::new("Animation", PathBuf::from("d.ts"), 2, Language::TypeScript);
+    animation.bases = vec!["EventTarget".to_string()];
+    let mut transition =
+        InheritanceNode::new("CSSTransition", PathBuf::from("d.ts"), 3, Language::TypeScript);
+    transition.bases = vec!["Animation".to_string()];
+
+    graph.add_node(event_target);
+    graph.add_node(animation);
+    graph.add_node(transition);
+
+    // Inject duplicates as the pre-M5 bug would have produced.
+    graph.add_edge("Animation", "EventTarget");
+    graph.add_edge("Animation", "EventTarget");
+    graph.add_edge("Animation", "EventTarget");
+    graph.add_edge("CSSTransition", "Animation");
+    graph.add_edge("CSSTransition", "Animation");
+    graph.add_edge("CSSTransition", "Animation");
+
+    let diamonds = detect_diamonds(&graph);
+    assert!(
+        diamonds.is_empty(),
+        "Linear chain (with duplicated edges) must NOT produce diamonds; got {:?}",
+        diamonds,
+    );
+}

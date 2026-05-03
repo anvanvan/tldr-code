@@ -263,14 +263,30 @@ fn collect_source_files(path: &Path, lang: Option<Language>) -> Vec<PathBuf> {
 }
 
 /// Build InheritanceEdge structs from graph
+///
+/// inheritance-and-dead-cleanup-v1 (M5): edges are deduplicated at the
+/// (child, parent, parent_file) tuple level. The same heritage clause may
+/// be emitted multiple times by language extractors (TS overload signatures,
+/// TSX re-emission, Go interface satisfaction, etc.). Deduping here keeps
+/// downstream consumers (and diamond detection counts) honest.
 fn build_edges(graph: &InheritanceGraph, _project_root: &Path) -> Vec<InheritanceEdge> {
     let mut edges = Vec::new();
+    let mut seen_edges: HashSet<(String, String, Option<PathBuf>)> = HashSet::new();
 
     for (child_name, parents) in &graph.parents {
         let child_node = match graph.nodes.get(child_name) {
             Some(n) => n,
             None => continue,
         };
+
+        // Dedupe parent names per child (M5 dedup) — a child can have the same
+        // parent listed multiple times when extractors emit the heritage
+        // clause repeatedly. We preserve order via a HashSet-tracking pass.
+        let mut seen_parents: HashSet<String> = HashSet::new();
+        let parents: Vec<&String> = parents
+            .iter()
+            .filter(|p| seen_parents.insert((*p).clone()))
+            .collect();
 
         for parent_name in parents {
             let parent_node = graph.nodes.get(parent_name);
@@ -310,7 +326,16 @@ fn build_edges(graph: &InheritanceGraph, _project_root: &Path) -> Vec<Inheritanc
                 )
             };
 
-            edges.push(edge);
+            // M5 dedup: (child, parent, parent_file) is the canonical edge
+            // identity. Skip if we've already emitted this triple.
+            let key = (
+                edge.child.clone(),
+                edge.parent.clone(),
+                edge.parent_file.clone(),
+            );
+            if seen_edges.insert(key) {
+                edges.push(edge);
+            }
         }
     }
 

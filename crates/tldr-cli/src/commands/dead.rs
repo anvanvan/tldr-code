@@ -240,6 +240,15 @@ fn tag_directive_functions(info: &mut ModuleInfo, source: &str, path: &Path) {
     }
 }
 
+/// inheritance-and-dead-cleanup-v1 (M6): TypeScript declaration files
+/// (`.d.ts`) contain only `interface` / `type` / ambient declarations — no
+/// executable code. Including them in dead-code analysis produces false
+/// "possibly_dead" findings for every declared symbol. Mirrors the
+/// oversize-skip pattern used elsewhere in the codebase.
+fn is_typescript_declaration_file(path: &Path) -> bool {
+    path.to_string_lossy().to_ascii_lowercase().ends_with(".d.ts")
+}
+
 /// Collect ModuleInfo from all files in a directory using detailed AST extraction.
 ///
 /// This provides the enriched function metadata (decorators, visibility, etc.)
@@ -252,6 +261,10 @@ fn collect_module_infos(
     let mut module_infos = Vec::new();
 
     if path.is_file() {
+        // M6: skip .d.ts declaration-only files
+        if is_typescript_declaration_file(path) {
+            return module_infos;
+        }
         if let Ok(mut info) = extract_file(path, path.parent()) {
             if let Ok(source) = std::fs::read_to_string(path) {
                 tag_directive_functions(&mut info, &source, path);
@@ -273,6 +286,10 @@ fn collect_module_infos(
         for entry in walker.iter() {
             let file_path = entry.path();
             if file_path.is_file() {
+                // M6: skip .d.ts declaration-only files
+                if is_typescript_declaration_file(file_path) {
+                    continue;
+                }
                 if let Some(ext_str) = file_path.extension().and_then(|e| e.to_str()) {
                     let dotted = format!(".{}", ext_str);
                     if extensions.contains(&dotted.as_str()) {
@@ -322,6 +339,11 @@ pub(crate) fn collect_module_infos_with_refcounts(
     let mut merged_counts: HashMap<String, usize> = HashMap::new();
 
     if path.is_file() {
+        // M6: skip .d.ts declaration-only files (still produce empty
+        // module_infos / counts so callers behave gracefully).
+        if is_typescript_declaration_file(path) {
+            return (module_infos, merged_counts);
+        }
         if let Ok((tree, source, lang)) = parse_file(path) {
             // Extract ModuleInfo from the parsed tree
             if let Ok(mut info) = extract_from_tree(&tree, &source, lang, path, path.parent()) {
@@ -348,6 +370,10 @@ pub(crate) fn collect_module_infos_with_refcounts(
         for entry in walker.iter() {
             let file_path = entry.path();
             if file_path.is_file() {
+                // M6: skip .d.ts declaration-only files
+                if is_typescript_declaration_file(file_path) {
+                    continue;
+                }
                 if let Some(ext_str) = file_path.extension().and_then(|e| e.to_str()) {
                     let dotted = format!(".{}", ext_str);
                     if extensions.contains(&dotted.as_str()) {
