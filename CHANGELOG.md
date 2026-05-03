@@ -1,5 +1,100 @@
 # Changelog
 
+## test-harness-feature-flag-v1 — internal milestone
+
+NOT a published release. Repairs three classes of stale test failures
+that had been masking real CI signal. None of these were product
+defects — they were tests asserting OBSOLETE shapes after intentional
+schema/feature changes had landed in earlier milestones. Per the
+"No Gaming" rule, every fix updates the assertion to match the NEW
+correct behavior; nothing is weakened or skipped to mask a real bug.
+
+### Class A — 54 semantic-family tests gated on the `semantic` feature
+
+`crates/tldr-cli/tests/exhaustive_matrix.rs` ships 18 `test_embed_on_*`,
+18 `test_semantic_on_*`, and 18 `test_similar_on_*` cells (54 total)
+that shell out to the `tldr` binary expecting the `embed` / `semantic`
+/ `similar` subcommands to be present. Those subcommands are
+`#[cfg(feature = "semantic")]` in the binary. When the test binary
+was built without `--features semantic` the subcommands were absent
+and every cell failed with `unrecognized subcommand 'embed'` (etc).
+
+**Fix:** Mirror the binary's gate at the test layer. Each of the 54
+test functions now carries `#[cfg(feature = "semantic")]`. The three
+helpers (`check_embed`, `check_semantic`, `check_similar`), the
+`embedding_mutex` `OnceLock`/`Mutex` accessor, the
+`std::sync::{Mutex, OnceLock}` import, and the
+`use serial_test::serial` import are all gated behind the same flag
+so the no-feature build stays warning-clean.
+
+Verification:
+- `cargo test -p tldr-cli --test exhaustive_matrix -- --list | grep -E
+  'test_(embed|semantic|similar)_on_' | wc -l` → 0 (no feature),
+  54 (`--features semantic`).
+- `cargo test -p tldr-cli --features semantic --test exhaustive_matrix
+  -- test_embed_on test_semantic_on test_similar_on` → 54 passed,
+  0 failed (run in isolation, ~7 min wall — fastembed cache warm).
+
+### Class B — `test_secure_sub_results_structure` (1 test)
+
+`crates/tldr-cli/tests/secure_sweep_tests.rs` was asserting that
+secure's JSON contained `"details"` or `"sub_results"`. Per
+`wrapper-cross-consistency-v1` (commit `226609d`) the secure wrapper
+no longer emits per-sub-analysis records — `sub_results` is now
+empty and serde-skipped, and the post-milestone shape is
+`{ wrapper, path, findings[], summary{...}, total_elapsed_ms }`.
+
+**Fix:** Rewrite to PIN the post-milestone contract. The test now
+parses the JSON, asserts `sub_results` and `details` are both ABSENT
+(catching regressions that re-introduce them), asserts the five
+required top-level keys are present, and asserts `wrapper == "secure"`.
+
+### Class C — 18 `test_imports_on_<lang>` matrix cells
+
+`crates/tldr-cli/tests/language_command_matrix.rs::check_imports` was
+calling `json.as_array()` on the imports output. Per
+`schema-unification-v1` (commit `8d71463`) the default imports shape
+is now an envelope `{ file, language, imports[] }`; the legacy
+top-level array is opt-in via `--legacy-array`. All 18 cells failed
+with `output is not a JSON array` after the schema change shipped.
+
+**Fix:** Rewrite `check_imports` to parse the envelope. The helper
+now asserts the three required keys (`file`, `language`, `imports`)
+are present, asserts `language` matches the requested language, and
+applies the existing per-language `EXPECTED_IMPORTS` exact-count
+match against the envelope's `imports` array. Detection coverage
+(under-counting / over-counting catch) is preserved.
+
+### Validation results
+
+- `cargo test -p tldr-cli --test secure_sweep_tests` → 24 passed.
+- `cargo test -p tldr-cli --test language_command_matrix` → 234 passed.
+- `cargo test -p tldr-cli --test exhaustive_matrix` (no feature)
+  → 676 passed, 0 failed (zero `unrecognized subcommand` errors).
+- `cargo test -p tldr-cli --features semantic --test
+  exhaustive_matrix -- test_embed_on test_semantic_on test_similar_on`
+  → 54 passed, 0 failed.
+- `cargo test -p tldr-cli --features semantic --test
+  vuln_migration_v1_red` → 168/168 GREEN (unchanged).
+
+Pre-existing failures unrelated to this milestone (still RED, owned by
+later milestones): `remaining_test::secure_command::test_secure_detects_taint`,
+`todo_aggregation_tests::test_todo_sub_results_track_errors`,
+`val003_daemon_registry_test::concurrent_add_entry_is_bounded_cas_safe`,
+`rr_module_function_integ_test::ruby_io_popen_with_user_input_via_compute_taint`.
+None touch the three test files modified here.
+
+### Files modified
+
+- `crates/tldr-cli/tests/exhaustive_matrix.rs` — 54 `#[test]` gates
+  + 3 helper-fn gates + 1 `embedding_mutex` gate + 2 import gates.
+- `crates/tldr-cli/tests/secure_sweep_tests.rs` — rewrote
+  `test_secure_sub_results_structure` to assert the post-milestone
+  envelope shape.
+- `crates/tldr-cli/tests/language_command_matrix.rs` — rewrote
+  `check_imports` to parse the `{ file, language, imports[] }`
+  envelope and preserve EXPECTED_IMPORTS exact-count enforcement.
+
 ## detection-gap-fixes-v1 — internal milestone
 
 NOT a published release. Closes two reflected-XSS detection gaps in the

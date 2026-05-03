@@ -286,6 +286,12 @@ fn check_imports(lang: &str) {
     // VAL-018: tightened — per-language EXPECTED_IMPORTS exact match.
     // Catches both under-counting (e.g. handler skips required imports)
     // and over-counting (e.g. handler treats type annotations as imports).
+    //
+    // Per `schema-unification-v1` (commit 8d71463) the default `imports`
+    // shape is now an envelope: { file, language, imports[] }. The
+    // legacy top-level array is opt-in via `--legacy-array`. This test
+    // pins the envelope contract: required keys, language matches, and
+    // exact import-count match against EXPECTED_IMPORTS.
     let expected = EXPECTED_IMPORTS
         .iter()
         .find(|(l, _)| *l == lang)
@@ -299,11 +305,52 @@ fn check_imports(lang: &str) {
                 &stderr,
             )
         });
-    let arr = json.as_array().unwrap_or_else(|| {
+    let obj = json.as_object().unwrap_or_else(|| {
         fail_cell(
             "imports",
             lang,
-            "output is not a JSON array (expected array of import records)",
+            "output is not a JSON object (expected envelope { file, language, imports[] } per schema-unification-v1)",
+            &stdout,
+            &stderr,
+        )
+    });
+    for key in ["file", "language", "imports"] {
+        if !obj.contains_key(key) {
+            fail_cell(
+                "imports",
+                lang,
+                &format!("envelope missing required key `{key}` (schema-unification-v1)"),
+                &stdout,
+                &stderr,
+            );
+        }
+    }
+    let reported_lang = obj
+        .get("language")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            fail_cell(
+                "imports",
+                lang,
+                "envelope `language` is not a string",
+                &stdout,
+                &stderr,
+            )
+        });
+    if reported_lang != lang {
+        fail_cell(
+            "imports",
+            lang,
+            &format!("envelope `language` = {reported_lang:?}, expected {lang:?}"),
+            &stdout,
+            &stderr,
+        );
+    }
+    let arr = obj.get("imports").and_then(Value::as_array).unwrap_or_else(|| {
+        fail_cell(
+            "imports",
+            lang,
+            "envelope `imports` is not an array",
             &stdout,
             &stderr,
         )

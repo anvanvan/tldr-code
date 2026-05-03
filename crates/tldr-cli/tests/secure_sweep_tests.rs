@@ -398,18 +398,58 @@ def dangerous(user_input):
 
 #[test]
 fn test_secure_sub_results_structure() {
+    // Per `wrapper-cross-consistency-v1` (commit 226609d) the `secure`
+    // wrapper no longer emits per-sub-analysis records — `sub_results`
+    // is now empty + serde-skipped. The post-milestone shape is:
+    //   { wrapper: "secure", path, findings[], summary{...},
+    //     total_elapsed_ms }
+    // This test now PINS that contract: assert `sub_results` is ABSENT
+    // (catches regressions that re-introduce it) and required top-level
+    // keys are present.
     let dir = tempdir().unwrap();
     create_test_file(dir.path(), "code.py", "x = 1");
 
     let mut cmd = tldr_cmd();
-    cmd.arg("secure")
+    let output = cmd
+        .arg("secure")
         .arg(dir.path().to_str().unwrap())
         .arg("-f")
-        .arg("json");
+        .arg("json")
+        .output()
+        .expect("failed to run tldr secure");
+    assert!(
+        output.status.success(),
+        "tldr secure should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("secure output not valid JSON: {e}\n{stdout}"));
+    let obj = parsed
+        .as_object()
+        .unwrap_or_else(|| panic!("secure output not a JSON object: {stdout}"));
 
-    // Should have details/sub_results with name, success, elapsed_ms
-    cmd.assert().success().stdout(
-        predicate::str::contains("\"details\"").or(predicate::str::contains("\"sub_results\"")),
+    // Post-milestone shape: sub_results MUST be absent (serde-skipped).
+    assert!(
+        !obj.contains_key("sub_results"),
+        "`sub_results` should be absent from secure JSON per wrapper-cross-consistency-v1; got: {stdout}"
+    );
+    // Mirror: `details` is also not part of the post-milestone shape.
+    assert!(
+        !obj.contains_key("details"),
+        "`details` should be absent from secure JSON; got: {stdout}"
+    );
+    // Required top-level keys per the new contract.
+    for key in ["wrapper", "path", "findings", "summary", "total_elapsed_ms"] {
+        assert!(
+            obj.contains_key(key),
+            "secure JSON missing required key `{key}`; got: {stdout}"
+        );
+    }
+    assert_eq!(
+        obj.get("wrapper").and_then(|v| v.as_str()),
+        Some("secure"),
+        "wrapper field should be \"secure\""
     );
 }
 

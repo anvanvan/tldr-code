@@ -35,10 +35,13 @@
 mod fixtures;
 
 use serde_json::Value;
+#[cfg(feature = "semantic")]
 use serial_test::serial;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::mpsc;
+#[cfg(feature = "semantic")]
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -50,6 +53,7 @@ use tempfile::TempDir;
 /// the cache is read-safe, but tests run in fresh processes so we can't
 /// rely on warm state. Holding the mutex around each invocation keeps
 /// the cache initialization race-free.
+#[cfg(feature = "semantic")]
 fn embedding_mutex() -> &'static Mutex<()> {
     static M: OnceLock<Mutex<()>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(()))
@@ -1332,9 +1336,14 @@ fn check_coupling(lang: &str) {
 // ============================================================================
 //
 // These require the arctic-m embedding model (~110MB cached after first
-// run). We always run them — if the model isn't downloaded yet, the
-// command auto-downloads on first invocation.
+// run). They also require the `semantic` cargo feature to compile the
+// embed/semantic/similar subcommands into the binary — when that feature
+// is OFF, these subcommands are absent and shelling out fails with
+// `unrecognized subcommand`. The whole family is feature-gated so the
+// suite stays GREEN under both `cargo test` and
+// `cargo test --features semantic`.
 
+#[cfg(feature = "semantic")]
 fn check_embed(lang: &str) {
     let _guard = embedding_mutex().lock().unwrap();
     let tmp = make_fixture(lang);
@@ -1352,6 +1361,7 @@ fn check_embed(lang: &str) {
     }
 }
 
+#[cfg(feature = "semantic")]
 fn check_semantic(lang: &str) {
     let _guard = embedding_mutex().lock().unwrap();
     let tmp = make_fixture(lang);
@@ -1376,6 +1386,7 @@ fn check_semantic(lang: &str) {
     }
 }
 
+#[cfg(feature = "semantic")]
 fn check_similar(lang: &str) {
     let _guard = embedding_mutex().lock().unwrap();
     let tmp = make_fixture(lang);
@@ -4017,91 +4028,109 @@ fn test_coupling_on_ocaml() {
 }
 
 // ---------------------------------------------------------------- embed
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_python() {
     check_embed("python");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_typescript() {
     check_embed("typescript");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_javascript() {
     check_embed("javascript");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_go() {
     check_embed("go");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_rust() {
     check_embed("rust");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_java() {
     check_embed("java");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_c() {
     check_embed("c");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_cpp() {
     check_embed("cpp");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_ruby() {
     check_embed("ruby");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_kotlin() {
     check_embed("kotlin");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_swift() {
     check_embed("swift");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_csharp() {
     check_embed("csharp");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_scala() {
     check_embed("scala");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_php() {
     check_embed("php");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_lua() {
     check_embed("lua");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_luau() {
     check_embed("luau");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_elixir() {
     check_embed("elixir");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_embed_on_ocaml() {
@@ -4109,91 +4138,109 @@ fn test_embed_on_ocaml() {
 }
 
 // ---------------------------------------------------------------- semantic
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_python() {
     check_semantic("python");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_typescript() {
     check_semantic("typescript");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_javascript() {
     check_semantic("javascript");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_go() {
     check_semantic("go");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_rust() {
     check_semantic("rust");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_java() {
     check_semantic("java");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_c() {
     check_semantic("c");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_cpp() {
     check_semantic("cpp");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_ruby() {
     check_semantic("ruby");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_kotlin() {
     check_semantic("kotlin");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_swift() {
     check_semantic("swift");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_csharp() {
     check_semantic("csharp");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_scala() {
     check_semantic("scala");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_php() {
     check_semantic("php");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_lua() {
     check_semantic("lua");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_luau() {
     check_semantic("luau");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_elixir() {
     check_semantic("elixir");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_semantic_on_ocaml() {
@@ -4201,91 +4248,109 @@ fn test_semantic_on_ocaml() {
 }
 
 // ---------------------------------------------------------------- similar
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_python() {
     check_similar("python");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_typescript() {
     check_similar("typescript");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_javascript() {
     check_similar("javascript");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_go() {
     check_similar("go");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_rust() {
     check_similar("rust");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_java() {
     check_similar("java");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_c() {
     check_similar("c");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_cpp() {
     check_similar("cpp");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_ruby() {
     check_similar("ruby");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_kotlin() {
     check_similar("kotlin");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_swift() {
     check_similar("swift");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_csharp() {
     check_similar("csharp");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_scala() {
     check_similar("scala");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_php() {
     check_similar("php");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_lua() {
     check_similar("lua");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_luau() {
     check_similar("luau");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_elixir() {
     check_similar("elixir");
 }
+#[cfg(feature = "semantic")]
 #[test]
 #[serial(embedding_cache)]
 fn test_similar_on_ocaml() {
