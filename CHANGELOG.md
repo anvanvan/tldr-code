@@ -1,5 +1,195 @@
 # Changelog
 
+## med-cleanup-bundle-v1 — internal milestone
+
+NOT a published release. UX-hygiene milestone fixing 8 MED-priority CLI
+bugs uncovered by the post-bundle real-repo audit. Each bug below was
+binary-verified against `/tmp/repos/{flask, express, rails-html-sanitizer}`
+and gated by a regression test in
+`crates/tldr-cli/tests/med_cleanup_bundle_v1.rs` (10 tests added).
+
+### Bug 1 — `tldr context` rejected positional path (M1)
+
+```bash
+$ tldr context router /tmp/repos/express
+error: unexpected argument '/tmp/repos/express' found
+```
+
+Sibling commands (`impact`, `whatbreaks`) accept
+`tldr <cmd> <thing> [path]`. `context` only had `--project /path`,
+which was inconsistent and failed for users who typed the same shape
+they'd used five seconds earlier with another command.
+
+**Fix.** Add a positional `path` argument that mirrors `impact`'s shape
+and takes precedence when set. `--project` is kept as a back-compat
+alias.
+
+- `crates/tldr-cli/src/commands/context.rs::ContextArgs` — add
+  positional `path: PathBuf`, demote `project` to `Option<PathBuf>`,
+  add `effective_project()` resolver.
+
+### Bug 2 — `tldr definition` returned malformed-success on bad position (M2)
+
+```bash
+$ tldr definition /tmp/repos/flask/src/flask/app.py 110 5
+{ "symbol": { "name": "<invalid argument: unresolved at ... — symbol '\"\"\"' not found in scope>", ... } }
+$ echo $?
+0
+```
+
+The position-based resolver returned an `Err(InvalidArgument(...))`
+when the cursor landed on a docstring or unresolvable token, but the
+CLI caught it and emitted a fake-success JSON payload with the error
+message stuffed into `symbol.name`. Exit code 0. Downstream tooling
+could not detect the failure.
+
+**Fix.** Propagate the resolver error through `anyhow::Result<()>` so
+the CLI exits non-zero and writes the message to stderr.
+
+- `crates/tldr-cli/src/commands/remaining/definition.rs::DefinitionArgs::run`
+  — return `Err` instead of synthesizing a `<unknown at ...>` result.
+
+### Bug 3 — `tldr available` parsed comments / docstrings as expressions (M3)
+
+```bash
+$ tldr available flask/cli.py shell_command
+{ "avail_in": { ... "text": "When loading the env files, set the default encoding to UTF - 8.", "operands": ["8.", "When loading ..."] }
+```
+
+Line 724 of `cli.py` is inside a docstring paragraph. The text-based
+parser (`parse_expression_from_line`) only stripped `#` and `//` at
+the start of a segment; it had no awareness of multi-line string
+literals or block comments and happily parsed
+`"... encoding to UTF - 8."` as a binary expression.
+
+**Fix.** Build a tree-sitter set of comment/string-literal lines and
+skip them in both the text-based and AST-based extractors. The AST
+walk also stops descending into comment/string nodes.
+
+- `crates/tldr-core/src/dataflow/available.rs` —
+  `collect_comment_and_string_lines` + skip in `extract_expressions_full_with_lang`
+  and `collect_binary_exprs`.
+
+### Bug 4 — Ruby `module Rails` reported as 27-method God Class (M7)
+
+```bash
+$ tldr smells /tmp/repos/rails-html-sanitizer
+{ "smells": [{ "smell_type": "god_class", "name": "Rails", "reason": "Class has 27 methods (threshold: 20)" }] }
+```
+
+`extract_ruby_methods_from_body` recursed into nested blocks to find
+methods inside `begin`/`rescue`. It also recursed into nested
+`class`/`module` declarations, summing their methods against the
+enclosing module — so `module Rails` inherited the method counts of
+every nested class.
+
+**Fix.** Skip nested `class` / `module` nodes during method extraction;
+they spawn their own `ClassInfo` entries via
+`extract_ruby_classes_detailed`.
+
+- `crates/tldr-core/src/ast/extract.rs::extract_ruby_methods_from_body`
+  — explicit `"class" | "module" => {}` arm.
+
+### Bug 5 — `tldr smells --help` lists 18 types but 8 are silently --deep-only (M14)
+
+```bash
+$ tldr smells --help | grep "requires --deep" | wc -l
+8
+$ tldr smells /tmp/repos/flask    # default — silently runs only 10 of 18
+```
+
+The help text annotates eight smell types as "requires --deep" but
+running `smells` without `--deep` produced no notice. Users got half
+the analysis surface and had to read help to find out.
+
+**Fix.** Emit a stderr note when `--deep` is absent and the user did
+not narrow with `--smell-type`. Suppressed under `--quiet`.
+
+- `crates/tldr-cli/src/commands/smells.rs::SmellsArgs::run` — stderr
+  notice listing the 8 deep-only analyzers.
+
+### Bug 6 — `tldr churn` warning vs text output contradicted on shallow clones (M15)
+
+```bash
+$ tldr churn /tmp/repos/flask --format text
+Warning: ... per-file churn ranks and averages have been suppressed.
+High-Churn Files:
+   1        1       +1       -0     ...    # ← printed anyway
+```
+
+The JSON layer set a degenerate-shallow warning and zeroed
+`avg_commits_per_file`. The text formatter ignored the warning and
+printed the full ranked list of files-tied-at-1-commit-each.
+
+**Fix.** Detect the well-known warning prefix in `format_churn_text`
+and replace the file table with an explanatory placeholder.
+
+- `crates/tldr-cli/src/commands/churn.rs::format_churn_text` —
+  `DEGENERATE_SHALLOW_WARN_PREFIX` constant + suppression branch.
+
+### Bug 7 — `tldr similar <file>` returned per-chunk noise instead of per-file (M16)
+
+```bash
+$ tldr similar /tmp/repos/express/lib/application.js   # 600 LOC
+# 5 unrelated 4-9-line helper chunks
+```
+
+The semantic index stores one chunk per function. When the user passed
+a whole file, `find_similar` matched against the FIRST chunk in that
+file and returned per-chunk hits — which were typically tiny helpers
+the user did not care about.
+
+**Fix.** When `--function` is omitted, default to file-level
+aggregation: for every chunk in the source file, find each candidate
+chunk's similarity, group by destination file, sum, and rank by total
+similarity. Add `--by-chunk` for opt-in legacy behavior.
+
+- `crates/tldr-cli/src/commands/similar.rs` — `aggregate_similar_by_file`,
+  `AggregatedSimilarityReport`, `FileSimilarityResult`,
+  `format_aggregated_similar_text`. New `--by-chunk` flag.
+- `crates/tldr-cli/tests/exhaustive_matrix.rs::check_similar` — accept
+  either `source` (legacy) or `source_file` (aggregated) shape.
+
+### Bug 8 — `tldr verify` `total_functions` denominator was undocumented (M18)
+
+```bash
+$ tldr verify /tmp/repos/flask | jq '.summary.coverage'
+{ "total_functions": 306, "coverage_pct": 96.0 }    # ← but flask has 918 functions
+```
+
+`coverage.total_functions` counted only contract-amenable functions
+(those evaluated by the contracts sub-analysis). Without explicit
+scoping, the 96% looked like project-wide coverage.
+
+**Fix.** Add `coverage.scope: String` documenting the denominator.
+Surface it in both JSON and text output.
+
+- `crates/tldr-cli/src/commands/contracts/types.rs::CoverageInfo` —
+  add `scope` field.
+- `crates/tldr-cli/src/commands/contracts/verify.rs::compute_coverage`
+  / `format_verify_text` — populate scope, render in text.
+
+### Validation
+
+10 new regression tests in `crates/tldr-cli/tests/med_cleanup_bundle_v1.rs`,
+all passing. `vuln_migration_v1_red`: 168/168 GREEN. Pre-existing
+failures (Ruby ruby_io_popen taint AST-only, secure-autodetect missing
+language coverage, csharp/c/cpp/etc.) are unchanged by this milestone
+and predate it.
+
+Binary verifications recorded against:
+- `tldr context find_best_app /tmp/repos/flask` — works.
+- `tldr definition /tmp/repos/flask/src/flask/app.py 110 5; echo $?` — exit 1.
+- `tldr available /tmp/repos/flask/src/flask/cli.py shell_command` — no
+  docstring prose in `avail_in`.
+- `tldr smells /tmp/repos/rails-html-sanitizer` — no Rails God Class.
+- `tldr smells /tmp/repos/flask` — stderr "8 smell analyzers require --deep".
+- `tldr churn /tmp/repos/flask --format text` — file table suppressed.
+- `tldr similar /tmp/repos/express/lib/application.js` — per-file
+  rows (response.js, view.js, utils.js — each with total/avg/chunks).
+- `tldr verify /tmp/repos/flask | jq '.summary.coverage.scope'` — scope
+  string present.
+
 ## schema-naming-and-units-v1 — internal milestone
 
 NOT a published release. Schema-hygiene milestone fixing three output

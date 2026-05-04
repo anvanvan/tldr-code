@@ -571,6 +571,12 @@ fn compute_coverage(
         constrained_functions: constrained,
         total_functions: total,
         coverage_pct,
+        // M18 (med-cleanup-bundle-v1): document what the
+        // total_functions denominator represents so callers do not
+        // mistake `coverage_pct` for project-wide coverage.
+        scope: "constraint-relevant functions (subset of all project functions; \
+                 typically << structure/health total_functions)"
+            .to_string(),
     }
 }
 
@@ -616,6 +622,7 @@ pub fn format_verify_text(report: &VerifyReport) -> String {
             "  Functions with any constraint: {}/{} ({:.1}%)",
             cov.constrained_functions, cov.total_functions, cov.coverage_pct
         ),
+        format!("  Scope: {}", cov.scope),
         String::new(),
         format!("Elapsed: {}ms", report.total_elapsed_ms),
     ];

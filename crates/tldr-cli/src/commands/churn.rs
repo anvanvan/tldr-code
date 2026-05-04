@@ -14,6 +14,12 @@ use tldr_core::quality::churn::{
     is_degenerate_shallow, is_git_repository, ChurnError, ChurnReport,
 };
 
+/// M15 (med-cleanup-bundle-v1): the JSON warning string used to flag a
+/// degenerate-shallow repo. Formatting code uses this prefix to keep
+/// text and JSON in sync — when the warning is present, per-file ranks
+/// MUST be suppressed in text output too.
+const DEGENERATE_SHALLOW_WARN_PREFIX: &str = "Shallow clone with";
+
 use crate::output::{OutputFormat, OutputWriter};
 
 /// Analyze git-based code churn
@@ -205,8 +211,19 @@ fn format_churn_text(report: &ChurnReport) -> String {
         output.push('\n');
     }
 
+    // M15 (med-cleanup-bundle-v1): if the JSON layer flagged this as a
+    // degenerate-shallow scenario (every file tied at 1 commit), the
+    // ranked list is mathematically meaningless — the JSON output already
+    // suppresses `most_churned_file` and zeros `avg_commits_per_file`,
+    // and emits a stronger warning. The text formatter MUST mirror that
+    // suppression instead of printing a misleading ordered list.
+    let suppress_per_file = report
+        .warnings
+        .iter()
+        .any(|w| w.starts_with(DEGENERATE_SHALLOW_WARN_PREFIX));
+
     // Files list
-    if !report.files.is_empty() {
+    if !report.files.is_empty() && !suppress_per_file {
         output.push_str(&"High-Churn Files:\n".bold().to_string());
         output.push_str(&format!(
             " {:>3}  {:>7}  {:>7}  {:>7}  {:>4}  {:>10}  {}\n",
@@ -226,6 +243,12 @@ fn format_churn_text(report: &ChurnReport) -> String {
             ));
         }
         output.push('\n');
+    } else if suppress_per_file && !report.files.is_empty() {
+        // Acknowledge presence of file data but explain why we are not
+        // printing ranks.
+        output.push_str(
+            "High-Churn Files: (suppressed — degenerate shallow clone, see warning above)\n\n",
+        );
     }
 
     // Hotspots list

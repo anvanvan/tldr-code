@@ -285,36 +285,28 @@ impl DefinitionArgs {
             ) {
                 Ok(result) => result,
                 Err(e) => {
-                    // Return a graceful "not found" result instead of failing.
-                    // The new resolver (definition-name-resolution-v1) emits
-                    // an `unresolved at FILE:LINE:COL — symbol 'X' not found
-                    // in scope` message via `RemainingError::InvalidArgument`
-                    // — surface it verbatim in `symbol.name` so callers see
-                    // a useful message, not the legacy opaque
-                    // `<unknown at ...>` payload.
+                    // M2 (med-cleanup-bundle-v1): when the resolver returns
+                    // an "unresolved at ..." sentinel (or any genuine
+                    // resolution failure), exit non-zero with a clear stderr
+                    // error. Previously we silently returned a fake-success
+                    // JSON payload with `name: "<unknown at ...>"` — the
+                    // CLI exited 0 and downstream tooling could not detect
+                    // the failure.
                     let msg = e.to_string();
-                    let display_name = if msg.contains("unresolved at") {
-                        format!("<{}>", msg)
+                    let detail = if msg.contains("unresolved at") {
+                        // The InvalidArgument sentinel already contains the
+                        // file:line:col anchor — propagate verbatim.
+                        msg
                     } else {
-                        format!("<unknown at {}:{}:{}>", file.display(), line, column)
+                        format!(
+                            "definition not found for {}:{}:{}: {}",
+                            file.display(),
+                            line,
+                            column,
+                            msg
+                        )
                     };
-                    DefinitionResult {
-                        symbol: SymbolInfo {
-                            name: display_name,
-                            kind: SymbolKind::Variable,
-                            location: Some(Location::with_column(
-                                file.display().to_string(),
-                                line,
-                                column,
-                            )),
-                            type_annotation: None,
-                            docstring: None,
-                            is_builtin: false,
-                            module: None,
-                        },
-                        definition: None,
-                        type_definition: None,
-                    }
+                    return Err(anyhow::anyhow!(detail));
                 }
             }
         };

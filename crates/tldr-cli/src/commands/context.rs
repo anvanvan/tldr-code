@@ -20,9 +20,16 @@ pub struct ContextArgs {
     /// Entry point function name
     pub entry: String,
 
-    /// Project root directory (default: current directory)
-    #[arg(long, short = 'p', default_value = ".")]
-    pub project: PathBuf,
+    /// Project root directory as positional argument (mirrors sibling
+    /// path-taking commands like `impact`, `whatbreaks`). When set, this
+    /// takes precedence over `--project`. (med-cleanup-bundle-v1 / M1)
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Project root directory (deprecated alias for the positional path
+    /// argument; kept for back-compat). (med-cleanup-bundle-v1 / M1)
+    #[arg(long, short = 'p')]
+    pub project: Option<PathBuf>,
 
     /// Programming language
     #[arg(long, short = 'l')]
@@ -42,18 +49,31 @@ pub struct ContextArgs {
 }
 
 impl ContextArgs {
+    /// Resolve the effective project path. The positional `path` argument
+    /// is the canonical input; `--project` is kept as a back-compat alias
+    /// and only wins when the positional path is left at its default ".".
+    /// (med-cleanup-bundle-v1 / M1)
+    fn effective_project(&self) -> PathBuf {
+        match &self.project {
+            Some(p) if self.path == PathBuf::from(".") => p.clone(),
+            _ => self.path.clone(),
+        }
+    }
+
     /// Run the context command
     pub fn run(&self, format: OutputFormat, quiet: bool) -> Result<()> {
         let writer = OutputWriter::new(format, quiet);
 
+        let project_path = self.effective_project();
+
         // Determine language (auto-detect from directory, default to Python)
         let language = self
             .lang
-            .unwrap_or_else(|| Language::from_directory(&self.project).unwrap_or(Language::Python));
+            .unwrap_or_else(|| Language::from_directory(&project_path).unwrap_or(Language::Python));
 
         // Try daemon first for cached result
         if let Some(context) = try_daemon_route::<RelevantContext>(
-            &self.project,
+            &project_path,
             "context",
             params_with_entry_depth(&self.entry, Some(self.depth)),
         ) {
@@ -77,7 +97,7 @@ impl ContextArgs {
 
         // Get relevant context
         let context = get_relevant_context(
-            &self.project,
+            &project_path,
             &self.entry,
             self.depth,
             language,

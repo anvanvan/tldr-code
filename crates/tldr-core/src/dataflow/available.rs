@@ -1680,10 +1680,34 @@ pub fn extract_expressions_full_with_lang(
         }
     }
 
+    // M3 (med-cleanup-bundle-v1): build a set of lines that fall
+    // entirely inside a comment or string-literal AST node, so the
+    // text-based `parse_expression_from_line` does not extract a
+    // pseudo-expression from prose like
+    //   "set the default encoding to UTF-8."
+    // (a docstring paragraph in flask/cli.py was being reported as an
+    // available expression `UTF - 8.`). The text-based parser only
+    // strips `#` and `//` at the start of a segment and is therefore
+    // blind to multi-line string literals / docstrings / block
+    // comments.
+    let comment_or_string_lines: std::collections::HashSet<u32> =
+        if let (Some(lines), Some(language)) = (source_lines, lang) {
+            collect_comment_and_string_lines(&lines.join("\n"), language)
+        } else {
+            std::collections::HashSet::new()
+        };
+
     // If we have source lines, use them for accurate expression parsing
     if let Some(lines) = source_lines {
         for (line_num, line_text) in lines.iter().enumerate() {
             let line = (line_num + 1) as u32; // 1-indexed
+
+            // M3: skip lines that are entirely inside a comment or
+            // string-literal AST node — the textual parser cannot
+            // distinguish prose from code.
+            if comment_or_string_lines.contains(&line) {
+                continue;
+            }
 
             if let Some((left, op, right)) = parse_expression_from_line(line_text) {
                 // Validate operands from DFG
@@ -2441,6 +2465,68 @@ pub fn extract_binary_exprs_from_ast(
     results
 }
 
+/// M3 (med-cleanup-bundle-v1): collect line numbers (1-indexed) that
+/// fall entirely inside a comment or string-literal AST node. Used to
+/// suppress pseudo-expression extraction from prose inside docstrings,
+/// block comments, or string literals — the text-based parser in
+/// `parse_expression_from_line` cannot otherwise distinguish e.g.
+/// "encoding to UTF-8" inside a docstring from real code.
+fn collect_comment_and_string_lines(
+    source: &str,
+    lang: Language,
+) -> std::collections::HashSet<u32> {
+    let mut lines = std::collections::HashSet::new();
+    let tree = match crate::ast::parser::parse(source, lang) {
+        Ok(t) => t,
+        Err(_) => return lines,
+    };
+    let mut cursor = tree.root_node().walk();
+    walk_comment_and_string(&mut cursor, &mut lines);
+    lines
+}
+
+fn walk_comment_and_string(
+    cursor: &mut tree_sitter::TreeCursor,
+    lines: &mut std::collections::HashSet<u32>,
+) {
+    let node = cursor.node();
+    let kind = node.kind();
+    // Tree-sitter grammars vary, but every supported grammar exposes
+    // either `comment` or a `*_comment` node kind, and string literal
+    // kinds end in `string` (`string`, `string_literal`, `raw_string`,
+    // `interpreted_string_literal`, etc.). This catches Python
+    // docstrings (which appear as `string` nodes inside
+    // `expression_statement` at the top of a function body).
+    let is_comment = kind == "comment" || kind.ends_with("_comment");
+    let is_string = kind == "string"
+        || kind.ends_with("_string")
+        || kind.ends_with("_string_literal")
+        || kind == "string_literal"
+        || kind == "raw_string_literal"
+        || kind == "interpreted_string_literal";
+
+    if is_comment || is_string {
+        let start = node.start_position().row + 1;
+        let end = node.end_position().row + 1;
+        for ln in start..=end {
+            lines.insert(ln as u32);
+        }
+        // Don't recurse into comments/strings — children are content,
+        // not separate code constructs.
+        return;
+    }
+
+    if cursor.goto_first_child() {
+        loop {
+            walk_comment_and_string(cursor, lines);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        cursor.goto_parent();
+    }
+}
+
 /// Recursively collect binary expressions from the AST.
 fn collect_binary_exprs(
     cursor: &mut tree_sitter::TreeCursor,
@@ -2460,6 +2546,22 @@ fn collect_binary_exprs(
 
     // If the entire node is outside the range, skip
     if node_end_line < start_line || node_start_line > end_line {
+        return;
+    }
+
+    // M3 (med-cleanup-bundle-v1): never descend into comment or string
+    // nodes — their contents are prose, not code, and any `+` / `-` we
+    // see there is content, not an operator.
+    let kind_outer = node.kind();
+    let is_comment_or_string = kind_outer == "comment"
+        || kind_outer.ends_with("_comment")
+        || kind_outer == "string"
+        || kind_outer.ends_with("_string")
+        || kind_outer.ends_with("_string_literal")
+        || kind_outer == "string_literal"
+        || kind_outer == "raw_string_literal"
+        || kind_outer == "interpreted_string_literal";
+    if is_comment_or_string {
         return;
     }
 

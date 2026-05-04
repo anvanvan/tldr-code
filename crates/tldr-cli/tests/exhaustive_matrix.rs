@@ -1402,9 +1402,16 @@ fn check_similar(lang: &str) {
             "--quiet",
         ],
     );
-    if !json.is_object() || json.get("source").is_none() {
+    // med-cleanup-bundle-v1 / M16: when the user passes a whole file
+    // (no `--function`), `tldr similar` now defaults to the aggregated
+    // `AggregatedSimilarityReport` shape (source_file + similar_files
+    // ranked by total similarity), not the legacy per-chunk
+    // `SimilarityReport` shape (source + similar). Accept either.
+    let has_legacy = json.get("source").is_some();
+    let has_aggregated = json.get("source_file").is_some();
+    if !json.is_object() || (!has_legacy && !has_aggregated) {
         panic!(
-            "[similar × {lang}] SILENT_FAIL — missing `source` field\n--- stdout ---\n{}\n--- stderr ---\n{stderr}",
+            "[similar × {lang}] SILENT_FAIL — missing `source` or `source_file` field\n--- stdout ---\n{}\n--- stderr ---\n{stderr}",
             truncate(&stdout, 400)
         );
     }

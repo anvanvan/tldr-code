@@ -922,16 +922,41 @@ impl SubAnalysisResult {
 }
 
 /// Coverage information from verify command.
+///
+/// M18 (med-cleanup-bundle-v1): `total_functions` here counts only the
+/// functions surfaced by the contracts sub-analysis (i.e. those whose
+/// pre/postcondition or invariant amenability was actually evaluated),
+/// NOT every function in the project. Without explicit scoping the
+/// `coverage_pct = constrained_functions / total_functions` ratio
+/// looked like a global coverage number even though `structure` /
+/// `health` reported a much larger function count for the same path.
+/// The `scope` field documents this filter so JSON consumers can not
+/// misread a 96% verify-coverage as 96% project-coverage.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoverageInfo {
     /// Number of functions with at least one constraint
     pub constrained_functions: u32,
 
-    /// Total functions analyzed
+    /// Number of functions in the constraint-relevant scope
+    /// (i.e. functions evaluated by the contracts analyzer; this is
+    /// typically a subset of the project's total function count).
     pub total_functions: u32,
 
-    /// Coverage percentage (0.0 - 100.0)
+    /// Coverage percentage (0.0 - 100.0), computed against
+    /// `total_functions` (constraint-relevant scope, not the full
+    /// project).
     pub coverage_pct: f64,
+
+    /// M18: human-readable label describing what `total_functions`
+    /// counts. Always emitted so consumers can self-document the
+    /// `coverage_pct` denominator.
+    #[serde(default = "default_coverage_scope")]
+    pub scope: String,
+}
+
+/// Default scope label for `CoverageInfo` (M18).
+fn default_coverage_scope() -> String {
+    "constraint-relevant functions (subset of all project functions; see verify docs)".to_string()
 }
 
 /// Summary from verify command.

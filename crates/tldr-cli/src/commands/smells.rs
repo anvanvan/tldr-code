@@ -216,6 +216,34 @@ impl SmellsArgs {
             }
         }
 
+        // M14 (med-cleanup-bundle-v1): when --deep is absent, advertise
+        // exactly which smell analyzers were skipped so the user is not
+        // silently handed half the analysis surface. This used to be
+        // discoverable only via --help (which lists 18 types but does
+        // not say which require --deep).
+        //
+        // Print to stderr (so it does not contaminate JSON on stdout) and
+        // skip when --quiet is set (matches `writer.progress` semantics)
+        // or when the user asked for a single specific smell type via
+        // --smell-type (the warning would be misleading there).
+        if !self.deep && !quiet && self.smell_type.is_none() {
+            const DEEP_ONLY_SMELLS: &[&str] = &[
+                "low_cohesion",
+                "tight_coupling",
+                "dead_code",
+                "code_clone",
+                "high_cognitive_complexity",
+                "middle_man",
+                "refused_bequest",
+                "inappropriate_intimacy",
+            ];
+            eprintln!(
+                "Note: {} smell analyzers require --deep flag. Run with --deep for: {}",
+                DEEP_ONLY_SMELLS.len(),
+                DEEP_ONLY_SMELLS.join(", ")
+            );
+        }
+
         // Fallback to direct compute
         writer.progress(&format!(
             "Scanning for code smells in {}{}...",

@@ -5094,6 +5094,14 @@ fn extract_ruby_module_info(node: &Node, source: &str) -> ClassInfo {
 
 /// Extract methods from a Ruby class/module body.
 /// The body is a body_statement node containing method definitions.
+///
+/// med-cleanup-bundle-v1 / M7: do NOT recurse into nested `class` /
+/// `module` declarations. Those are reported as their own ClassInfo
+/// entries by `extract_ruby_classes_detailed` and counting their
+/// methods against the enclosing module produced spurious God Class
+/// findings (e.g. `module Rails` reported with 27 methods on
+/// rails-html-sanitizer where every method actually lived in nested
+/// classes).
 fn extract_ruby_methods_from_body(body: &Node, source: &str, methods: &mut Vec<FunctionInfo>) {
     let mut cursor = body.walk();
 
@@ -5103,8 +5111,13 @@ fn extract_ruby_methods_from_body(body: &Node, source: &str, methods: &mut Vec<F
                 let info = extract_ruby_function_info(&child, source, true);
                 methods.push(info);
             }
+            // M7: skip nested classes/modules. Their methods belong to
+            // the nested ClassInfo entry, not this body's owner.
+            "class" | "module" => {}
             _ => {
-                // Recurse to find methods in nested blocks (e.g., inside `begin`/`rescue`)
+                // Recurse to find methods in nested blocks (e.g., inside
+                // `begin`/`rescue`). Nested `class`/`module` nodes are
+                // already filtered above.
                 extract_ruby_methods_from_body(&child, source, methods);
             }
         }
