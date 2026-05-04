@@ -58,9 +58,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::types::FunctionRef;
+use crate::types::{FunctionRef, Language};
 
 // =============================================================================
 // Configuration Types
@@ -1122,6 +1122,129 @@ pub fn compute_hub_report(
     top_k: usize,
     threshold: Option<f64>,
 ) -> HubReport {
+    compute_hub_report_with_lines(
+        nodes,
+        forward_graph,
+        reverse_graph,
+        algorithm,
+        top_k,
+        threshold,
+        None,
+    )
+}
+
+/// Lookup map from `(file, function_name)` -> 1-based definition line.
+///
+/// hubs-line-population-v1: built by [`enumerate_function_lines`] and consumed by
+/// [`compute_hub_report_with_lines`] so each hub's `function_ref.line` reflects
+/// the actual AST definition position instead of the legacy `0` placeholder.
+///
+/// The `name` key is whatever the call-graph builder records as the function
+/// identifier, including qualified `Class.method` forms produced by
+/// `CallGraphIR::build_indices` (cross_file_types.rs:1349-1351).
+pub type FunctionLineLookup = HashMap<(PathBuf, String), u32>;
+
+/// Build a `(file, name) -> line` lookup for every function defined under `root`.
+///
+/// hubs-line-population-v1: this is the canonical line source for `tldr hubs`.
+/// We walk the project with the shared [`crate::walker::ProjectWalker`] (so
+/// `.gitignore`, `node_modules`, `target`, etc. are honored), parse each file
+/// with [`crate::ast::extract_file`], and index every top-level function plus
+/// every method by both `name` and qualified `Class.method`.
+///
+/// File keys use **paths relative to `root`** with forward slashes — this
+/// matches `FunctionRef.file` produced by the call-graph builder
+/// (`cross_file_types::normalize_path_buf`).
+///
+/// # Arguments
+/// * `root` - Project root (same path passed to `build_project_call_graph`).
+/// * `language` - Project language used for extension filtering.
+///
+/// # Returns
+/// A lookup keyed by `(relative_file_path, function_name_or_Class_dot_method)`.
+/// Functions that fail to parse are skipped silently (mirrors the call-graph
+/// builder's behavior — bad files don't poison hub metrics).
+pub fn enumerate_function_lines(root: &Path, language: Language) -> FunctionLineLookup {
+    use crate::ast::extract_file;
+    use crate::walker::ProjectWalker;
+
+    let mut lookup: FunctionLineLookup = HashMap::new();
+
+    if !root.exists() || !root.is_dir() {
+        return lookup;
+    }
+
+    // Strip leading dots from extensions: walker wants "py", `Language::extensions`
+    // returns ".py".
+    let exts: Vec<&'static str> = language
+        .extensions()
+        .iter()
+        .map(|e| e.trim_start_matches('.'))
+        .collect();
+
+    let walker = ProjectWalker::new(root).extensions(&exts).iter();
+    for entry in walker {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // Compute relative path matching the call-graph's normalized scheme:
+        // strip the project root and forward-slash any backslashes.
+        let rel = match path.strip_prefix(root) {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => path.to_path_buf(),
+        };
+        let rel_norm = PathBuf::from(rel.to_string_lossy().replace('\\', "/"));
+
+        let module = match extract_file(path, Some(root)) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Top-level functions: index by bare name.
+        for f in &module.functions {
+            lookup
+                .entry((rel_norm.clone(), f.name.clone()))
+                .or_insert(f.line_number);
+        }
+
+        // Class methods: index by both bare `name` and qualified `Class.name`.
+        for class in &module.classes {
+            for m in &class.methods {
+                let qualified = format!("{}.{}", class.name, m.name);
+                lookup
+                    .entry((rel_norm.clone(), qualified))
+                    .or_insert(m.line_number);
+                // Also index the bare method name as a fallback for
+                // builders that do not qualify (first-writer-wins so the
+                // qualified form takes priority when both exist).
+                lookup
+                    .entry((rel_norm.clone(), m.name.clone()))
+                    .or_insert(m.line_number);
+            }
+        }
+    }
+
+    lookup
+}
+
+/// Same as [`compute_hub_report`] but populates `HubScore.function_ref.line`
+/// from a `(file, name) -> line` lookup.
+///
+/// hubs-line-population-v1: callers (typically `tldr hubs`) build the lookup
+/// with [`enumerate_function_lines`] and pass it here so hub output identifies
+/// each function by its real AST line instead of `0`. When `lookup` is `None`
+/// or a node is absent from the lookup, `line` stays `0` — matching the
+/// existing FunctionRef convention (`types.rs:1401`: `0 = unknown`).
+pub fn compute_hub_report_with_lines(
+    nodes: &HashSet<FunctionRef>,
+    forward_graph: &HashMap<FunctionRef, Vec<FunctionRef>>,
+    reverse_graph: &HashMap<FunctionRef, Vec<FunctionRef>>,
+    algorithm: HubAlgorithm,
+    top_k: usize,
+    threshold: Option<f64>,
+    function_line_lookup: Option<&FunctionLineLookup>,
+) -> HubReport {
     let total_nodes = nodes.len();
 
     // Handle empty graph (T16 mitigation)
@@ -1164,7 +1287,13 @@ pub fn compute_hub_report(
         None
     };
 
-    // Build HubScores for all nodes
+    // Build HubScores for all nodes.
+    //
+    // hubs-line-population-v1: when a `function_line_lookup` is provided, look
+    // up the function by `(file, name)` and overwrite `function_ref.line`
+    // (the call-graph builder constructs FunctionRefs with `line: 0`, see
+    // `graph_utils::collect_nodes`). Misses leave the field at `0`, matching
+    // the documented FunctionRef convention (`types.rs:1401`).
     let mut all_scores: Vec<HubScore> = nodes
         .iter()
         .map(|node| {
@@ -1177,8 +1306,19 @@ pub fn compute_hub_report(
             let callers = caller_counts.get(node).copied().unwrap_or(0);
             let callees = callee_counts.get(node).copied().unwrap_or(0);
 
+            // Populate the line from the canonical AST extractor. If the
+            // node is not in the lookup, fall back to whatever line the
+            // FunctionRef already carries (typically 0 = unknown).
+            let mut node_with_line = node.clone();
+            if let Some(lookup) = function_line_lookup {
+                let key = (node.file.clone(), node.name.clone());
+                if let Some(&line) = lookup.get(&key) {
+                    node_with_line.line = line;
+                }
+            }
+
             HubScore::with_optional_measures(
-                node.clone(),
+                node_with_line,
                 in_deg,
                 out_deg,
                 pr,

@@ -21,7 +21,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, ValueEnum};
 
-use tldr_core::analysis::hubs::{compute_hub_report, HubAlgorithm};
+use tldr_core::analysis::hubs::{
+    compute_hub_report_with_lines, enumerate_function_lines, HubAlgorithm,
+};
 use tldr_core::callgraph::{build_forward_graph, build_reverse_graph, collect_nodes};
 use tldr_core::{build_project_call_graph, Language};
 
@@ -117,14 +119,22 @@ impl HubsArgs {
         let reverse = build_reverse_graph(&graph);
         let nodes = collect_nodes(&graph);
 
+        // hubs-line-population-v1: enumerate function definition lines so the
+        // hub report identifies each function by its real AST line instead of
+        // the legacy `0` placeholder produced by the call-graph builder
+        // (graph_utils::collect_nodes constructs FunctionRefs without line
+        // info).
+        let function_lines = enumerate_function_lines(&self.path, language);
+
         // Compute hub report
-        let report = compute_hub_report(
+        let report = compute_hub_report_with_lines(
             &nodes,
             &forward,
             &reverse,
             self.algorithm.into(),
             self.top,
             self.threshold,
+            Some(&function_lines),
         );
 
         // Output based on format

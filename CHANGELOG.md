@@ -1,5 +1,97 @@
 # Changelog
 
+## hubs-line-population-v1 — internal milestone
+
+NOT a published release. Surgical fix for a single MED bug surfaced by
+the post-AD-bundle real-repo audit: every hub returned by `tldr hubs`
+had `function_ref.line: 0`, regardless of where the function was
+actually defined. Binary-verified against `/tmp/repos/flask` and gated
+by 4 regression tests in
+`crates/tldr-cli/tests/hubs_line_population_v1.rs` covering Python
+(top-level + class method), Rust, and JavaScript.
+`vuln_migration_v1_red`: 168/168 GREEN. All AA/AB/AC/AD/AE prior
+milestones still hold.
+
+### Bug — `tldr hubs` always emitted `function_ref.line: 0`
+
+```bash
+$ tldr hubs /tmp/repos/flask --quiet \
+    | jq '[.hubs[].function_ref.line] | unique'
+[0]
+```
+
+Every hub in the report had `line: 0`, including `Scaffold.route`,
+which is actually defined at `src/flask/sansio/scaffold.py:336`.
+Downstream consumers (IDE jumps, code-review summaries, AI agents
+asking "where is this hub?") had no way to locate the function from
+the JSON without an extra grep step.
+
+**Root cause.** The hub analysis layer builds its node set from
+`ProjectCallGraph` edges via `graph_utils::collect_nodes`, which
+constructs each `FunctionRef` with only `(file, name)` — `line`
+defaults to `0` (per the `FunctionRef::new` convention,
+`types.rs:1401`: "0 = unknown"). No reconciliation against the AST
+extractor was ever done.
+
+**Fix.** Added a public canonical-line enumerator in
+`tldr_core::analysis::hubs`:
+
+- `enumerate_function_lines(root, language) -> FunctionLineLookup` —
+  walks the project with `ProjectWalker` (so `.gitignore`,
+  `node_modules`, `target` etc. are honored), parses each file with
+  `crate::ast::extract_file`, and indexes every top-level function
+  plus every class method (by both bare `name` and qualified
+  `Class.method`) by `(relative_file_path, name) -> 1-based line`.
+  File keys use forward-slashed relative paths so they match the
+  `FunctionRef.file` produced by the call-graph builder
+  (`cross_file_types::normalize_path_buf`).
+- `compute_hub_report_with_lines(...)` — same shape as the existing
+  `compute_hub_report`, plus a `function_line_lookup: Option<&...>`
+  parameter. After building each `HubScore`, looks up the function
+  by `(file, name)` and overwrites `function_ref.line` from the
+  AST. Misses leave the field at `0` (matches existing convention).
+
+`compute_hub_report` is preserved as a backward-compatible
+delegate that passes `None` for the lookup, so existing internal
+callers (`bench_l2_multilang`, hub unit tests) keep working
+unchanged.
+
+The CLI (`tldr hubs`) builds the lookup once per invocation
+between `build_project_call_graph` and `compute_hub_report_with_lines`,
+amortizing the AST walk across the analysis.
+
+**Result.** Post-fix on Flask, the unique line set is
+`[0, 174, 233, 336, 567, 602, 645, 701]` — `Scaffold.route` is now
+correctly `336`, `Blueprint.__init__` is `174`, `App.add_url_rule`
+is `602`, etc. The remaining `0`s are nodes the call-graph builder
+attributed to the wrong file (e.g., `Flask.__init__` recorded as
+defined in `tests/test_config.py`); that is a distinct call-graph
+builder bug and out of scope for this milestone — the lookup
+correctly fails closed when the file/name pair is not in the
+canonical extractor.
+
+Files:
+- `crates/tldr-core/src/analysis/hubs.rs` — added
+  `enumerate_function_lines`, `FunctionLineLookup`,
+  `compute_hub_report_with_lines`; populates `function_ref.line`
+  inside the score-construction loop.
+- `crates/tldr-core/src/analysis/mod.rs` — re-exports the new
+  symbols.
+- `crates/tldr-cli/src/commands/hubs.rs` — calls
+  `enumerate_function_lines` and switches to
+  `compute_hub_report_with_lines`.
+
+Tests: `crates/tldr-cli/tests/hubs_line_population_v1.rs` (4 tests):
+- `test_hubs_line_populated_python` — top-level function at known
+  line; also asserts no hub has `line == 0`.
+- `test_hubs_line_populated_python_class_method` — exercises the
+  exact `Scaffold.route` shape from the original bug, asserting
+  qualified `Class.method` lookups land on the right line.
+- `test_hubs_line_populated_rust` — Rust standalone function
+  fixture with a `Cargo.toml` for project autodetect.
+- `test_hubs_line_populated_javascript` — ESM `import`/`export`
+  JavaScript fixture (the call-graph builder's resolvable dialect).
+
 ## med-low-schema-cleanup-v1 — internal milestone
 
 NOT a published release. Schema-hygiene milestone fixing 6 MED-LOW JSON

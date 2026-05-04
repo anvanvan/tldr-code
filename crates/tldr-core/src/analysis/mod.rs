@@ -71,8 +71,9 @@ pub use deps::{
     is_typescript_relative, DepCycle, DepEdge, DepKind, DepNode, DepStats, DepsOptions, DepsReport,
 };
 pub use hubs::{
-    compute_hub_report, compute_hub_scores, compute_in_degree, compute_out_degree, HubAlgorithm,
-    HubReport, HubScore, RiskLevel,
+    compute_hub_report, compute_hub_report_with_lines, compute_hub_scores, compute_in_degree,
+    compute_out_degree, enumerate_function_lines, FunctionLineLookup, HubAlgorithm, HubReport,
+    HubScore, RiskLevel,
 };
 pub use impact::{impact_analysis, impact_analysis_with_ast_fallback};
 pub use importers::find_importers;
