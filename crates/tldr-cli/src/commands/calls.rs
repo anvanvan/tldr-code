@@ -41,12 +41,16 @@ pub struct CallsArgs {
 }
 
 /// Call graph output format
+///
+/// med-low-schema-cleanup-v1 (N12): the redundant `edge_count` and
+/// `node_count` keys were removed. `total_edges` + `shown_edges` +
+/// `truncated` is the single canonical pair (mirrors what `references`
+/// and `dead` use); `node_count` was always equal to `nodes.len()` so
+/// consumers can derive it locally.
 #[derive(Debug, Serialize, Deserialize)]
 struct CallGraphOutput {
     root: PathBuf,
     language: Language,
-    edge_count: usize,
-    node_count: usize,
     nodes: Vec<String>,
     edges: Vec<EdgeOutput>,
     /// Whether the output was truncated due to max_items limit
@@ -97,7 +101,7 @@ impl CallsArgs {
                     output.root.display(),
                     output.language
                 ));
-                text.push_str(&format!("Edges: {}\n\n", output.edge_count));
+                text.push_str(&format!("Edges: {}\n\n", output.total_edges));
 
                 for edge in &output.edges {
                     text.push_str(&format!(
@@ -179,8 +183,6 @@ impl CallsArgs {
         let output = CallGraphOutput {
             root: self.path.clone(),
             language,
-            edge_count: total_edges,
-            node_count: nodes.len(),
             nodes,
             edges,
             truncated,
@@ -196,7 +198,7 @@ impl CallsArgs {
                 self.path.display(),
                 language
             ));
-            text.push_str(&format!("Edges: {}\n\n", output.edge_count));
+            text.push_str(&format!("Edges: {}\n\n", output.total_edges));
 
             for edge in &output.edges {
                 text.push_str(&format!(

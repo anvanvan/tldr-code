@@ -146,9 +146,26 @@ impl RemainingError {
         Self::Timeout { seconds }
     }
 
-    /// Get the appropriate exit code for this error
+    /// Get the appropriate exit code for this error.
+    ///
+    /// med-low-schema-cleanup-v1 (N9): standardized the
+    /// `tldr definition` failure codes:
+    /// - `FileNotFound` → 5 (filesystem-class error, mirrors the rest
+    ///   of the CLI where missing input files map to the 2-9 band).
+    /// - `SymbolNotFound` → 20 (analysis-class error, mirrors
+    ///   `tldr_core::TldrError::FunctionNotFound` exit 20 used by
+    ///   `tldr impact`).
+    ///
+    /// Pre-fix all `definition` failures collapsed onto exit 1
+    /// (generic), so callers had no way to distinguish "I gave a bad
+    /// path" from "the symbol genuinely isn't there".
     pub fn exit_code(&self) -> i32 {
         match self {
+            // Filesystem class (N9): missing input file.
+            Self::FileNotFound { .. } => 5,
+            // Analysis class (N9): the symbol genuinely doesn't exist
+            // in the file. Matches the `impact` exit-20 convention.
+            Self::SymbolNotFound { .. } => 20,
             // Special exit code for findings (scan ran, had results)
             Self::FindingsDetected { .. } => 2,
             // Special exit code for "scan not attempted because
@@ -185,7 +202,14 @@ mod tests {
 
     #[test]
     fn test_exit_codes() {
-        assert_eq!(RemainingError::file_not_found("/foo").exit_code(), 1);
+        // med-low-schema-cleanup-v1 (N9): file_not_found is now 5
+        // (filesystem-class) and symbol_not_found is now 20
+        // (analysis-class, matches `tldr impact` convention).
+        assert_eq!(RemainingError::file_not_found("/foo").exit_code(), 5);
+        assert_eq!(
+            RemainingError::symbol_not_found("foo", "/bar.py").exit_code(),
+            20
+        );
         assert_eq!(RemainingError::findings_detected(5).exit_code(), 2);
         assert_eq!(
             RemainingError::autodetect_unsupported("nope").exit_code(),

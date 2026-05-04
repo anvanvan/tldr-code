@@ -144,8 +144,12 @@ pub fn dead_code_analysis(
     let total_dead = dead_functions.len();
     let total_possibly_dead = possibly_dead.len();
     let total_functions = all_functions.len();
+    // med-low-schema-cleanup-v1 (N15): round percentage to 2 decimal places at
+    // serialization to avoid 15-digit IEEE-754 noise in the JSON output
+    // (e.g. `0.10893246187363835`). 2 decimals is the human-meaningful
+    // precision for "percent dead".
     let dead_percentage = if total_functions > 0 {
-        (total_dead as f64 / total_functions as f64) * 100.0
+        round_pct((total_dead as f64 / total_functions as f64) * 100.0)
     } else {
         0.0
     };
@@ -159,6 +163,16 @@ pub fn dead_code_analysis(
         total_functions,
         dead_percentage,
     })
+}
+
+/// Round a percentage value to 2 decimal places.
+///
+/// med-low-schema-cleanup-v1 (N15): clamps `f64` percentage fields to a
+/// human-meaningful precision (`12.34`) so the JSON output is stable
+/// across platforms / floating-point rounding.
+#[inline]
+fn round_pct(p: f64) -> f64 {
+    (p * 100.0).round() / 100.0
 }
 
 /// Analyze dead (unreachable) code using reference counting instead of a call graph.
@@ -274,8 +288,9 @@ pub fn dead_code_analysis_refcount(
     let total_dead = dead_functions.len();
     let total_possibly_dead = possibly_dead.len();
     let total_functions = all_functions.len();
+    // med-low-schema-cleanup-v1 (N15): see `round_pct`.
     let dead_percentage = if total_functions > 0 {
-        (total_dead as f64 / total_functions as f64) * 100.0
+        round_pct((total_dead as f64 / total_functions as f64) * 100.0)
     } else {
         0.0
     };

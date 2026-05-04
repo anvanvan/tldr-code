@@ -1,5 +1,173 @@
 # Changelog
 
+## med-low-schema-cleanup-v1 — internal milestone
+
+NOT a published release. Schema-hygiene milestone fixing 6 MED-LOW JSON
+schema bugs surfaced by the post-AD-bundle real-repo audit. Each bug
+was binary-verified against `/tmp/repos/{flask, express}` and gated by
+a regression test in
+`crates/tldr-cli/tests/med_low_schema_cleanup_v1.rs` (9 tests added).
+`vuln_migration_v1_red`: 168/168 GREEN. All AA/AB/AC/AD1 milestones
+still hold.
+
+### Bug 1 — `references` silently truncated with no signal (N6)
+
+```bash
+$ tldr references __init__ /tmp/repos/flask --format json --quiet \
+    | jq '{total_references, len: (.references | length)}'
+{ "total_references": 62, "len": 20 }
+```
+
+`total_references: 62` but the `references` array only has 20 entries
+and the JSON had no `truncated` flag — downstream tooling could not
+detect that 42 references were silently hidden behind the default
+`--limit 20`.
+
+**Fix.** Mirrored the `calls` schema's truncation triplet on
+`ReferencesReport`:
+
+- `total_references` — full pre-truncation count (already there).
+- `shown_references` — `references[].len()` after limiting.
+- `truncated` — boolean, omitted (`skip_serializing_if`) when the
+  Vec was NOT truncated, so non-truncated outputs keep the same
+  shape they had before.
+
+Files: `crates/tldr-core/src/analysis/references.rs::find_references`
+populates the new fields; `crates/tldr-cli/src/commands/references.rs::filter_by_min_confidence`
+keeps them coherent across the post-filter rewrite.
+
+### Bug 2 — empty directory silently reported `language: "python"` (N7)
+
+```bash
+$ mkdir /tmp/empty && tldr structure /tmp/empty --format json
+{ "language": "python", "files": [] }
+```
+
+For a directory with zero source files the autodetector silently
+returned `Language::Python` (the fallback default) and surfaced the
+shape `{"language":"python","files":[]}`. Users had no way to tell
+whether the directory was genuinely empty or whether the autodetector
+mis-picked.
+
+**Fix.** Switched `CodeStructure.language` from `Language` to
+`Option<Language>` and emitted `language: null` + a
+`"No source files found in directory"` warning when the dir-walk
+yielded zero source files. Mirrors the M-X5/M-Y2/M-Z8 warnings
+pattern.
+
+Files: `crates/tldr-core/src/types.rs::CodeStructure`,
+`crates/tldr-core/src/ast/extractor.rs::get_code_structure`,
+`crates/tldr-cli/src/output.rs::format_structure_text`.
+
+### Bug 3 — `tldr definition` exit code was a generic `1` (N9)
+
+```bash
+$ tldr definition /nonexistent.py 1 1; echo $?
+1
+$ tldr definition --symbol nope --file existing.py 2>/dev/null; echo $?
+1
+```
+
+Both "I gave a bad path" and "the symbol genuinely isn't there"
+collapsed onto exit 1, so callers couldn't tell which kind of
+failure they were dealing with.
+
+**Fix.** Standardized `RemainingError::exit_code`:
+
+- `FileNotFound` → 5 (filesystem-class, falls in the 2-9 band already
+  used by `TldrError::PathNotFound`).
+- `SymbolNotFound` → 20 (analysis-class, mirrors the
+  `TldrError::FunctionNotFound` exit 20 used by `tldr impact`).
+
+Also stopped wrapping typed `RemainingError`s in
+`anyhow::anyhow!(detail)` inside `definition::run`: the position-mode
+branch was discarding the type, so `main` couldn't downcast and
+collapsed onto `ExitCode::FAILURE`. Now `FileNotFound` and
+`SymbolNotFound` propagate via `Err(e.into())` and main's downcast
+chain emits the proper code.
+
+Files: `crates/tldr-cli/src/commands/remaining/error.rs::exit_code`,
+`crates/tldr-cli/src/commands/remaining/definition.rs::run`,
+`crates/tldr-cli/tests/remaining_test.rs` (refreshed `.code(...)`
+expectations across 6 tests, all of which previously asserted exit 1).
+
+### Bug 4 — `tldr calls` JSON had redundant `edge_count` / `node_count` (N12)
+
+```bash
+$ tldr calls /tmp/repos/flask --format json --quiet \
+    | jq '{node_count, edge_count, total_edges, shown_edges}'
+{ "node_count": 132, "edge_count": 935, "total_edges": 935, "shown_edges": 200 }
+```
+
+`edge_count` was always equal to `total_edges`; `node_count` was
+always equal to `nodes.len()`. Both were dead weight that confused
+schema readers about which key was canonical.
+
+**Fix.** Dropped `edge_count` and `node_count` from
+`CallGraphOutput`; canonical pair is `total_edges` + `shown_edges` +
+`truncated` (matches the `references` triplet). Internal text-format
+emitter switched from `output.edge_count` to `output.total_edges`.
+
+Files: `crates/tldr-cli/src/commands/calls.rs::CallGraphOutput`,
+`crates/tldr-cli/tests/cli_graph_tests.rs` (updated three assertions
+that expected `edge_count` / `node_count`).
+
+### Bug 5 — `dead.total_functions` vs `health.functions_analyzed` naming drift (N13)
+
+The same metric had two names: `dead.total_functions` vs
+`health.summary.functions_analyzed`. M-B2
+(`canonical-function-enumerator-v1`) defined `functions_analyzed` as
+the canonical key.
+
+**Fix.** Hand-rolled `Serialize` for `DeadCodeReport` so it emits
+BOTH keys: `functions_analyzed` (canonical, N13) and `total_functions`
+(deprecated alias, kept for back-compat with consumers that were
+reading the old key). On deserialization either key is accepted via
+`serde(alias)`. The Rust field name keeps `total_functions` to avoid
+in-process API churn.
+
+Files: `crates/tldr-core/src/types.rs::DeadCodeReport`.
+
+### Bug 6 — `dead_percentage` had 15-decimal IEEE-754 noise (N15)
+
+```bash
+$ tldr dead /tmp/repos/flask --format json --quiet | jq .dead_percentage
+0.10893246187363835
+```
+
+15 fractional digits is meaningless for a "percent dead" metric and
+made snapshot tests platform-fragile.
+
+**Fix.** Round `dead_percentage` to 2 decimal places at construction
+time in both `dead_code_analysis` (call-graph path) and
+`dead_code_analysis_refcount` (refcount path) in
+`crates/tldr-core/src/analysis/dead.rs`, plus the parallel emitter
+in `crates/tldr-core/src/quality/dead_code.rs`. New `round_pct`
+helper documents the rule for any future percentage field.
+
+### Validation
+
+- `cargo test -p tldr-cli --test med_low_schema_cleanup_v1
+  --features semantic`: 9/9 GREEN (one test per bug above + a
+  `--limit 1000` non-truncation sanity check + a "structure on real
+  project keeps language" sanity check).
+- `cargo test -p tldr-cli --test vuln_migration_v1_red
+  --features semantic`: 168/168 GREEN.
+- `cargo test -p tldr-cli --test cli_graph_tests --features
+  semantic`: 32/32 GREEN (post-N12 schema rewrite).
+- `cargo test -p tldr-core --test canonical_function_count_v1
+  --features semantic`: 3/3 GREEN — `functions_analyzed` /
+  `total_functions` agree across `health` / `dead` / `structure`
+  for python / javascript / rust.
+- All AA/AB/AC/AD1 milestones still hold.
+
+Two unrelated pre-existing test failures remain
+(`secure_command::test_secure_detects_taint`,
+`definition_command::test_definition_invalid_position`,
+`ruby_io_popen_with_user_input_via_compute_taint`); none touch the
+schemas changed in this milestone and they fail on the parent
+commit `992063a` as well.
+
 ## high-bundle-progress-determinism-coverage-v1 — internal milestone
 
 NOT a published release. UX-hygiene milestone fixing 5 HIGH-priority CLI

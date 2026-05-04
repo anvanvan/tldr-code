@@ -49,7 +49,7 @@ pub fn get_code_structure(
             Ok(structure) => {
                 return Ok(CodeStructure {
                     root: root.to_path_buf(),
-                    language,
+                    language: Some(language),
                     files: vec![structure],
                     files_skipped: 0,
                     warnings: Vec::new(),
@@ -87,7 +87,7 @@ pub fn get_code_structure(
                 ));
                 return Ok(CodeStructure {
                     root: root.to_path_buf(),
-                    language,
+                    language: Some(language),
                     files: Vec::new(),
                     files_skipped,
                     warnings,
@@ -152,12 +152,27 @@ pub fn get_code_structure(
         }
     }
 
+    // med-low-schema-cleanup-v1 (N7): when a directory walk yielded zero
+    // source files, emit `language: null` and a warning instead of
+    // silently defaulting to the requested language. This avoids the
+    // misleading shape `{"language":"python","files":[]}` for an empty
+    // directory: the user has no way to tell whether the directory is
+    // genuinely empty or whether the autodetector picked the wrong
+    // language. Mirrors the M-X5/M-Y2/M-Z8 warnings pattern.
+    let (out_language, out_warnings) = if file_structures.is_empty() && files_skipped == 0 {
+        let mut w = warnings.clone();
+        w.push("No source files found in directory".to_string());
+        (None, w)
+    } else {
+        (Some(language), warnings)
+    };
+
     Ok(CodeStructure {
         root: root.to_path_buf(),
-        language,
+        language: out_language,
         files: file_structures,
         files_skipped,
-        warnings,
+        warnings: out_warnings,
     })
 }
 

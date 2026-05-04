@@ -299,9 +299,15 @@ pub fn format_structure_text(structure: &tldr_core::CodeStructure) -> String {
         structure.root.display().to_string().bold(),
         structure.files.len()
     ));
+    // med-low-schema-cleanup-v1 (N7): `language` is `Option<Language>`
+    // and is `None` when the scanned directory contained zero source
+    // files. Render that explicitly instead of debug-printing `None`.
     output.push_str(&format!(
         "Language: {}\n\n",
-        format!("{:?}", structure.language).cyan()
+        match &structure.language {
+            Some(lang) => format!("{:?}", lang).cyan(),
+            None => "(none — no source files found)".to_string().cyan(),
+        }
     ));
 
     let prefix = &structure.root;

@@ -393,8 +393,10 @@ fn transform_core_report(
 
     let total_functions = core_report.total_functions;
     let dead_count = dead_functions.len();
+    // med-low-schema-cleanup-v1 (N15): round percentage to 2 decimals.
     let dead_percentage = if total_functions > 0 {
-        (dead_count as f64 / total_functions as f64) * 100.0
+        let raw = (dead_count as f64 / total_functions as f64) * 100.0;
+        (raw * 100.0).round() / 100.0
     } else {
         0.0
     };

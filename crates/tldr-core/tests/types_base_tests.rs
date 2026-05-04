@@ -398,16 +398,17 @@ fn test_ignore_spec_is_ignored_stub() {
 
 #[test]
 fn test_code_structure_creation() {
+    // med-low-schema-cleanup-v1 (N7): `language` is `Option<Language>`.
     let structure = CodeStructure {
         root: PathBuf::from("/project"),
-        language: Language::Python,
+        language: Some(Language::Python),
         files: vec![],
         files_skipped: 0,
         warnings: vec![],
     };
 
     assert_eq!(structure.root, PathBuf::from("/project"));
-    assert_eq!(structure.language, Language::Python);
+    assert_eq!(structure.language, Some(Language::Python));
 }
 
 #[test]

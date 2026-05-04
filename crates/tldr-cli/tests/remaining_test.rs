@@ -1012,11 +1012,13 @@ mod todo_command {
 
     #[test]
     fn test_todo_file_not_found() {
+        // med-low-schema-cleanup-v1 (N9): file-not-found is exit 5
+        // (was generic 1).
         tldr_assert_cmd()
             .args(["todo", "/nonexistent/file.py"])
             .assert()
             .failure()
-            .code(1)
+            .code(5)
             .stderr(
                 predicate::str::contains("file not found")
                     .or(predicate::str::contains("not found")),
@@ -1261,11 +1263,12 @@ mod explain_command {
 
     #[test]
     fn test_explain_file_not_found() {
+        // med-low-schema-cleanup-v1 (N9): file-not-found is exit 5.
         tldr_assert_cmd()
             .args(["explain", "/nonexistent/file.py", "some_function"])
             .assert()
             .failure()
-            .code(1)
+            .code(5)
             .stderr(
                 predicate::str::contains("file not found")
                     .or(predicate::str::contains("not found")),
@@ -1277,6 +1280,9 @@ mod explain_command {
         let temp = TempDir::new().unwrap();
         let file_path = create_test_file(&temp, "sample.py", PYTHON_EXPLAIN_SAMPLE);
 
+        // med-low-schema-cleanup-v1 (N9): symbol-not-found is exit 20
+        // (matches the `tldr impact` convention for analysis-class
+        // failures).
         tldr_assert_cmd()
             .args([
                 "explain",
@@ -1285,7 +1291,7 @@ mod explain_command {
             ])
             .assert()
             .failure()
-            .code(1)
+            .code(20)
             .stderr(predicate::str::contains("not found").or(predicate::str::contains("symbol")));
     }
 
@@ -1502,11 +1508,12 @@ mod secure_command {
 
     #[test]
     fn test_secure_file_not_found() {
+        // med-low-schema-cleanup-v1 (N9): file-not-found is exit 5.
         tldr_assert_cmd()
             .args(["secure", "/nonexistent/file.py"])
             .assert()
             .failure()
-            .code(1)
+            .code(5)
             .stderr(
                 predicate::str::contains("file not found")
                     .or(predicate::str::contains("not found")),
@@ -1726,11 +1733,15 @@ result = len([1, 2, 3])
     #[test]
 
     fn test_definition_file_not_found() {
-        // Command gracefully handles nonexistent files (returns placeholder, exit 0)
+        // med-low-schema-cleanup-v1 (N9): missing-file path returns
+        // exit 5 (filesystem-class). Pre-fix this returned exit 0
+        // with a fake-success placeholder, then exit 1 generic, now
+        // exit 5 typed.
         tldr_assert_cmd()
             .args(["definition", "/nonexistent/file.py", "1", "0"])
             .assert()
-            .success();
+            .failure()
+            .code(5);
     }
 
     #[test]
@@ -1739,6 +1750,8 @@ result = len([1, 2, 3])
         let temp = TempDir::new().unwrap();
         let file_path = create_test_file(&temp, "sample.py", PYTHON_DEFINITION_SAMPLE);
 
+        // med-low-schema-cleanup-v1 (N9): symbol-not-found is exit 20
+        // (analysis-class, mirrors the `tldr impact` convention).
         tldr_assert_cmd()
             .args([
                 "definition",
@@ -1749,7 +1762,7 @@ result = len([1, 2, 3])
             ])
             .assert()
             .failure()
-            .code(1)
+            .code(20)
             .stderr(predicate::str::contains("not found").or(predicate::str::contains("symbol")));
     }
 
@@ -2021,11 +2034,12 @@ mod diff_command {
         let temp = TempDir::new().unwrap();
         let file_a = create_test_file(&temp, "a.py", PYTHON_DIFF_A);
 
+        // med-low-schema-cleanup-v1 (N9): file-not-found is exit 5.
         tldr_assert_cmd()
             .args(["diff", file_a.to_str().unwrap(), "/nonexistent/file.py"])
             .assert()
             .failure()
-            .code(1)
+            .code(5)
             .stderr(
                 predicate::str::contains("file not found")
                     .or(predicate::str::contains("not found")),
@@ -2320,11 +2334,12 @@ def safe_file_handling():
 
     #[test]
     fn test_api_check_file_not_found() {
+        // med-low-schema-cleanup-v1 (N9): file-not-found is exit 5.
         tldr_assert_cmd()
             .args(["api-check", "/nonexistent/file.py"])
             .assert()
             .failure()
-            .code(1)
+            .code(5)
             .stderr(
                 predicate::str::contains("file not found")
                     .or(predicate::str::contains("not found")),
@@ -2845,11 +2860,12 @@ def search():
     #[test]
 
     fn test_vuln_file_not_found() {
+        // med-low-schema-cleanup-v1 (N9): file-not-found is exit 5.
         tldr_assert_cmd()
             .args(["vuln", "/nonexistent/file.py"])
             .assert()
             .failure()
-            .code(1)
+            .code(5)
             .stderr(
                 predicate::str::contains("file not found")
                     .or(predicate::str::contains("not found")),

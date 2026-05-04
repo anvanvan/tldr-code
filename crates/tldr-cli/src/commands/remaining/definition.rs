@@ -292,21 +292,37 @@ impl DefinitionArgs {
                     // JSON payload with `name: "<unknown at ...>"` — the
                     // CLI exited 0 and downstream tooling could not detect
                     // the failure.
-                    let msg = e.to_string();
-                    let detail = if msg.contains("unresolved at") {
-                        // The InvalidArgument sentinel already contains the
-                        // file:line:col anchor — propagate verbatim.
-                        msg
-                    } else {
-                        format!(
-                            "definition not found for {}:{}:{}: {}",
-                            file.display(),
-                            line,
-                            column,
-                            msg
-                        )
-                    };
-                    return Err(anyhow::anyhow!(detail));
+                    //
+                    // med-low-schema-cleanup-v1 (N9): preserve the
+                    // typed `RemainingError` so `main` can downcast it
+                    // and emit the standardized exit code (5 for
+                    // missing-file, 20 for symbol-not-found).
+                    // Previously we wrapped every failure into a plain
+                    // `anyhow::anyhow!` string which discarded the
+                    // type and collapsed every definition failure
+                    // onto exit 1.
+                    match e {
+                        RemainingError::FileNotFound { .. }
+                        | RemainingError::SymbolNotFound { .. } => return Err(e.into()),
+                        _ => {
+                            let msg = e.to_string();
+                            let detail = if msg.contains("unresolved at") {
+                                // The InvalidArgument sentinel already
+                                // contains the file:line:col anchor —
+                                // propagate verbatim.
+                                msg
+                            } else {
+                                format!(
+                                    "definition not found for {}:{}:{}: {}",
+                                    file.display(),
+                                    line,
+                                    column,
+                                    msg
+                                )
+                            };
+                            return Err(anyhow::anyhow!(detail));
+                        }
+                    }
                 }
             }
         };

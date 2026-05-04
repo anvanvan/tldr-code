@@ -58,13 +58,25 @@ fn test_calls_basic_json() {
 
     assert!(output.status.success(), "calls command should succeed");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // med-low-schema-cleanup-v1 (N12): canonical keys are total_edges /
+    // shown_edges / truncated; the redundant `edge_count` / `node_count`
+    // pair was removed (edge_count was always equal to total_edges and
+    // node_count was always equal to nodes.len()).
     assert!(
-        stdout.contains("\"edge_count\""),
-        "JSON should contain edge_count"
+        stdout.contains("\"total_edges\""),
+        "JSON should contain total_edges"
     );
     assert!(
-        stdout.contains("\"node_count\""),
-        "JSON should contain node_count"
+        stdout.contains("\"shown_edges\""),
+        "JSON should contain shown_edges"
+    );
+    assert!(
+        !stdout.contains("\"edge_count\""),
+        "JSON should NOT contain redundant edge_count (N12)"
+    );
+    assert!(
+        !stdout.contains("\"node_count\""),
+        "JSON should NOT contain redundant node_count (N12)"
     );
     assert!(
         stdout.contains("main.py"),
@@ -112,9 +124,10 @@ fn test_calls_compact_format() {
         !stdout.contains("\n{"),
         "Compact format should not have newlines before objects"
     );
+    // med-low-schema-cleanup-v1 (N12): canonical key is total_edges.
     assert!(
-        stdout.contains("edge_count"),
-        "Output should contain edge_count"
+        stdout.contains("total_edges"),
+        "Output should contain total_edges"
     );
 }
 
@@ -724,8 +737,9 @@ fn test_empty_project() {
 
     // If it succeeds, should show empty results
     if output.status.success() {
+        // med-low-schema-cleanup-v1 (N12): canonical key is total_edges.
         assert!(
-            stdout.contains("\"edge_count\": 0") || stdout.contains("\"edge_count\":0"),
+            stdout.contains("\"total_edges\": 0") || stdout.contains("\"total_edges\":0"),
             "Empty project should have 0 edges"
         );
     }

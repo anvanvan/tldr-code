@@ -55,6 +55,13 @@ const MAX_CONTEXT_LENGTH: usize = 200;
 ///
 /// Contains all information about references to a symbol including
 /// the definition location, all references found, and search statistics.
+///
+/// med-low-schema-cleanup-v1 (N6): mirrors the `calls` schema's
+/// truncation triplet — `total_references` (full pre-truncation count),
+/// `shown_references` (length of `references` after limiting), and
+/// `truncated` (whether limiting actually dropped any). Pre-fix the
+/// `references` Vec was silently capped at `--limit` and there was no
+/// way for downstream tooling to detect that more references existed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReferencesReport {
     /// Symbol that was searched for
@@ -64,17 +71,35 @@ pub struct ReferencesReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<Definition>,
 
-    /// All references found
+    /// All references found (post-truncation; may be a prefix of the
+    /// full set if `truncated == true`).
     pub references: Vec<Reference>,
 
-    /// Total number of references
+    /// Total number of references found before any limit was applied.
     pub total_references: usize,
+
+    /// Number of references actually returned in `references` after
+    /// applying the caller's limit. Equals `references.len()`.
+    #[serde(default)]
+    pub shown_references: usize,
+
+    /// Whether the `references` Vec was truncated by the caller's
+    /// `--limit`. When `true`, `total_references > shown_references`.
+    /// Omitted from JSON when `false` to keep the default-shape
+    /// existing snapshot tests stable.
+    #[serde(default, skip_serializing_if = "is_false_bool")]
+    pub truncated: bool,
 
     /// Search scope used
     pub search_scope: SearchScope,
 
     /// Search statistics
     pub stats: ReferenceStats,
+}
+
+/// Helper for `skip_serializing_if` on the boolean `truncated` field.
+fn is_false_bool(v: &bool) -> bool {
+    !*v
 }
 
 impl ReferencesReport {
@@ -93,6 +118,8 @@ impl ReferencesReport {
             definition: None,
             references: Vec::new(),
             total_references: 0,
+            shown_references: 0,
+            truncated: false,
             search_scope: scope,
             stats,
         }
@@ -3235,10 +3262,16 @@ pub fn find_references(
     // 20 (low)?".)
     let total_verified = references.len();
 
-    // Apply limit if specified
+    // Apply limit if specified.
+    // med-low-schema-cleanup-v1 (N6): record whether truncation actually
+    // dropped any references and how many we ended up returning so the
+    // CLI/JSON output can carry honest truncation metadata. Mirrors
+    // the `calls` schema (truncated / total_edges / shown_edges).
+    let truncated = options.limit.is_some_and(|l| total_verified > l);
     if let Some(limit) = options.limit {
         references.truncate(limit);
     }
+    let shown_references = references.len();
 
     let files_searched = count_source_files(root, language);
 
@@ -3254,6 +3287,8 @@ pub fn find_references(
         definition,
         references,
         total_references: total_verified,
+        shown_references,
+        truncated,
         search_scope: effective_scope, // Use the effective scope (auto-detected or explicit)
         stats,
     })
@@ -3789,6 +3824,8 @@ mod tests {
                 "login()".to_string(),
             )],
             total_references: 1,
+            shown_references: 1,
+            truncated: false,
             search_scope: SearchScope::Workspace,
             stats: ReferenceStats::new(10, 5, 1).with_time(50),
         };

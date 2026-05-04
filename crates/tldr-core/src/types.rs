@@ -1020,8 +1020,16 @@ impl IgnoreSpec {
 pub struct CodeStructure {
     /// Root directory of the analyzed project
     pub root: PathBuf,
-    /// Primary programming language of the project
-    pub language: Language,
+    /// Primary programming language of the project.
+    ///
+    /// med-low-schema-cleanup-v1 (N7): emitted as `null` when the
+    /// directory contains zero source files (instead of silently
+    /// defaulting to `"python"`). When `language` is `None` the
+    /// `warnings` field carries a `"No source files found in
+    /// directory"` entry, mirroring the M-X5/M-Y2/M-Z8 warnings
+    /// pattern.
+    #[serde(default)]
+    pub language: Option<Language>,
     /// Structural information for each source file
     pub files: Vec<FileStructure>,
     /// Files that were skipped during the scan (with reason).
@@ -2173,7 +2181,12 @@ pub struct CallerTree {
 /// - `possibly_dead`: Public/exported but uncalled (may be API surface)
 ///
 /// The `dead_percentage` is calculated from `dead_functions` only (definitely dead).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// med-low-schema-cleanup-v1 (N13): JSON serialization emits both
+/// `functions_analyzed` (canonical, matches `health.summary.functions_analyzed`
+/// from the M-B2 canonical-function-enumerator-v1 vocabulary) and the legacy
+/// `total_functions` key (deprecated alias) for back-compat.
+#[derive(Debug, Clone, Deserialize)]
 pub struct DeadCodeReport {
     /// Functions that are definitely dead (private and uncalled)
     pub dead_functions: Vec<FunctionRef>,
@@ -2187,10 +2200,41 @@ pub struct DeadCodeReport {
     /// Number of possibly-dead (public but uncalled) functions
     #[serde(default)]
     pub total_possibly_dead: usize,
-    /// Total number of functions in the analyzed codebase
+    /// Total number of functions in the analyzed codebase.
+    ///
+    /// Accepts both `functions_analyzed` (canonical, N13) and
+    /// `total_functions` (legacy) on deserialization.
+    #[serde(alias = "functions_analyzed")]
     pub total_functions: usize,
     /// Percentage of definitely-dead functions (excludes possibly_dead)
     pub dead_percentage: f64,
+}
+
+// med-low-schema-cleanup-v1 (N13): hand-rolled `Serialize` so we can emit
+// the canonical `functions_analyzed` key AND keep the legacy
+// `total_functions` key in JSON for back-compat. Field order matches the
+// previous struct shape so existing snapshot tests keep diffing cleanly.
+impl serde::Serialize for DeadCodeReport {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("DeadCodeReport", 8)?;
+        s.serialize_field("dead_functions", &self.dead_functions)?;
+        s.serialize_field("possibly_dead", &self.possibly_dead)?;
+        s.serialize_field("by_file", &self.by_file)?;
+        s.serialize_field("total_dead", &self.total_dead)?;
+        s.serialize_field("total_possibly_dead", &self.total_possibly_dead)?;
+        // Canonical key (N13).
+        s.serialize_field("functions_analyzed", &self.total_functions)?;
+        // Deprecated alias - kept for back-compat with consumers that
+        // were reading the old key. Will be removed in a future major
+        // release; new code should read `functions_analyzed`.
+        s.serialize_field("total_functions", &self.total_functions)?;
+        s.serialize_field("dead_percentage", &self.dead_percentage)?;
+        s.end()
+    }
 }
 
 // =============================================================================

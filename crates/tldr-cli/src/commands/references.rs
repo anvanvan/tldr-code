@@ -193,14 +193,24 @@ fn parse_kinds(s: &str) -> Vec<ReferenceKind> {
 /// Filter a report by minimum confidence threshold.
 ///
 /// Removes references with confidence below `min_confidence` and
-/// updates `total_references` to match. References with `None` confidence
-/// are treated as 0.0.
+/// updates `total_references` / `shown_references` to match. References
+/// with `None` confidence are treated as 0.0.
+///
+/// med-low-schema-cleanup-v1 (N6): also keeps `shown_references`
+/// consistent with the post-filter Vec and clears `truncated` if the
+/// filter happens to drop the report below the original limit (this
+/// is a defensive sync; the truncation flag was set upstream against
+/// the pre-filter total).
 fn filter_by_min_confidence(mut report: ReferencesReport, min_confidence: f64) -> ReferencesReport {
     if min_confidence > 0.0 {
         report
             .references
             .retain(|r| r.confidence.unwrap_or(0.0) >= min_confidence);
         report.total_references = report.references.len();
+        report.shown_references = report.references.len();
+        // After confidence filtering the Vec is the full surviving set;
+        // there's no longer a hidden tail behind a `--limit`.
+        report.truncated = false;
     }
     report
 }
@@ -331,6 +341,8 @@ mod tests {
                 ),
             ],
             total_references: 2,
+            shown_references: 2,
+            truncated: false,
             search_scope: SearchScope::Workspace,
             stats: ReferenceStats {
                 files_searched: 10,
@@ -498,6 +510,8 @@ mod tests {
                 ),
             ],
             total_references: 3,
+            shown_references: 3,
+            truncated: false,
             search_scope: SearchScope::Workspace,
             stats: ReferenceStats {
                 files_searched: 5,
