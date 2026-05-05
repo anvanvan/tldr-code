@@ -56,12 +56,12 @@ export async function POST(request) {
     let sink_lines: Vec<_> = result
         .sinks
         .iter()
-        .filter(|s| matches!(s.sink_type, TaintSinkType::FileWrite))
+        .filter(|s| matches!(s.sink_type, TaintSinkType::OpenRedirect))
         .map(|s| s.line)
         .collect();
     assert!(
         !sink_lines.is_empty(),
-        "expected at least one FileWrite sink for NextResponse.redirect; \
+        "expected at least one OpenRedirect sink for NextResponse.redirect; \
          got sinks={:?}",
         result.sinks
     );
@@ -120,12 +120,12 @@ export async function action(formData) {
     let sink_lines: Vec<_> = result
         .sinks
         .iter()
-        .filter(|s| matches!(s.sink_type, TaintSinkType::FileWrite))
+        .filter(|s| matches!(s.sink_type, TaintSinkType::OpenRedirect))
         .map(|s| s.line)
         .collect();
     assert!(
         !sink_lines.is_empty(),
-        "expected at least one FileWrite sink for bare redirect() helper; \
+        "expected at least one OpenRedirect sink for bare redirect() helper; \
          got sinks={:?}",
         result.sinks
     );
@@ -201,12 +201,12 @@ async function go(request, reply) {
     let sink_lines: Vec<_> = result
         .sinks
         .iter()
-        .filter(|s| matches!(s.sink_type, TaintSinkType::FileWrite))
+        .filter(|s| matches!(s.sink_type, TaintSinkType::OpenRedirect))
         .map(|s| s.line)
         .collect();
     assert!(
         !sink_lines.is_empty(),
-        "expected at least one FileWrite sink for reply.redirect; \
+        "expected at least one OpenRedirect sink for reply.redirect; \
          got sinks={:?}",
         result.sinks
     );
@@ -281,12 +281,12 @@ async function handler(req, res) {
     let sink_lines: Vec<_> = result
         .sinks
         .iter()
-        .filter(|s| matches!(s.sink_type, TaintSinkType::FileWrite))
+        .filter(|s| matches!(s.sink_type, TaintSinkType::OpenRedirect))
         .map(|s| s.line)
         .collect();
     assert!(
         !sink_lines.is_empty(),
-        "expected at least one FileWrite sink for res.redirect; \
+        "expected at least one OpenRedirect sink for res.redirect; \
          got sinks={:?}",
         result.sinks
     );
@@ -338,12 +338,12 @@ async function handler(req, Response) {
     let sink_lines: Vec<_> = result
         .sinks
         .iter()
-        .filter(|s| matches!(s.sink_type, TaintSinkType::FileWrite))
+        .filter(|s| matches!(s.sink_type, TaintSinkType::OpenRedirect))
         .map(|s| s.line)
         .collect();
     assert!(
         !sink_lines.is_empty(),
-        "expected at least one FileWrite sink for Response.redirect (builder); \
+        "expected at least one OpenRedirect sink for Response.redirect (builder); \
          got sinks={:?}",
         result.sinks
     );

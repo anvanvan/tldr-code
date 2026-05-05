@@ -279,7 +279,7 @@ mod structure_tests {
         cmd.args(["structure", "-l", "python", "-q"]);
         cmd.assert()
             .success()
-            .stdout(predicate::str::contains("\"functions\""))
+            .stdout(predicate::str::contains("\"definitions\""))
             .stdout(predicate::str::contains("\"classes\""));
     }
 

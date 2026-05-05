@@ -1,5 +1,72 @@
 # Changelog
 
+## test-fixture-realignment-v1 — internal milestone
+
+NOT a published release. Realigns 6 unit-test assertions left stale by
+two prior milestones: M3's `detection-accuracy-v1` correctly reclassified
+JS/TS redirect sinks from `FileWrite`/CWE-22 (the wrong category — open
+redirects are CWE-601, not path traversal) to `OpenRedirect`/CWE-601, and
+M4's `schema-cleanup-v1` removed the redundant `functions` string array
+from `tldr structure` JSON in favour of the canonical `definitions`
+array. The two milestones each introduced their semantic fix correctly,
+but did not update tests in adjacent files that asserted on the
+pre-existing-buggy behaviour. Five `rr_framework_integ_test` cases
+(`nextjs_response_redirect_open_redirect_via_compute_taint`,
+`nextjs_redirect_helper_via_compute_taint`,
+`fastify_reply_redirect_via_compute_taint`,
+`nestjs_res_redirect_open_redirect_via_compute_taint`,
+`nestjs_response_builder_redirect_via_compute_taint`) — each of whose
+*name* already encoded the correct "open redirect" intent — and one
+`cli_basic_tests::structure_tests::test_structure_default_path` case
+were updated to match the new (correct) semantics. No production code
+changed.
+
+### Changed
+- `crates/tldr-core/tests/rr_framework_integ_test.rs` — five redirect-flow
+  tests updated from `TaintSinkType::FileWrite` to
+  `TaintSinkType::OpenRedirect` with correspondingly retitled assertion
+  messages. The other two `FileWrite` assertions in this file
+  (`fastify_reply_header_injection_via_compute_taint` line 218 and
+  `nextjs_dangerously_set_inner_html_via_compute_taint` line 138) were
+  left intact — they were passing under M3 and target separate sink
+  categories (header-injection and JSX-XSS); they are out of scope for
+  this realignment.
+- `crates/tldr-cli/tests/cli_basic_tests.rs:282` — `test_structure_default_path`
+  now asserts the canonical `"definitions"` substring instead of the
+  removed-by-design `"functions"` string array.
+
+### Architectural note
+This is purely a test-file realignment. The pattern is the same one used
+by `detection-gap-fixes-v1` (commit 18a3680) earlier in the project: when
+a milestone fixes a *semantic* bug, follow up on stale test assertions
+in adjacent suites whose *name* already encodes the correct intent. The
+test names served as the source of truth — `..._open_redirect_...` is
+unambiguous about what the test was meant to assert.
+
+### Retained
+- All M3 + M4 production code intact (no changes to
+  `crates/tldr-core/src/security/` or `crates/tldr-core/src/types.rs`).
+- The two non-redirect `FileWrite` assertions in `rr_framework_integ_test`
+  (header-injection, JSX `dangerouslySetInnerHTML`) remain unchanged —
+  out of scope.
+- All 6 prior milestone test files stay GREEN: M0 168, M1 5, M2 7, M3 4,
+  M4 11, M5 6 = 201/201.
+
+### Quantification
+
+| Suite | Before this commit | After this commit |
+| --- | --- | --- |
+| `cargo test -p tldr-core --test rr_framework_integ_test` | 13 passed / 5 failed | 18 passed / 0 failed |
+| `cargo test -p tldr-cli --test cli_basic_tests structure_tests::test_structure_default_path` | FAIL | OK |
+| `cargo test -p tldr-cli --test cli_basic_tests` | 69 passed / 1 failed | 70 passed / 0 failed |
+
+### Standing rules upheld
+- One atomic commit, one CHANGELOG entry, one local annotated tag
+- Cargo.lock not staged
+- No push, no `cargo publish`, no version bump (manifest stays at 0.3.0)
+- Explicit-add only (3 files)
+- 168/168 master regression `vuln_migration_v1_red` preserved
+
 ## surface-gaps-v1 — internal milestone
 
 NOT a published release. Closes 2 audit-found bugs that share the
