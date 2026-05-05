@@ -132,10 +132,12 @@ fn test_calls_compact_format() {
 }
 
 #[test]
-fn test_calls_dot_format_rejected() {
-    // format-flag-strictness-v1: `calls` does not emit a real DOT/Graphviz
-    // document, so `--format dot` previously silently fell back to JSON
-    // (a UX false-trust hazard). It must now error out instead.
+fn test_calls_dot_format_emits_digraph() {
+    // surface-gaps-v1 (commit 1a692bc) added real DOT/Graphviz emission for
+    // `tldr calls` (alongside `inheritance`, `hubs`, `impact`). The previous
+    // format-flag-strictness-v1 stance — that DOT was unsupported and must
+    // error — has been superseded. `calls --format dot` now succeeds and
+    // emits a `digraph calls { ... }` document.
     let temp_dir = create_test_project();
     let output = tldr_cmd()
         .args([
@@ -149,13 +151,15 @@ fn test_calls_dot_format_rejected() {
         .expect("Failed to execute tldr calls");
 
     assert!(
-        !output.status.success(),
-        "calls --format dot must error (DOT not supported by calls)"
+        output.status.success(),
+        "calls --format dot must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("not supported"),
-        "stderr should explain DOT is unsupported; got: {stderr}"
+        stdout.starts_with("digraph"),
+        "calls --format dot stdout must start with 'digraph'; got: {}",
+        stdout.lines().next().unwrap_or("")
     );
 }
 

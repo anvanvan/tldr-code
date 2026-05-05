@@ -1,5 +1,55 @@
 # Changelog
 
+## calls-dot-test-followup-v1 — internal milestone
+
+NOT a published release. Aligns one stale test left red by
+`surface-gaps-v1` (M5). The phase-1 milestone added real DOT/Graphviz
+emission to `tldr calls` (alongside `inheritance`, `hubs`, `impact`),
+superseding the earlier `format-flag-strictness-v1` stance that DOT
+was unsupported by `calls` and must error. M5 updated
+`format_flag_strictness_v1.rs` itself (dropping its `dot_errors_on_calls`
+case), but did not update an *adjacent* test in `cli_graph_tests.rs`
+that asserted the same now-stale expectation. Test inverted: it now
+asserts `calls --format dot` succeeds and emits `digraph ...`. No
+production code changed.
+
+### Changed
+- `crates/tldr-cli/tests/cli_graph_tests.rs:134-160` — renamed
+  `test_calls_dot_format_rejected` → `test_calls_dot_format_emits_digraph`;
+  inverted assertion to require `output.status.success()` and
+  `stdout.starts_with("digraph")` (matches the same expectation already
+  exercised by `surface_gaps_v1::calls_dot_output_valid`). Comment block
+  rewritten to point at `surface-gaps-v1` (commit 1a692bc).
+
+### Architectural note
+Same pattern as `test-fixture-realignment-v1` and
+`bug13-stale-test-followup-v1`: when a milestone changes externally-
+visible behaviour (DOT now supported), follow-up on adjacent tests
+whose old assertions encoded the prior contract. The `calls` DOT
+output's substantive correctness is still covered by
+`surface_gaps_v1::calls_dot_output_valid` — this test was redundant
+before M5 and is now properly aligned with the new contract.
+
+### Retained
+- All M5 production code (`crates/tldr-cli/src/commands/calls.rs` DOT
+  arm, `output.rs::format_calls_dot`).
+- The `format_flag_strictness_v1` allowlist (already updated by M5).
+
+### Quantification
+
+| Suite | Before | After |
+| --- | --- | --- |
+| `cli_graph_tests::test_calls_dot_format_rejected` | FAIL | renamed + OK |
+| `cli_graph_tests` (full) | 31/32 | 32/32 |
+
+### Standing rules upheld
+- One atomic commit, one CHANGELOG entry, one local annotated tag
+- Cargo.lock not staged
+- No push, no `cargo publish`, no version bump (manifest stays at 0.3.0)
+- Explicit-add only (2 files: 1 test + CHANGELOG)
+- 168/168 master regression preserved
+- All other phase-1, phase-2, phase-3 milestone test files preserved GREEN
+
 ## path-and-schema-cleanup-v3 — internal milestone
 
 NOT a published release. Closes 5 small bugs surfaced by the convergence
