@@ -1,5 +1,90 @@
 # Changelog
 
+## cli-error-clarity-v2 — internal milestone
+
+NOT a published release. Second milestone of phase 2: closes three
+MED-severity bugs that all share the surface "the CLI says one thing, the
+runtime does another". When users get conflicting signals from `--help`,
+error messages, and command behaviour, they lose trust in the tool. Each
+bug is a small footgun on its own; together they make the surface feel
+unreliable.
+
+### Fixed
+
+- **P2.BUG-4: `tldr hubs|impact|whatbreaks|change-impact <file>` returned
+  confusing errors when given a regular file instead of a directory.**
+  `hubs`, `impact`, and `whatbreaks` checked `path.exists()` only, so
+  passing a file produced `Error: Path not found: <file>` — false, the
+  file *does* exist. `change-impact` had no validation at all; the file
+  reached the git invocation downstream and surfaced
+  `Git: Not a directory (os error 20)`, which gives the user no clue
+  what to fix. New shared helper `path_validation::require_directory`
+  centralises the check and produces a single, actionable message:
+  `<command> requires a directory; got file '<path>'. Pass the project
+  root or omit the argument to use the current directory.` All four
+  commands now use the helper before any expensive work runs.
+  - `crates/tldr-cli/src/path_validation.rs` — new module + unit tests.
+  - `crates/tldr-cli/src/lib.rs` — register the module.
+  - `crates/tldr-cli/src/commands/hubs.rs` — replace bare-`exists` check.
+  - `crates/tldr-cli/src/commands/impact.rs` — replace bare-`exists` check.
+  - `crates/tldr-cli/src/commands/whatbreaks.rs` — replace bare-`exists`
+    check.
+  - `crates/tldr-cli/src/commands/change_impact.rs` — add validation
+    upstream of the git invocation.
+
+- **P2.BUG-5: per-command `--help` advertised `sarif` / `dot` formats
+  the runtime rejects.** The global `--format` flag is a `clap::ValueEnum`
+  with five variants (json, text, compact, sarif, dot). clap's auto-generated
+  help dutifully listed all five under "Possible values" on every
+  subcommand. But `validate_format_for_command` (output.rs) gates SARIF
+  to `vuln`/`clones` and DOT to `clones`/`deps`/`calls`/`impact`/`hubs`/
+  `inheritance`, so `tldr structure --format sarif` advertised support
+  in `--help` and then bailed at runtime with "not supported by
+  structure". Fix: hide possible values on the global flag
+  (`hide_possible_values = true`) and replace the auto-generated list
+  with explicit long-help text that names which commands actually emit
+  each command-specific format. The runtime is unchanged — it remains
+  the source of truth for which format/command pairs are valid.
+  - `crates/tldr-cli/src/main.rs` — `Cli.format` definition: hide
+    possible values + add long help describing universal vs
+    command-specific formats.
+
+- **P2.BUG-8: `tldr context <fn> <repo-root>` returned 0 functions when
+  the same call from `<repo-root>/src` returned several.** Root cause
+  was in `find_function_in_graph` (context/builder.rs): it iterated
+  call-graph edges and returned the FIRST match. When a project root
+  is walked (e.g. flask/), test fixtures often contain placeholder
+  classes with the same name as the real implementation but no method
+  bodies (`class Flask: pass` in `tests/test_config.py`). The first
+  edge could therefore land on the placeholder, BFS would collect a
+  single key under that path, `find_function_info` would return None
+  for every key, and the entire function list would come back empty.
+  Walking from `<root>/src` happened to put the real edge first, so
+  the bug only surfaced from the project root. Fix: collect ALL
+  candidate locations, deprioritise paths under `tests/`/`__tests__`/
+  `spec`/etc., and verify each candidate by extracting the module and
+  confirming the function is actually defined there. Only fall back to
+  the first edge match if no candidate verifies.
+  - `crates/tldr-core/src/context/builder.rs` —
+    `find_function_in_graph` rewritten as a verified candidate
+    selector with a test-path deprioritisation heuristic.
+
+### Tests
+
+- New: `crates/tldr-cli/tests/cli_error_clarity_v2.rs` — seven tests:
+  `hubs_on_file_clear_error`, `impact_on_file_clear_error`,
+  `whatbreaks_on_file_clear_error`, `change_impact_on_file_clear_error`
+  (all assert: failure exit + stderr mentions "requires a directory"
+  and the file path), `format_help_matches_runtime_calls` and
+  `format_help_matches_runtime_structure` (assert help no longer
+  advertises sarif/dot for non-supporting commands AND runtime still
+  rejects them), and `context_works_from_repo_root` (synthetic mini-
+  repo with a placeholder `Foo` in `tests/` and the real `Foo.bar` in
+  `src/pkg/core.py`; asserts `tldr context Foo.bar <root>` returns
+  >= 1 function and `>=` the count returned from `<root>/src`).
+- New unit tests: `crates/tldr-cli/src/path_validation.rs::tests`
+  (3 tests covering directory pass, file fail, missing-path fail).
+
 ## cross-language-extraction-v2 — internal milestone
 
 NOT a published release. First milestone of phase 2: closes the three

@@ -28,6 +28,7 @@ use tldr_core::callgraph::{build_forward_graph, build_reverse_graph, collect_nod
 use tldr_core::{build_project_call_graph, Language};
 
 use crate::output::{format_hubs_dot, format_hubs_text, OutputFormat, OutputWriter};
+use crate::path_validation::require_directory;
 
 /// Algorithm selection for CLI (mirrors HubAlgorithm)
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -86,10 +87,11 @@ impl HubsArgs {
     pub fn run(&self, format: OutputFormat, quiet: bool) -> Result<()> {
         let writer = OutputWriter::new(format, quiet);
 
-        // Validate path exists
-        if !self.path.exists() {
-            anyhow::bail!("Path not found: {}", self.path.display());
-        }
+        // Validate path exists AND is a directory.
+        // cli-error-clarity-v2 (P2.BUG-4): when given a regular file we used
+        // to print "Path not found" (false). Use the shared helper so the
+        // error explains the user mistake clearly.
+        require_directory(&self.path, "hubs")?;
 
         // Validate threshold if provided
         if let Some(thresh) = self.threshold {

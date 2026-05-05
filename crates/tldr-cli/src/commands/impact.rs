@@ -14,6 +14,7 @@ use tldr_core::{build_project_call_graph, impact_analysis_with_ast_fallback, Lan
 
 use crate::commands::daemon_router::{params_with_func_depth, try_daemon_route};
 use crate::output::{format_impact_dot, format_impact_text, OutputFormat, OutputWriter};
+use crate::path_validation::require_directory;
 
 /// Analyze impact of changing a function
 #[derive(Debug, Args)]
@@ -47,11 +48,12 @@ impl ImpactArgs {
     pub fn run(&self, format: OutputFormat, quiet: bool) -> Result<()> {
         let writer = OutputWriter::new(format, quiet);
 
-        // Validate path exists BEFORE language detection / progress banner
-        // (lang-detect-default-v1)
-        if !self.path.exists() {
-            anyhow::bail!("Path not found: {}", self.path.display());
-        }
+        // Validate path exists AND is a directory BEFORE language detection
+        // / progress banner (lang-detect-default-v1).
+        // cli-error-clarity-v2 (P2.BUG-4): reject files with a clear message
+        // instead of saying "Path not found" or letting downstream surface
+        // cryptic IO errors.
+        require_directory(&self.path, "impact")?;
 
         // Determine language (auto-detect from directory, default to Python)
         let language = self

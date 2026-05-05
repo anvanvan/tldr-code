@@ -23,6 +23,7 @@ use tldr_core::analysis::whatbreaks::{whatbreaks_analysis, TargetType, Whatbreak
 use tldr_core::Language;
 
 use crate::output::{format_whatbreaks_text, OutputFormat, OutputWriter};
+use crate::path_validation::require_directory;
 
 /// Target type selection for CLI (T15 mitigation)
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -80,10 +81,9 @@ impl WhatbreaksArgs {
     pub fn run(&self, format: OutputFormat, quiet: bool) -> Result<()> {
         let writer = OutputWriter::new(format, quiet);
 
-        // Validate path exists
-        if !self.path.exists() {
-            anyhow::bail!("Path not found: {}", self.path.display());
-        }
+        // Validate path exists AND is a directory.
+        // cli-error-clarity-v2 (P2.BUG-4).
+        require_directory(&self.path, "whatbreaks")?;
 
         writer.progress(&format!(
             "Analyzing what breaks if '{}' changes...",

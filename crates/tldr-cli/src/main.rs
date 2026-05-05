@@ -79,7 +79,26 @@ pub struct Cli {
     pub command: Command,
 
     /// Output format
-    #[arg(long, short = 'f', global = true, default_value = "json")]
+    ///
+    /// Supported by every command: json, text, compact.
+    ///
+    /// Command-specific formats (rejected at runtime by other commands):
+    ///   sarif  — only: vuln, clones
+    ///   dot    — only: calls, impact, hubs, inheritance, clones, deps
+    ///
+    /// cli-error-clarity-v2 (P2.BUG-5): possible values are hidden on the
+    /// global help to avoid promising sarif/dot for every subcommand. Run
+    /// `tldr <cmd> --help` to confirm what a specific command emits, and
+    /// see `validate_format_for_command` in `output.rs` for the source of
+    /// truth.
+    #[arg(
+        long,
+        short = 'f',
+        global = true,
+        default_value = "json",
+        hide_possible_values = true,
+        value_name = "FORMAT"
+    )]
     pub format: OutputFormat,
 
     /// Programming language (auto-detect if not specified)

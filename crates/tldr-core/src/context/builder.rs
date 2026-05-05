@@ -223,6 +223,17 @@ pub fn get_relevant_context(
 ///
 /// When `file_filter` is `Some`, only matches functions whose file path ends with
 /// the filter path. This disambiguates common function names that appear in multiple files.
+///
+/// cli-error-clarity-v2 (P2.BUG-8): when running from a project root, the call
+/// graph may contain edges where the *callee* refers to a method by a name that
+/// also happens to be defined as a placeholder (with no methods) in a test
+/// file. The previous implementation returned the first edge match, which
+/// could land on the placeholder file (e.g. `tests/test_config.py` defining a
+/// stub class `Flask`) and then `find_function_info` would fail, producing 0
+/// functions. We now collect ALL candidate locations and prefer ones whose
+/// extracted module actually contains the function definition. As a tertiary
+/// preference (still without verification) we deprioritise files under common
+/// test directories so the chosen location is the real implementation.
 fn find_function_in_graph(
     call_graph: &ProjectCallGraph,
     func_name: &str,
@@ -237,18 +248,61 @@ fn find_function_in_graph(
         }
     };
 
-    // First, check if function appears as source or destination in any edge
+    // Heuristic: paths that look like test fixtures should be deprioritised
+    // unless they actually define the function (verified by extraction below).
+    fn is_test_path(p: &Path) -> bool {
+        p.components().any(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            matches!(
+                s.as_ref(),
+                "tests" | "test" | "__tests__" | "spec" | "specs" | "testing"
+            )
+        })
+    }
+
+    // Collect ALL edge matches (not just the first) so we can pick the best.
+    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+    let mut seen: HashSet<(PathBuf, String)> = HashSet::new();
     for edge in call_graph.edges() {
         if (edge.src_func == func_name || edge.src_func.ends_with(&format!(".{}", func_name)))
             && file_matches(&edge.src_file)
         {
-            return Ok((edge.src_file.clone(), edge.src_func.clone()));
+            let key = (edge.src_file.clone(), edge.src_func.clone());
+            if seen.insert(key.clone()) {
+                candidates.push(key);
+            }
         }
         if (edge.dst_func == func_name || edge.dst_func.ends_with(&format!(".{}", func_name)))
             && file_matches(&edge.dst_file)
         {
-            return Ok((edge.dst_file.clone(), edge.dst_func.clone()));
+            let key = (edge.dst_file.clone(), edge.dst_func.clone());
+            if seen.insert(key.clone()) {
+                candidates.push(key);
+            }
         }
+    }
+
+    // Verify each candidate by extracting the module and checking the function
+    // actually has a definition there. Prefer non-test candidates first.
+    let mut sorted = candidates.clone();
+    sorted.sort_by_key(|(f, _)| is_test_path(f));
+    for (file, func) in &sorted {
+        let full_path = if file.is_relative() {
+            project.join(file)
+        } else {
+            file.clone()
+        };
+        if let Ok(module_info) = extract_file(&full_path, Some(project)) {
+            if find_function_info(&module_info, func).is_some() {
+                return Ok((file.clone(), func.clone()));
+            }
+        }
+    }
+
+    // No candidate verified — fall back to the first edge match (preserves
+    // previous behaviour for cases where extraction fails for some reason).
+    if let Some(first) = candidates.into_iter().next() {
+        return Ok(first);
     }
 
     // If not in call graph, it might be a standalone function

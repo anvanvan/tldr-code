@@ -24,6 +24,7 @@ use tldr_core::{
 };
 
 use crate::output::{format_change_impact_text, OutputFormat, OutputWriter};
+use crate::path_validation::require_directory;
 
 /// Find tests affected by code changes
 #[derive(Debug, Args)]
@@ -111,6 +112,11 @@ impl ChangeImpactArgs {
     /// Run the change-impact command
     pub fn run(&self, format: OutputFormat, quiet: bool) -> Result<()> {
         let writer = OutputWriter::new(self.output_format.unwrap_or(format), quiet);
+
+        // cli-error-clarity-v2 (P2.BUG-4): reject regular files up-front so
+        // callers don't get the cryptic "Git: Not a directory (os error 20)"
+        // surfaced from the git invocation downstream.
+        require_directory(&self.path, "change-impact")?;
 
         // Determine language (auto-detect from directory, default to Python)
         let language = self
