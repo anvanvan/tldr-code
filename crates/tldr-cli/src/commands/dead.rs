@@ -275,7 +275,10 @@ fn collect_module_infos(
             module_infos.push((rel_path, info));
         }
     } else {
-        let extensions: &[&str] = language.extensions();
+        // language-coverage-fixes-v1 (P4.BUG-N1, P4.BUG-N5): use
+        // `scan_extensions()` so C++ dir scans include `.h` and JS/TS
+        // sibling extensions (`.tsx` ↔ `.jsx`) participate together.
+        let extensions: &[&str] = language.scan_extensions();
         let mut file_count: usize = 0;
         let mut walker = ProjectWalker::new(path);
         if no_default_ignore {
@@ -359,7 +362,10 @@ pub(crate) fn collect_module_infos_with_refcounts(
             }
         }
     } else {
-        let extensions: &[&str] = language.extensions();
+        // language-coverage-fixes-v1 (P4.BUG-N1, P4.BUG-N5): use
+        // `scan_extensions()` so C++ dir scans include `.h` and JS/TS
+        // sibling extensions (`.tsx` ↔ `.jsx`) participate together.
+        let extensions: &[&str] = language.scan_extensions();
         let mut file_count: usize = 0;
         let mut walker = ProjectWalker::new(path);
         if no_default_ignore {

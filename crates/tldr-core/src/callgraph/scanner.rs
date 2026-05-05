@@ -466,7 +466,13 @@ pub(crate) fn get_language_extensions(language: &str) -> Result<Vec<&'static str
         _ => return Err(BuildError::UnsupportedLanguage(language.to_string())),
     };
 
-    Ok(lang.extensions().to_vec())
+    // language-coverage-fixes-v1 (P4.BUG-N1, P4.BUG-N5): use
+    // `scan_extensions()` so the call-graph scanner picks up `.h` for
+    // C++ projects and the JS/TS sibling family for mixed React/Node
+    // directories. The per-file callgraph handler still ignores
+    // foreign-extension files via its own `extensions()` filter, so
+    // this only affects file enumeration, not parsing dispatch.
+    Ok(lang.scan_extensions().to_vec())
 }
 
 /// Check if a path has a matching file extension.

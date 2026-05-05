@@ -1,5 +1,215 @@
 # Changelog
 
+## language-coverage-fixes-v1 — internal milestone
+
+NOT a published release. Closes 5 bugs surfaced by the phase-4 UX
+audit that ran after `path-and-schema-cleanup-v3`. One HIGH (the C++
+header bug), two MED (Ruby class enumeration regression, definition
+out-of-range stderr blast), and two LOW (naming-violation false
+positives, JS/TS sibling-extension scan loss). All five bugs share
+two root causes: the single-bucket extension classifier in
+`Language::extensions` / `Language::from_path` (BUG-N1, BUG-N5) and
+weakness in node-walking recursion / bound-checking (BUG-N2, BUG-N3).
+BUG-N4 is independent: a degenerate-name-classification flaw in the
+naming convention detector.
+
+### Fixed
+
+- **P4.BUG-N1 (HIGH) — `tldr structure` (and `dead`, `calls`,
+  `smells`, `extract` — every directory-scanning command) silently
+  excluded `.h` files in C++ projects.** `Language::Cpp.extensions()`
+  returned only `[".cpp", ".cc", ".cxx", ".hpp"]`, and the canonical
+  `Language::from_path` always tagged `.h` as C. So `tinyxml2.h`
+  next to `tinyxml2.cpp` — clearly C++ to any human reader, the
+  unambiguous public-header-of-this-cpp-file convention used across
+  the C++ ecosystem (Boost, Folly, LLVM, every header-only library)
+  — was silently dropped from project scans. Fix: added
+  `Language::scan_extensions()` returning a wider list for the C++
+  family `[".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx",
+  ".h++", ".h"]`, and a predicate `Language::matches_for_scan(path)`.
+  Updated five scan paths to use the wider set: `extractor::
+  get_code_structure`, `dead.rs` walkers (×2), `callgraph::scanner::
+  language_extensions`, and `quality::smells::detect_smells_with_
+  walker_opts`. Per-file parsing dispatch is unchanged: `.h` files
+  parsed under `language=Cpp` route to `tree_sitter_cpp::LANGUAGE`
+  (a strict superset of C declarations), so structure / classes /
+  imports extract correctly. C-only projects do NOT regress: when
+  the user / autodetect picks `Language::C`, the canonical extension
+  list is still `[".c", ".h"]`.
+
+- **P4.BUG-N2 (MED) — `tldr extract` on Ruby files reported the
+  outermost `module` as the only class with zero methods.** Real
+  Rails code (e.g. `Rails::HTML::Sanitizer`, 27 explicit `def`
+  lines, 26 nested `class`/`module` declarations under one outer
+  `module Rails`) extracted as `[{name:"Rails", methods:[],
+  decorators:["module"]}]` — every nested entity invisible.
+  `extract_ruby_classes_detailed` walked siblings via `_ =>
+  recurse(child, ...)` but, when it FOUND a `class` or `module`
+  node, pushed it without descending into its `body` field, so any
+  nested declarations vanished. Fix: when emitting a class/module
+  entry, also recurse into its body. Mirrors the recursion already
+  used by `quality::cohesion::extract_ruby_classes_recursive` and
+  by the structure command's extractor (which is why structure was
+  correct on the same file: 26 classes, 27 methods). Methods stay
+  attributed to the nearest enclosing class because
+  `extract_ruby_methods_from_body` already filters out nested
+  `class`/`module` nodes (M7 invariant from
+  `med-cleanup-bundle-v1`); we did not weaken that.
+
+- **P4.BUG-N3 (MED) — `tldr definition <file> <line> <col>` with an
+  out-of-range line emitted the entire file as the "symbol name" in
+  its error message.** For `flask/app.py:9999:8`, stderr was 65 KB
+  (the whole file). Root cause:
+  `find_symbol_at_position` called `descendant_for_point_range`
+  which, given a position past EOF, returned the tree's root node;
+  `node.utf8_text(...)` then echoed every byte of the source, which
+  was substituted into the `unresolved at FILE:LINE:COL — symbol
+  'X'` payload. Fix: validate `(line, col)` against the file BEFORE
+  parsing — count lines, return a typed `"line N out of range
+  (file has M lines)"` for OOB lines and `"column N out of range
+  on line L (line has K bytes)"` for OOB columns. Added a 256-byte
+  symbol cap (`MAX_SYMBOL_LEN`) and a UTF-8-boundary-aware
+  `clamp_symbol` so the wrapper-node fallback path can never echo
+  >256 bytes. Replaced the "fall back to wrapper node text"
+  branch with `extract_identifier_at_column` — a word-boundary
+  scan over the LINE (not the whole file), so even a multi-line
+  wrapper produces a bounded symbol. After the fix, the same
+  `flask/app.py:9999:8` invocation produces 137 bytes of stderr
+  containing the typed "out of range" message — a 99.8% reduction.
+
+- **P4.BUG-N4 (LOW) — `tldr patterns` naming-violations classifier
+  flagged single-word identifiers as snake_case / upper-snake_case
+  violations.** `tldr patterns spring-petclinic` reported
+  `{"name":"print","expected":"camel_case","actual":"snake_case"}`
+  for a method that has zero underscores; symmetrically `E1` (a
+  single-uppercase-word class name) was reported as
+  `upper_snake_case`. Both are visibly nonsensical. Root cause:
+  `signals::detect_naming_case` returned `SnakeCase` for any
+  all-lowercase ASCII identifier and `UpperSnakeCase` for any
+  all-uppercase, with no underscore requirement. Fix: tightened
+  both classifications to require ≥1 underscore (zero-underscore
+  identifiers are NOT snake-case). Added two new variants
+  `LowerAlpha` (single lowercase word: `print`, `value`) and
+  `UpperAlpha` (single uppercase word: `E1`, `URL`); the violation
+  emitter (`is_compatible` predicate in
+  `patterns::naming::find_violations`) treats `LowerAlpha` as
+  compatible with both `SnakeCase` AND `CamelCase`, and
+  `UpperAlpha` as compatible with both `PascalCase` AND
+  `UpperSnakeCase`. Updated `language_profile.rs` constant
+  detection to also accept `UpperAlpha` so `KEY = 1` keeps being
+  catalogued as a constant.
+
+- **P4.BUG-N5 (LOW) — `tldr structure` autodetect dropped `.tsx`
+  files in mixed JS/TS directories.** A directory containing
+  `a.mjs + a.tsx + a.jsx + a.cjs` (the standard React/Node mix)
+  autodetected as `javascript` (extension-majority correctly picks
+  the JS family) and the walker filter then dropped `.tsx` because
+  `Language::JavaScript.extensions()` doesn't include it. Same
+  root cause as BUG-N1: single-bucket extension classifier. Fix:
+  same `scan_extensions()` mechanism — `Language::JavaScript`
+  scans now include `[".js", ".jsx", ".mjs", ".cjs", ".ts",
+  ".tsx"]` and `Language::TypeScript` scans include the symmetric
+  union. Per-file parsing already routes `.tsx`/`.jsx` to the
+  TSX grammar via `parse_with_path::select_ts_grammar`, so
+  declared-language=`JavaScript` × file=`a.tsx` parses correctly
+  with JSX support.
+
+### Changed
+
+- `crates/tldr-core/src/types.rs:138-243` — added
+  `Language::scan_extensions()` and `Language::matches_for_scan(path)`.
+  These are the new "directory-walk" predicates that the structure
+  walker, smells walker, callgraph scanner, and dead-code walker now
+  use. `Language::from_path` and `Language::extensions` keep their
+  single-bucket / canonical semantics so the dozens of call sites
+  using them for classification are unchanged.
+- `crates/tldr-core/src/ast/extractor.rs:103-117` —
+  `get_code_structure` switched from `language.extensions()` to
+  `language.scan_extensions()` for the directory-walk file filter.
+- `crates/tldr-cli/src/commands/dead.rs:278,362` — both walker
+  branches in `dead` switched to `scan_extensions()`.
+- `crates/tldr-core/src/callgraph/scanner.rs:469-476` —
+  `language_extensions` returns `scan_extensions()` for the call-graph
+  scanner (used by `tldr calls`).
+- `crates/tldr-core/src/quality/smells.rs:404-414,442-454` —
+  `detect_smells_with_walker_opts` uses `Language::matches_for_scan`
+  in both the explicit-files and walker branches, so a `.h` file is
+  included when smells is run with `--lang cpp`.
+- `crates/tldr-core/src/ast/extract.rs:5216-5253` —
+  `extract_ruby_classes_detailed` now descends into `class`/`module`
+  body when emitting an entry, so nested declarations are reported
+  as their own `ClassInfo` entries.
+- `crates/tldr-cli/src/commands/remaining/definition.rs:3014-3146`
+  — `find_symbol_at_position` validates `(line, col)` bounds before
+  parsing and clamps any returned symbol to 256 bytes via
+  `clamp_symbol`. Added `MAX_SYMBOL_LEN`, `clamp_symbol`, and
+  `extract_identifier_at_column` helpers.
+- `crates/tldr-core/src/patterns/signals.rs:213-340` — `NamingCase`
+  enum now has `LowerAlpha` and `UpperAlpha` variants;
+  `detect_naming_case` requires `'_'` for snake_case /
+  upper_snake_case classification.
+- `crates/tldr-core/src/patterns/naming.rs:106-200` — added
+  `is_compatible(actual, expected)` predicate; `find_violations`
+  and `calculate_consistency` both use it. `naming_case_to_convention`
+  now maps `LowerAlpha → SnakeCase` and `UpperAlpha → PascalCase`
+  for stable JSON output.
+- `crates/tldr-core/src/patterns/language_profile.rs:567,810` —
+  Python and TypeScript constant detection accept `UpperAlpha`
+  as a constant variant (single uppercase identifier like `KEY`).
+- `crates/tldr-cli/tests/language_coverage_fixes_v1.rs` — new
+  test file with 5 regression tests, one per bug.
+
+### Architectural note
+
+`scan_extensions` deliberately stays additive on top of
+`extensions`: the canonical 1-extension-per-language map is still
+used by all classification paths (`from_path`, `from_extension`,
+`extension`-based language inference inside per-language handlers),
+so a `.h` file's CANONICAL language is still C — it just becomes
+INCLUDABLE in a Cpp scan. This narrow widening avoids a 30-call-site
+refactor while fixing the user-visible bug. The same pattern works
+for the JS/TS sibling family: each language's classification is
+unchanged; only directory walks union the family extensions.
+
+### Retained
+
+- `Language::from_path`, `Language::from_extension`,
+  `Language::from_directory`: all 30+ call sites unchanged.
+- `c_vs_cpp_tie_break`: still ignores `.h` and uses `.cpp`/`.cc`
+  family for the C-vs-Cpp decision (the autodetect-correctness-v1
+  invariant).
+- All M2/M5/M7 invariants for Ruby method attribution
+  (`extract_ruby_methods_from_body` still skips nested `class`/`module`
+  bodies — the nested entries get their own ClassInfo).
+- All P3 path-preservation guarantees from
+  `path-and-schema-cleanup-v3` (canonicalisation done internally,
+  user-supplied path echoed in JSON).
+
+### Quantification
+
+| Bug | Repro | Before | After |
+| --- | --- | --- | --- |
+| N1 | `tldr structure /tmp/repos/cpp-tinyxml2 \| jq '[.files[].path]'` | `["…html5-printer.cpp","tinyxml2.cpp","xmltest.cpp"]` (3 files; .h missing) | `[…,"tinyxml2.h",…]` (4 files; .h included) |
+| N2 | `tldr extract …/sanitizer.rb \| jq '.classes\|length'` | 1 (only outer module) | ≥4 (nested entries enumerated) |
+| N3 | `tldr definition …/app.py 9999 8 2>&1 \| wc -c` | 65 536 bytes (entire file) | 137 bytes (typed error) |
+| N4 | `tldr patterns …/petclinic \| jq '.naming.violations\|map(select(.name\|test("_")\|not))\|length'` | 21 (false positives) | 0 (all violations have underscores) |
+| N5 | `tldr structure /tmp/x_tsx \| jq '[.files[].path]\|any(.\|test("tsx"))'` | `false` (.tsx dropped) | `true` (.tsx included) |
+
+| Suite | Before | After |
+| --- | --- | --- |
+| `language_coverage_fixes_v1` (new) | n/a | 5/5 |
+| `vuln_migration_v1_red` (master regression) | 168/168 | 168/168 |
+
+### Standing rules upheld
+
+- One atomic commit, one CHANGELOG entry, one local annotated tag
+- `Cargo.lock` not staged (explicit-add list only)
+- No push, no `cargo publish`, no version bump (manifest stays at 0.3.0)
+- No `#[allow(...)]` suppression, no test weakening, no scope cuts —
+  all 5 bugs fixed in this milestone, none deferred
+- No `git stash`, no destructive git
+- 168/168 master regression preserved; new test file is additive
+
 ## calls-dot-test-followup-v1 — internal milestone
 
 NOT a published release. Aligns one stale test left red by

@@ -219,6 +219,27 @@ pub enum NamingCase {
     PascalCase,
     /// All uppercase with underscores: `MAX_VALUE`
     UpperSnakeCase,
+    /// Single lowercase word, no underscores: `print`, `value2`.
+    ///
+    /// language-coverage-fixes-v1 (P4.BUG-N4): a single-word
+    /// lowercase identifier is *compatible* with both `snake_case`
+    /// (degenerate, zero-underscore form) and `camelCase`
+    /// (degenerate, no-second-word form). Reporting it as
+    /// `SnakeCase` (the previous behaviour) caused spurious
+    /// "expected camelCase, got snake_case" violations in Java and
+    /// other camelCase codebases. The violation emitter treats
+    /// `LowerAlpha` as compatible with both conventions.
+    LowerAlpha,
+    /// Single uppercase word, no underscores: `E1`, `K`, `URL`.
+    ///
+    /// language-coverage-fixes-v1 (P4.BUG-N4): compatible with
+    /// `PascalCase` (single uppercase word IS pascal-degenerate)
+    /// and `UPPER_SNAKE_CASE` (single uppercase word IS
+    /// upper-snake-degenerate). The previous classifier returned
+    /// `UpperSnakeCase` regardless, producing spurious violations
+    /// against PascalCase class-name expectations on names like
+    /// `E1`.
+    UpperAlpha,
     /// Could not determine naming convention
     Unknown,
 }
@@ -256,20 +277,50 @@ pub fn detect_naming_case(name: &str) -> NamingCase {
         return NamingCase::Unknown;
     }
 
-    // UPPER_SNAKE_CASE: all uppercase with underscores
-    if name
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+    // language-coverage-fixes-v1 (P4.BUG-N4): require ≥1 underscore
+    // before classifying as snake_case / UPPER_SNAKE_CASE. Without
+    // this guard, `print` was classified as `SnakeCase` and `E1` as
+    // `UpperSnakeCase`, producing spurious "expected camelCase, got
+    // snake_case" violations against camelCase Java codebases (and
+    // similar against PascalCase class expectations on `E1`-style
+    // names). Single-word degenerate names get their own `LowerAlpha`
+    // / `UpperAlpha` variants which the violation emitter treats as
+    // compatible with both adjacent conventions.
+
+    // UPPER_SNAKE_CASE: all uppercase WITH underscores.
+    if name.contains('_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
     {
         return NamingCase::UpperSnakeCase;
     }
 
-    // snake_case: lowercase with underscores
-    if name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+    // snake_case: lowercase WITH underscores.
+    if name.contains('_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
     {
         return NamingCase::SnakeCase;
+    }
+
+    // Single-word lowercase / uppercase (no underscore): emit the
+    // dedicated degenerate variants so the violation emitter can
+    // treat them as compatible with multiple conventions.
+    if name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name.chars().any(|c| c.is_ascii_lowercase())
+    {
+        return NamingCase::LowerAlpha;
+    }
+    if name
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && name.chars().any(|c| c.is_ascii_uppercase())
+    {
+        return NamingCase::UpperAlpha;
     }
 
     // PascalCase: starts with uppercase, no underscores (except at start for private)

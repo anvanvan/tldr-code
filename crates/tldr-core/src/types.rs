@@ -103,6 +103,57 @@ impl Language {
         }
     }
 
+    /// Get file extensions for **directory scanning** when this language is
+    /// the requested / autodetected target.
+    ///
+    /// Distinct from [`Self::extensions`] (which returns the canonical
+    /// extensions for **classification**). Two language families need a
+    /// broader scan list so directory walks don't silently drop files that
+    /// belong to the project but live in a sibling extension:
+    ///
+    /// - **C++** scans must include `.h` (and the rare `.h++` / `.c++`
+    ///   spellings). The header extension is technically ambiguous between
+    ///   C and C++, but `tinyxml2.h` next to `tinyxml2.cpp` is
+    ///   unambiguously C++. When the user (or autodetect) selects `Cpp`,
+    ///   include all C-style header extensions; tree-sitter will parse them
+    ///   with the C++ grammar (`Language::Cpp` is passed to the parser),
+    ///   which is a strict superset of C declarations.
+    ///
+    /// - **JavaScript / TypeScript** are sibling families. Real React /
+    ///   Node monorepos ship `.tsx`, `.jsx`, `.cjs`, `.mjs` side-by-side;
+    ///   when autodetect picks one, the other's extensions must still
+    ///   participate. `parse_with_path` already routes `.tsx` / `.jsx`
+    ///   through the TSX grammar regardless of the requested language, so
+    ///   parsing remains correct.
+    ///
+    /// All other languages return their canonical [`Self::extensions`]
+    /// list — this method is purely a widening for the JS/TS and C++
+    /// families.
+    ///
+    /// # Why a separate method
+    ///
+    /// `from_extension` / `from_path` keep their single-bucket semantics
+    /// (every extension maps to exactly one canonical language) so the
+    /// dozens of call sites that use them for classification don't change
+    /// shape. Only the directory walker needs the broader list.
+    pub fn scan_extensions(&self) -> &'static [&'static str] {
+        match self {
+            // C++ family: include all C-style header extensions so a
+            // `tinyxml2.h` sitting next to `tinyxml2.cpp` is included.
+            Language::Cpp => &[
+                ".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h++", ".h",
+            ],
+            // C family: same as canonical (`.c` + `.h`).
+            // JS/TS sibling family: include each other's extensions so a
+            // mixed `.ts/.tsx/.js/.jsx/.mjs/.cjs` directory is fully
+            // walked regardless of which sibling autodetect picks.
+            Language::JavaScript => &[".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"],
+            Language::TypeScript => &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"],
+            // All other languages: canonical extensions.
+            _ => self.extensions(),
+        }
+    }
+
     /// Detect language from file extension
     pub fn from_extension(ext: &str) -> Option<Self> {
         // Normalize extension to lowercase with leading dot
@@ -140,6 +191,33 @@ impl Language {
         path.extension()
             .and_then(|ext| ext.to_str())
             .and_then(|ext| Self::from_extension(&format!(".{}", ext)))
+    }
+
+    /// Returns `true` if `path`'s extension belongs to the broader scan
+    /// family of this language.
+    ///
+    /// This is the predicate version of [`Self::scan_extensions`]. Unlike
+    /// [`Self::from_path`] (which always returns the canonical language for
+    /// an extension), this method handles the C/C++ header ambiguity and
+    /// the JS/TS sibling-family widening:
+    ///
+    /// - `Language::Cpp.matches_for_scan("foo.h")` → `true` (canonical
+    ///   `from_path` would tag it as C).
+    /// - `Language::JavaScript.matches_for_scan("foo.tsx")` → `true`
+    ///   (canonical `from_path` would tag it as TypeScript).
+    /// - `Language::Cpp.matches_for_scan("foo.rs")` → `false`.
+    ///
+    /// Used by directory-scanning commands (smells, dead, calls,
+    /// structure, …) to keep mixed-extension projects working when the
+    /// user (or autodetect) picks a single language.
+    pub fn matches_for_scan(self, path: &std::path::Path) -> bool {
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            return false;
+        };
+        let dotted = format!(".{}", ext.to_ascii_lowercase());
+        self.scan_extensions()
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(&dotted))
     }
 
     /// Detect dominant language from files in a directory.

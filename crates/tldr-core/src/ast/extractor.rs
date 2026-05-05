@@ -99,9 +99,19 @@ pub fn get_code_structure(
         }
     }
 
-    // Get file tree filtered by language extensions
+    // Get file tree filtered by language extensions.
+    //
+    // language-coverage-fixes-v1 (P4.BUG-N1, P4.BUG-N5): use
+    // `scan_extensions()` instead of `extensions()` so:
+    //   - C++ scans include `.h` (`tinyxml2.h` next to `tinyxml2.cpp`).
+    //   - JS/TS scans include the sibling family (`.tsx` files in mixed
+    //     React/Node directories are no longer silently dropped).
+    //
+    // The downstream parser (`parse_with_path`) routes `.tsx`/`.jsx` to
+    // the TSX grammar dialect and `.h` is parsed by the C++ grammar when
+    // `language == Language::Cpp` (a strict superset of C decls).
     let extensions: HashSet<String> = language
-        .extensions()
+        .scan_extensions()
         .iter()
         .map(|s| s.to_string())
         .collect();

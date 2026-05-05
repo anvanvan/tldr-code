@@ -401,10 +401,12 @@ pub fn detect_smells_with_walker_opts(
             .iter()
             .filter(|p| p.is_file())
             .filter(|p| Language::from_path(p).is_some())
-            .filter(|p| match (Language::from_path(p), lang_filter) {
-                (Some(detected), Some(requested)) => detected == requested,
-                (Some(_), None) => true,
-                _ => false,
+            // language-coverage-fixes-v1 (P4.BUG-N1, P4.BUG-N5): use
+            // `matches_for_scan` to handle C++ `.h` and JS/TS sibling
+            // extensions when an explicit lang is requested.
+            .filter(|p| match lang_filter {
+                Some(requested) => requested.matches_for_scan(p),
+                None => true,
             })
             .filter(|p| {
                 p.metadata()
@@ -436,13 +438,17 @@ pub fn detect_smells_with_walker_opts(
         let lang_filter = walker_opts
             .lang
             .or_else(|| Language::from_directory(path));
+        // language-coverage-fixes-v1 (P4.BUG-N1, P4.BUG-N5): when a
+        // language is selected, use `matches_for_scan` so the C/C++
+        // header ambiguity (`.h`) and the JS/TS sibling family
+        // (`.jsx`/`.tsx`/`.cjs`/`.mjs`) are handled correctly. Falls
+        // back to canonical `from_path` when no language is selected.
         let mut paths: Vec<PathBuf> = walker
             .iter()
             .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
-            .filter(|e| match (Language::from_path(e.path()), lang_filter) {
-                (Some(detected), Some(requested)) => detected == requested,
-                (Some(_), None) => true,
-                _ => false,
+            .filter(|e| match lang_filter {
+                Some(requested) => requested.matches_for_scan(e.path()),
+                None => Language::from_path(e.path()).is_some(),
             })
             .filter(|e| {
                 e.metadata()

@@ -564,7 +564,12 @@ impl PythonSemantics {
         if let Some(left) = node.child_by_field_name("left") {
             let name = node_text(left, source);
             let case = detect_naming_case(&name);
-            if case == NamingCase::UpperSnakeCase {
+            // language-coverage-fixes-v1 (P4.BUG-N4): also accept
+            // `UpperAlpha` (single uppercase word, e.g. `KEY`, `URL`)
+            // as a constant. The new `detect_naming_case` only emits
+            // `UpperSnakeCase` when the name actually contains an
+            // underscore.
+            if case == NamingCase::UpperSnakeCase || case == NamingCase::UpperAlpha {
                 signals.naming.constant_names.push((
                     name,
                     case,
@@ -807,7 +812,12 @@ impl TypeScriptSemantics {
                     .unwrap_or("")
                     .trim();
                 let case = detect_naming_case(name);
-                if case == NamingCase::UpperSnakeCase {
+                // language-coverage-fixes-v1 (P4.BUG-N4): also accept
+            // `UpperAlpha` (single uppercase word, e.g. `KEY`, `URL`)
+            // as a constant. The new `detect_naming_case` only emits
+            // `UpperSnakeCase` when the name actually contains an
+            // underscore.
+            if case == NamingCase::UpperSnakeCase || case == NamingCase::UpperAlpha {
                     signals.naming.constant_names.push((
                         name.to_string(),
                         case,

@@ -3011,6 +3011,18 @@ fn ocaml_open_line(source: &str, symbol: &str) -> Option<(u32, u32)> {
 /// ends in `"identifier"` to cover language-specific variants
 /// (`identifier`, `property_identifier`, `field_identifier`,
 /// `type_identifier`, `shorthand_property_identifier`, etc.).
+/// Maximum length of a symbol name accepted by [`find_symbol_at_position`].
+///
+/// language-coverage-fixes-v1 (P4.BUG-N3): the previous implementation
+/// echoed `node.utf8_text(...)` with no upper bound. When the caller
+/// passed a `(line, col)` past EOF, tree-sitter returned the entire
+/// file as the "node text", and that text was then formatted into the
+/// error message — producing a 65 KB stderr blast for `flask/app.py`
+/// at line 9999. Symbols are identifiers; clamping at 256 bytes is far
+/// more than any real source identifier and keeps error messages
+/// bounded even if the cursor lands on a wrapper node.
+const MAX_SYMBOL_LEN: usize = 256;
+
 fn find_symbol_at_position(
     source: &str,
     line: u32,
@@ -3018,12 +3030,38 @@ fn find_symbol_at_position(
     language: Language,
     file: &Path,
 ) -> RemainingResult<String> {
+    // language-coverage-fixes-v1 (P4.BUG-N3): validate `(line, col)`
+    // against the file BEFORE parsing. Out-of-range positions previously
+    // walked into tree-sitter's root node and echoed the entire source
+    // file back through the error message; bounded checks here produce
+    // a typed, short error instead.
+    let line_count = source.lines().count();
+    let target_line_0 = line.saturating_sub(1) as usize;
+    if line as usize == 0 || target_line_0 >= line_count {
+        return Err(RemainingError::invalid_argument(format!(
+            "line {} out of range (file has {} lines)",
+            line, line_count
+        )));
+    }
+    let line_text = source.lines().nth(target_line_0).unwrap_or("");
+    // tree-sitter columns are byte offsets within the line; allow
+    // `column == line.len()` (end-of-line cursor) but reject anything
+    // beyond.
+    if (column as usize) > line_text.len() {
+        return Err(RemainingError::invalid_argument(format!(
+            "column {} out of range on line {} (line has {} bytes)",
+            column,
+            line,
+            line_text.len()
+        )));
+    }
+
     let tree = PARSER_POOL
         .parse_with_path(source, language, Some(file))
         .map_err(|e| RemainingError::parse_error(file.to_path_buf(), e.to_string()))?;
 
     // Convert 1-indexed line to 0-indexed
-    let target_line = line.saturating_sub(1) as usize;
+    let target_line = target_line_0;
     let target_col = column as usize;
 
     // Find the node at the position
@@ -3044,7 +3082,7 @@ fn find_symbol_at_position(
     })?;
 
     if is_identifier_kind(node.kind()) {
-        return Ok(text.to_string());
+        return Ok(clamp_symbol(text));
     }
 
     // Walk up looking for an identifier-like node (covers cases where the
@@ -3055,13 +3093,61 @@ fn find_symbol_at_position(
             let text = n.utf8_text(source.as_bytes()).map_err(|_| {
                 RemainingError::parse_error(file.to_path_buf(), "Invalid UTF-8".to_string())
             })?;
-            return Ok(text.to_string());
+            return Ok(clamp_symbol(text));
         }
         current = n.parent();
     }
 
-    // Fall back to the original token text — better than nothing.
-    Ok(text.to_string())
+    // Fall back: extract a word-boundary identifier slice from the
+    // line text rather than echoing the entire wrapper node — a
+    // wrapper like `call_expression` can span hundreds of lines.
+    Ok(extract_identifier_at_column(line_text, target_col))
+}
+
+/// Clamp a candidate symbol name to [`MAX_SYMBOL_LEN`] bytes (truncating
+/// at a UTF-8 boundary) so error messages stay bounded.
+fn clamp_symbol(s: &str) -> String {
+    if s.len() <= MAX_SYMBOL_LEN {
+        return s.to_string();
+    }
+    // Find the largest valid UTF-8 prefix ≤ MAX_SYMBOL_LEN.
+    let mut end = MAX_SYMBOL_LEN;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// Extract a contiguous identifier-character run around `col` from
+/// `line`. ASCII identifier characters: `[A-Za-z0-9_]`. Returns an
+/// empty string if no identifier touches `col`.
+///
+/// Used as the bounded fallback when the cursor lands on a wrapper
+/// node and no enclosing identifier-kind ancestor was found.
+fn extract_identifier_at_column(line: &str, col: usize) -> String {
+    let bytes = line.as_bytes();
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // Start from min(col, line.len()-1); walk back to identifier start.
+    let mut start = col.min(bytes.len().saturating_sub(1));
+    // If we landed on a non-ident byte, scan one to the left first.
+    if !is_ident(bytes[start]) && start > 0 && is_ident(bytes[start - 1]) {
+        start -= 1;
+    }
+    if !is_ident(bytes[start]) {
+        return String::new();
+    }
+    while start > 0 && is_ident(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = start;
+    while end < bytes.len() && is_ident(bytes[end]) {
+        end += 1;
+    }
+    let slice = &line[start..end];
+    clamp_symbol(slice)
 }
 
 /// Returns true for any tree-sitter node kind that represents an identifier

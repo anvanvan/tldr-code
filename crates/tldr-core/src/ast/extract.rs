@@ -5213,6 +5213,21 @@ fn is_inside_ruby_class(node: &Node) -> bool {
     false
 }
 
+/// Recursively enumerate Ruby `class` and `module` declarations.
+///
+/// language-coverage-fixes-v1 (P4.BUG-N2): the previous version stopped
+/// at the first `class`/`module` node it encountered and never recursed
+/// into the body. Real Ruby code (e.g. Rails::HTML::Sanitizer) nests
+/// 26+ modules and classes under a top-level `module Rails`; only the
+/// outermost wrapper was reported, with zero methods, because every
+/// method actually lived inside a nested class. Mirrors the recursion
+/// pattern in `quality::cohesion::extract_ruby_classes_recursive`.
+///
+/// Each nested class/module is emitted as its own `ClassInfo` entry,
+/// and `extract_ruby_methods_from_body` (which already filters out
+/// nested `class`/`module` nodes per M7) attributes methods to the
+/// nearest enclosing class — so a method on `class Sanitizer` inside
+/// `module Rails` is reported on `Sanitizer`, not on `Rails`.
 fn extract_ruby_classes_detailed(node: &Node, source: &str, classes: &mut Vec<ClassInfo>) {
     let mut cursor = node.walk();
 
@@ -5221,11 +5236,23 @@ fn extract_ruby_classes_detailed(node: &Node, source: &str, classes: &mut Vec<Cl
             "class" => {
                 let info = extract_ruby_class_info(&child, source);
                 classes.push(info);
+                // P4.BUG-N2: descend into the class body so nested
+                // class/module declarations are emitted as their own
+                // ClassInfo entries.
+                if let Some(body) = child.child_by_field_name("body") {
+                    extract_ruby_classes_detailed(&body, source, classes);
+                }
             }
             "module" => {
                 // Treat modules as class-like constructs
                 let info = extract_ruby_module_info(&child, source);
                 classes.push(info);
+                // P4.BUG-N2: descend into the module body so nested
+                // class/module declarations (the common Rails pattern)
+                // are emitted as their own ClassInfo entries.
+                if let Some(body) = child.child_by_field_name("body") {
+                    extract_ruby_classes_detailed(&body, source, classes);
+                }
             }
             _ => {
                 extract_ruby_classes_detailed(&child, source, classes);

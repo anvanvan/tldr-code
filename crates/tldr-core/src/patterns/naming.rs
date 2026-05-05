@@ -88,6 +88,13 @@ fn detect_majority_convention(names: &[(String, NamingCase, String, u32)]) -> Na
 }
 
 /// Calculate consistency score for a set of names against expected convention
+///
+/// language-coverage-fixes-v1 (P4.BUG-N4): use the same
+/// [`is_compatible`] predicate as `find_violations` so that
+/// degenerate single-word identifiers (`LowerAlpha`, `UpperAlpha`)
+/// don't drag the consistency score down. Without this, a Java
+/// codebase whose majority is `CamelCase` would have its score
+/// proportionally reduced for every method named `print` or `clone`.
 fn calculate_consistency(
     names: &[(String, NamingCase, String, u32)],
     expected: &NamingCase,
@@ -98,9 +105,46 @@ fn calculate_consistency(
 
     let matching = names
         .iter()
-        .filter(|(_, case, _, _)| case == expected)
+        .filter(|(_, case, _, _)| is_compatible(*case, *expected))
         .count();
     matching as f64 / names.len() as f64
+}
+
+/// Returns true when `actual` should be considered compatible with
+/// `expected` and therefore NOT flagged as a violation.
+///
+/// language-coverage-fixes-v1 (P4.BUG-N4): single-word degenerate
+/// identifiers are compatible with multiple conventions:
+///
+/// - `LowerAlpha` (e.g. `print`, `value`): compatible with
+///   `SnakeCase`, `CamelCase`, and `LowerAlpha` itself. A single
+///   lowercase word is the degenerate form of both snake_case
+///   (zero underscores) and camelCase (no second word).
+/// - `UpperAlpha` (e.g. `E1`, `K`, `URL`): compatible with
+///   `PascalCase`, `UpperSnakeCase`, and `UpperAlpha` itself. A
+///   single uppercase word is the degenerate form of both pascal
+///   (single word) and upper-snake (no underscores).
+///
+/// Without this rule the classifier emitted false positives like
+/// `{"name":"print","expected":"camel_case","actual":"snake_case"}`
+/// and `{"name":"E1","expected":"pascal_case","actual":"upper_snake_case"}`
+/// — both visibly nonsensical because neither name has an
+/// underscore.
+fn is_compatible(actual: NamingCase, expected: NamingCase) -> bool {
+    if actual == expected {
+        return true;
+    }
+    match (actual, expected) {
+        (
+            NamingCase::LowerAlpha,
+            NamingCase::SnakeCase | NamingCase::CamelCase | NamingCase::LowerAlpha,
+        ) => true,
+        (
+            NamingCase::UpperAlpha,
+            NamingCase::PascalCase | NamingCase::UpperSnakeCase | NamingCase::UpperAlpha,
+        ) => true,
+        _ => false,
+    }
 }
 
 /// Find violations (names not matching the expected convention)
@@ -114,7 +158,13 @@ fn find_violations(
 
     names
         .iter()
-        .filter(|(_, case, _, _)| *case != NamingCase::Unknown && case != expected)
+        // language-coverage-fixes-v1 (P4.BUG-N4): use `is_compatible`
+        // so single-word `LowerAlpha` / `UpperAlpha` identifiers
+        // aren't flagged as violations against camelCase/PascalCase
+        // expectations they degenerate into.
+        .filter(|(_, case, _, _)| {
+            *case != NamingCase::Unknown && !is_compatible(*case, *expected)
+        })
         .map(|(name, case, file, line)| NamingViolation {
             name: name.clone(),
             expected: naming_case_to_convention(*expected),
@@ -135,6 +185,17 @@ fn naming_case_to_convention(case: NamingCase) -> NamingConvention {
         NamingCase::CamelCase => NamingConvention::CamelCase,
         NamingCase::PascalCase => NamingConvention::PascalCase,
         NamingCase::UpperSnakeCase => NamingConvention::UpperSnakeCase,
+        // language-coverage-fixes-v1 (P4.BUG-N4): degenerate
+        // single-word forms surface as the closest "natural"
+        // convention so JSON output remains stable for clients
+        // that only know the canonical four conventions.
+        // `LowerAlpha` → `SnakeCase` (zero-underscore degenerate),
+        // `UpperAlpha` → `PascalCase` (single-word pascal). These
+        // mappings are only used when the name IS the majority
+        // convention; the violation filter (`is_compatible`)
+        // keeps them out of the `violations` array regardless.
+        NamingCase::LowerAlpha => NamingConvention::SnakeCase,
+        NamingCase::UpperAlpha => NamingConvention::PascalCase,
         NamingCase::Unknown => NamingConvention::Mixed,
     }
 }
