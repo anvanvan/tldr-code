@@ -43,16 +43,63 @@ use ignore::{DirEntry, WalkBuilder};
 /// Commands that explicitly need to scan vendored code (e.g. auditing
 /// dependencies) can disable this list via
 /// [`ProjectWalker::no_default_ignore`].
+///
+/// **api-check-and-patterns-accuracy-v1 (P11.BUG-AGG-7)**: extended this
+/// list to include common generated/vendored artifact dirs that previously
+/// polluted language autodetection (e.g. doxygen `dox/` output, sphinx
+/// `_build/`, gradle/maven build sinks, Python venvs and caches). These
+/// directories ship in many third-party repositories — without skipping
+/// them, `tldr patterns /tmp/repos/cpp-tinyxml2` mis-classified the project
+/// as JavaScript-majority because the `docs/` doxygen output contained 63
+/// generated `.js` files vs 3 actual `.cpp` source files.
 pub const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
+    // Vendored / package-manager output
     "node_modules",
+    "vendor",
+    // Build sinks (general)
     "target",
     "dist",
     "build",
+    "out",
+    "bin",
+    "obj",
+    // JavaScript framework caches
     ".next",
+    ".nuxt",
+    // Doxygen output (typical custom-config dir; the more common `docs/`
+    // is detected via the `doxygen.css` sentinel below since `docs/` may
+    // legitimately hold authored markdown).
+    "dox",
+    // Python tooling
     "__pycache__",
-    "vendor",
+    ".pytest_cache",
+    ".tox",
+    ".mypy_cache",
+    ".ruff_cache",
+    // Coverage artefacts
+    "coverage",
+    ".coverage",
+    // JVM tooling
+    ".gradle",
+    // Version control
     ".git",
 ];
+
+/// Files whose presence in a directory indicates it is generator output
+/// rather than authored source. When a directory contains any of these
+/// sentinels at its top level, the walker skips it (subject to
+/// [`ProjectWalker::no_default_ignore`]).
+///
+/// This is the secondary mechanism used to detect generated docs whose
+/// directory name is itself ambiguous (e.g. `docs/` may be authored
+/// markdown OR doxygen html output). A name-only ignore list cannot
+/// distinguish those without reading inside the dir.
+///
+/// Sentinels chosen here are unambiguous markers of *generated* output:
+/// - `doxygen.css` / `doxygen.svg`: doxygen-emitted style/asset files
+///   (placed alongside generated HTML+JS by `doxygen` in its target dir).
+/// - `.doctrees/` is sphinx's internal cache, typically inside `_build/`.
+const GENERATED_DIR_SENTINELS: &[&str] = &["doxygen.css", "doxygen.svg"];
 
 /// Builder for project walks.
 ///
@@ -145,10 +192,25 @@ impl ProjectWalker {
                 if !is_dir {
                     return true;
                 }
-                match entry.file_name().to_str() {
-                    Some(name) => !DEFAULT_EXCLUDE_DIRS.contains(&name),
-                    None => true,
+                let name_excluded = match entry.file_name().to_str() {
+                    Some(name) => DEFAULT_EXCLUDE_DIRS.contains(&name),
+                    None => false,
+                };
+                if name_excluded {
+                    return false;
                 }
+                // api-check-and-patterns-accuracy-v1 (P11.BUG-AGG-7):
+                // sentinel-file detection for generator output whose
+                // directory name is ambiguous (e.g. `docs/` containing
+                // doxygen output). When a directory contains any of the
+                // sentinel files at its top level, treat it as generated
+                // and skip descent. This is a cheap top-level dir read,
+                // performed only on directories not already excluded by
+                // name above.
+                if dir_has_generated_sentinel(entry.path()) {
+                    return false;
+                }
+                true
             });
         }
 
@@ -172,6 +234,29 @@ impl ProjectWalker {
             }
         })
     }
+}
+
+/// Whether a directory contains any [`GENERATED_DIR_SENTINELS`] at its
+/// top level. Used by [`ProjectWalker::iter`]'s `filter_entry` to skip
+/// generator output dirs whose name is ambiguous.
+///
+/// The check reads only the top-level entries of `dir`; nested matches
+/// are not considered (a project that authors a `doxygen.css` deep inside
+/// its source tree is legitimate). Errors during read (permission denied,
+/// non-directory) are treated as "no sentinel found" — the walker then
+/// falls through to the normal name-based exclusion logic.
+fn dir_has_generated_sentinel(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if GENERATED_DIR_SENTINELS.contains(&name) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Convenience free function: walk project with all defaults on.

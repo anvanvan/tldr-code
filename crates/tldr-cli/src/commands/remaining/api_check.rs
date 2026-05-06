@@ -89,6 +89,51 @@ impl RegexRuleSpec {
     }
 }
 
+/// Per-rule language applicability (api-check-and-patterns-accuracy-v1,
+/// P11.BUG-AGG-6). Each rule id is tied to the language(s) for which the
+/// rule's pattern is meaningful. The scanner gates `check_regex_rule` and
+/// `check_rule` calls through [`rule_applies_to_language`] so a JS rule
+/// (e.g. `JS003 JSON.parse`) cannot fire against a `.cpp` file even if the
+/// rule list were ever cross-wired by mistake. The per-file `detect_language`
+/// dispatch (in [`ApiCheckArgs::run`]) is the primary gate; this is a
+/// defense-in-depth backstop documented declaratively.
+fn rule_applies_to_language(rule_id: &str, language: ApiLanguage) -> bool {
+    // Rule-id naming follows the constants in this file (`C00x`, `CPP00x`,
+    // `JS00x`, etc). Matching is exact prefix + numeric suffix to avoid
+    // confusing siblings: `C` must NOT match `CPP*`/`CS*`, `LU` must NOT
+    // match `LUA*` (no such id exists, but the digit-suffix rule keeps the
+    // matcher robust to future renames).
+    let prefix_lang: &[&str] = match language {
+        ApiLanguage::Python => &["PY"],
+        ApiLanguage::Rust => &["RS"],
+        ApiLanguage::Go => &["GO"],
+        ApiLanguage::Java => &["JV"],
+        ApiLanguage::JavaScript => &["JS"],
+        ApiLanguage::TypeScript => &["TS"],
+        ApiLanguage::C => &["C"],
+        ApiLanguage::Cpp => &["CPP"],
+        ApiLanguage::Ruby => &["RB"],
+        ApiLanguage::Php => &["PH"],
+        ApiLanguage::Kotlin => &["KT"],
+        ApiLanguage::Swift => &["SW"],
+        ApiLanguage::CSharp => &["CS"],
+        ApiLanguage::Scala => &["SC"],
+        ApiLanguage::Elixir => &["EX"],
+        ApiLanguage::Lua | ApiLanguage::Luau => &["LU"],
+        ApiLanguage::Ocaml => &["OC"],
+    };
+    for prefix in prefix_lang {
+        if let Some(rest) = rule_id.strip_prefix(prefix) {
+            // Require digit immediately after prefix so "C" doesn't
+            // match "CPP001"/"CS001".
+            if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 const GO_RULE_SPECS: &[RegexRuleSpec] = &[
     RegexRuleSpec {
         id: "GO001",
@@ -1735,9 +1780,36 @@ pub(crate) fn analyze_file(
         Vec::new()
     };
 
+    // api-check-and-patterns-accuracy-v1 (P11.BUG-AGG-10): for C-family
+    // languages, mark lines that live inside a `/* ... */` block comment
+    // so per-line identifier matchers (e.g. `C003 sprintf-call`) skip
+    // them. Pre-fix the `\bsprintf\s*\(` pattern matched the *literal*
+    // text `sprintf()` inside a doc-comment block (e.g.
+    // `/* ... not rely on sprintf() family ... */` in
+    // `/tmp/repos/c-sds/sds.c:601`), reporting it as a real call site.
+    // The line-level `is_comment_line` skip only handles `//` line
+    // comments; block comments need state tracking across lines.
+    let block_comment_ctx: Vec<bool> = if language_uses_c_block_comments(language) {
+        compute_c_block_comment_lines(&content)
+    } else {
+        Vec::new()
+    };
+
     for (line_num, line) in content.lines().enumerate() {
         let line_number = (line_num + 1) as u32;
         let trimmed = line.trim();
+        // Skip lines that live inside a `/* ... */` block (BUG-AGG-10).
+        // Indices align with `content.lines()` ordering.
+        if block_comment_ctx
+            .get(line_num)
+            .copied()
+            .unwrap_or(false)
+        {
+            // Still update prev_trimmed so the Rust `previous_is_loop`
+            // context isn't disrupted by the comment skip.
+            prev_trimmed = trimmed.to_string();
+            continue;
+        }
         let rust_ctx = RustLineContext {
             file_has_hashmap,
             previous_line: prev_trimmed.as_str(),
@@ -1785,6 +1857,116 @@ pub(crate) fn analyze_file(
 pub(crate) struct PyLineContext {
     pub in_docstring: bool,
     pub is_def_or_class_signature: bool,
+}
+
+/// Whether `language` uses C-style `/* ... */` block comments. Used by
+/// the api-check scanner to decide whether to compute per-line block-
+/// comment context (api-check-and-patterns-accuracy-v1, BUG-AGG-10).
+///
+/// All listed languages share the C lexical tradition (block comments
+/// open with `/*` and close with `*/`). Languages that use a different
+/// block-comment shape (Python triple-quoted docstrings, Lua `--[[ ]]`,
+/// OCaml `(* *)`, Elixir doc attribute blocks) are handled separately or
+/// have their own line-level matcher in `is_comment_line`.
+fn language_uses_c_block_comments(language: ApiLanguage) -> bool {
+    matches!(
+        language,
+        ApiLanguage::Rust
+            | ApiLanguage::Go
+            | ApiLanguage::Java
+            | ApiLanguage::JavaScript
+            | ApiLanguage::TypeScript
+            | ApiLanguage::C
+            | ApiLanguage::Cpp
+            | ApiLanguage::Kotlin
+            | ApiLanguage::Swift
+            | ApiLanguage::CSharp
+            | ApiLanguage::Scala
+            | ApiLanguage::Php
+    )
+}
+
+/// For each line in `content`, return whether ANY part of the line lives
+/// inside a C-style `/* ... */` block comment.
+///
+/// Tracks block-comment state across lines, including the case where a
+/// block opens and closes on the same line (that line is treated as
+/// fully inside the comment for suppression purposes — the rule's
+/// regex would otherwise match on text *between* `/*` and `*/`).
+///
+/// String-literal awareness: this scanner is conservative. It tracks
+/// double-quoted (`"..."`) and single-quoted (`'..'`) string state so a
+/// `/*` inside a string doesn't open a phantom block. It does NOT handle
+/// escaped quotes, raw strings, template literals, or character literals
+/// with embedded escapes — those are uncommon enough in API-check rule
+/// shapes that the simpler scanner suffices. When in doubt the scanner
+/// errs toward NOT marking the line as comment, so the existing
+/// `is_comment_line` line-comment fallback still runs.
+///
+/// (api-check-and-patterns-accuracy-v1, P11.BUG-AGG-10)
+pub(crate) fn compute_c_block_comment_lines(content: &str) -> Vec<bool> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in content.lines() {
+        let line_starts_in_block = in_block;
+        let mut any_in_block = in_block;
+        let bytes = line.as_bytes();
+        let mut i = 0usize;
+        let mut in_dq = false;
+        let mut in_sq = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_block {
+                // Look for closing `*/`.
+                if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    in_block = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            // Outside a block comment: track strings so `/*` inside
+            // `"..."` doesn't open a phantom block.
+            if !in_sq && b == b'"' {
+                in_dq = !in_dq;
+                i += 1;
+                continue;
+            }
+            if !in_dq && b == b'\'' {
+                in_sq = !in_sq;
+                i += 1;
+                continue;
+            }
+            if !in_dq && !in_sq {
+                // `//` line comment: rest of the line is comment, no
+                // block-state change. Stop scanning the line.
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    break;
+                }
+                // `/*` opens a block.
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    in_block = true;
+                    any_in_block = true;
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        // Mark the line as in-comment if it started inside one or
+        // entered one anywhere on this line. The opening line of a
+        // block comment counts as comment for suppression — we don't
+        // want a `sprintf()` mention sitting *after* a same-line
+        // `/* ... */` to be missed, but per the bug report, the more
+        // common case is the *closing-line text* sitting inside the
+        // block (e.g. `* not rely on sprintf() family ...`), and the
+        // strictly conservative choice for either case is "skip the
+        // whole line" to avoid false positives.
+        let _ = line_starts_in_block; // (kept for clarity; merged into any_in_block)
+        out.push(any_in_block);
+    }
+    out
 }
 
 /// Pre-pass: compute [`PyLineContext`] for every line of a Python file.
@@ -1903,6 +2085,16 @@ fn check_rule(
     regex_specs: &[(&'static RegexRuleSpec, Regex)],
 ) -> Option<MisuseFinding> {
     let trimmed = line_text.trim();
+
+    // api-check-and-patterns-accuracy-v1 (P11.BUG-AGG-6): defense-in-depth
+    // gate. The primary dispatch (`ApiCheckArgs::run`) already restricts
+    // each file to its detected language's rule set, but this explicit
+    // gate ensures that even if a rule list were ever cross-wired (or if
+    // a future code path bypasses `rules_for_language`), a JS rule like
+    // `JS003 JSON.parse` cannot fire against a `.cpp` file.
+    if !rule_applies_to_language(rule.id.as_str(), language) {
+        return None;
+    }
 
     // Skip comments
     if is_comment_line(trimmed, language) {

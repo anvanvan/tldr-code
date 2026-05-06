@@ -21,29 +21,79 @@ use crate::TldrResult;
 /// Maximum file size to process (5MB) - M6 mitigation
 pub const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024;
 
-/// Default directories to skip during traversal
+/// Default directories to skip during traversal.
+///
+/// **api-check-and-patterns-accuracy-v1 (P11.BUG-AGG-7)**: extended this
+/// list to include common generated artifact dirs (e.g. `out`, `bin`,
+/// `obj`, `.gradle`, `dox` for doxygen, `.pytest_cache`, `.mypy_cache`,
+/// `.ruff_cache`) so `tldr patterns` and other tree-driven commands
+/// don't mis-classify projects whose generated docs/build output happens
+/// to outnumber authored sources.
 pub const DEFAULT_SKIP_DIRS: &[&str] = &[
+    // Vendored / package-manager output
     "node_modules",
-    "__pycache__",
-    ".git",
-    ".svn",
-    ".hg",
+    "vendor",
+    // Build sinks (general)
+    "target",
     "dist",
     "build",
+    "out",
+    "bin",
+    "obj",
+    // JavaScript framework caches
     ".next",
     ".nuxt",
-    "coverage",
-    ".tox",
+    // Doxygen output (typical custom-config dir; see GENERATED_DIR_SENTINELS
+    // below for the `docs/` doxygen-output detection).
+    "dox",
+    // Python tooling
+    "__pycache__",
     "venv",
     ".venv",
     "env",
     ".env",
-    "vendor",
-    ".cache",
-    "target",
+    ".tox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    // Coverage artefacts
+    "coverage",
+    ".coverage",
+    // JVM tooling
+    ".gradle",
+    // Version control
+    ".git",
+    ".svn",
+    ".hg",
+    // Editor caches
     ".idea",
     ".vscode",
+    ".cache",
 ];
+
+/// Files whose presence at the top level of a directory mark it as
+/// generator output rather than authored source. Used by the file-tree
+/// walker to skip directories whose name is ambiguous (e.g. `docs/`
+/// containing doxygen html output vs `docs/` with authored markdown).
+///
+/// (api-check-and-patterns-accuracy-v1, P11.BUG-AGG-7)
+const GENERATED_DIR_SENTINELS: &[&str] = &["doxygen.css", "doxygen.svg"];
+
+/// Whether a directory contains any [`GENERATED_DIR_SENTINELS`] at its
+/// top level. Cheap top-level read; nested matches are not considered.
+pub(crate) fn dir_has_generated_sentinel(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if GENERATED_DIR_SENTINELS.contains(&name) {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// Get file tree structure with optional extension filtering.
 ///
@@ -180,6 +230,17 @@ fn build_tree_children(
         if entry.file_type().is_dir() {
             // Skip default skip directories
             if DEFAULT_SKIP_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+
+            // api-check-and-patterns-accuracy-v1 (P11.BUG-AGG-7):
+            // skip directories that look like generator output (e.g.
+            // doxygen-emitted `docs/`). The name-based ignore list above
+            // can't catch these because `docs/` is also a legitimate
+            // authored-content directory; the sentinel-file check
+            // disambiguates by reading the dir's top level for
+            // unambiguous generator artefacts.
+            if dir_has_generated_sentinel(path) {
                 continue;
             }
 

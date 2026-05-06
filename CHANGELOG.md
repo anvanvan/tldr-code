@@ -1,5 +1,74 @@
 # Changelog
 
+## api-check-and-patterns-accuracy-v1 — internal milestone
+
+NOT a published release. Closes 3 bugs (2 MED + 1 LOW) from the
+phase-11 audit. `tldr api-check` now defensively gates each rule by
+language so a JS rule (e.g. `JSON.parse`) cannot fire against a `.cpp`
+file even if the rule list were ever cross-wired, and its C-family
+scanner now skips matches that live inside `/* ... */` block comments.
+The shared project walker has an extended default-ignore list (build
+sinks, Python tooling caches, JVM tooling, doxygen output) plus a
+sentinel-file detector so `docs/` directories that hold doxygen-
+generated HTML+JS are skipped even though `docs/` is also a legitimate
+authored-content directory. Tag: `api-check-and-patterns-accuracy-v1`.
+Manifest stays at 0.3.0.
+
+### Fixed
+
+- `crates/tldr-core/src/walker.rs` and
+  `crates/tldr-core/src/fs/tree.rs` — `tldr patterns
+  /tmp/repos/cpp-tinyxml2` mis-classified the project as JavaScript-
+  majority (`{javascript: 63, cpp: 3, c: 1, python: 1}`) because the
+  doxygen-generated `docs/` directory contained 63 generated `.js`
+  files vs the 3 authored `.cpp` source files. Extended both walkers'
+  default-ignore lists to include `out`, `bin`, `obj`, `dox`,
+  `.gradle`, `.nuxt`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`,
+  `coverage`, `.coverage` (in addition to the existing `node_modules`,
+  `target`, `dist`, `build`, `.next`, `__pycache__`, `vendor`, `.git`).
+  Added a `GENERATED_DIR_SENTINELS` mechanism: a directory whose top
+  level contains `doxygen.css` or `doxygen.svg` is treated as
+  generator output regardless of its name, so `docs/` with doxygen
+  artefacts is skipped while authored-markdown `docs/` stays. Opt-out
+  remains via `ProjectWalker::no_default_ignore`.
+  (P11.BUG-AGG-7, MED)
+
+- `crates/tldr-cli/src/commands/remaining/api_check.rs` — added
+  `rule_applies_to_language` defense-in-depth gate at `check_rule`.
+  The primary file→language→rule-set dispatch in `ApiCheckArgs::run`
+  already scoped each file's rules, but a declarative per-rule check
+  (matching rule-id prefix `JS00x`, `CPP00x`, `C00x`, ...) ensures
+  that even if a rule list were ever cross-wired, a JS rule cannot
+  fire against a `.cpp` file. After this fix `tldr api-check
+  /tmp/repos/cpp-tinyxml2` produces zero JS findings; combined with
+  the walker fix, the doxygen-generated `docs/*.js` files no longer
+  reach the scanner at all.
+  (P11.BUG-AGG-6, MED)
+
+- `crates/tldr-cli/src/commands/remaining/api_check.rs` — added
+  `compute_c_block_comment_lines` and a new per-line skip in
+  `analyze_file` that suppresses rule checks on lines living inside a
+  `/* ... */` block comment. Pre-fix, `C003 sprintf-call` matched the
+  literal text `sprintf()` inside `/tmp/repos/c-sds/sds.c:601`'s doc
+  comment (`* not rely on sprintf() family functions ...`),
+  reporting a comment as a real call site. The new helper tracks
+  block-comment state across lines (with string-literal awareness
+  for `"..."` and `'..'`) and applies to all C-family languages
+  (Rust, Go, Java, JS, TS, C, C++, Kotlin, Swift, C#, Scala, PHP).
+  Real `sprintf()` calls in `.c` files are still flagged.
+  (P11.BUG-AGG-10, LOW)
+
+### Tests
+
+- `crates/tldr-cli/tests/api_check_and_patterns_accuracy_v1.rs` —
+  five integration tests covering the three bugs:
+  `test_api_check_skips_js_rules_on_cpp_files` (BUG-AGG-6),
+  `test_api_check_no_false_positive_in_c_comments` (BUG-AGG-10),
+  `test_api_check_real_sprintf_still_flagged` (BUG-AGG-10
+  non-regression), `test_patterns_skips_default_ignore_dirs`
+  (BUG-AGG-7), and `test_patterns_real_repo_cpp_tinyxml2` (BUG-AGG-7,
+  gated on `/tmp/repos/cpp-tinyxml2`).
+
 ## interface-extraction-ocaml-elixir-v1 — internal milestone
 
 NOT a published release. Closes 2 MED interface-extraction bugs from
