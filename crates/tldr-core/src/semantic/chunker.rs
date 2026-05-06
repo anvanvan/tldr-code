@@ -38,7 +38,6 @@
 use std::path::Path;
 
 use tree_sitter::{Node, Tree};
-use walkdir::WalkDir;
 
 use crate::ast::parser::parse_file;
 use crate::semantic::types::{ChunkGranularity, ChunkOptions, CodeChunk};
@@ -65,23 +64,6 @@ const BINARY_EXTENSIONS: &[&str] = &[
 
 /// Hidden directory/file prefixes to skip
 const HIDDEN_PREFIXES: &[&str] = &[".", "_"];
-
-/// Directories to always skip
-const SKIP_DIRECTORIES: &[&str] = &[
-    "node_modules",
-    "target",
-    "__pycache__",
-    ".git",
-    ".hg",
-    ".svn",
-    "venv",
-    ".venv",
-    "env",
-    ".env",
-    "dist",
-    "build",
-    "vendor",
-];
 
 // =============================================================================
 // Result Types
@@ -277,33 +259,48 @@ pub fn chunk_file<P: AsRef<Path>>(path: P, options: &ChunkOptions) -> TldrResult
 // Internal Functions
 // =============================================================================
 
-/// Chunk all files in a directory recursively
+/// Chunk all files in a directory recursively.
+///
+/// verification-and-metrics-completeness-v1 (P12.AGG12-12): switched from a
+/// raw `walkdir::WalkDir` with a tiny built-in skip list to the shared
+/// `ProjectWalker`, which honours `.gitignore`, the canonical
+/// `DEFAULT_EXCLUDE_DIRS` list (covers `dox/`, `out/`, `obj/`, JVM build
+/// dirs, Python venvs, etc.), and the `dir_has_generated_sentinel` check
+/// (skips e.g. `docs/` directories that contain doxygen output identified
+/// by `doxygen.css` / `doxygen.svg` siblings). Without these filters,
+/// `tldr semantic` indexed minified vendor JS such as
+/// `cpp-tinyxml2/docs/jquery.js` and `clipboard.js`, which then dominated
+/// every search result.
 fn chunk_directory<P: AsRef<Path>>(path: P, options: &ChunkOptions) -> TldrResult<ChunkResult> {
     let path = path.as_ref();
     let mut all_chunks = Vec::new();
     let mut all_skipped = Vec::new();
 
-    // Note: We use filter_entry but allow the root directory through even if it
-    // would normally be skipped (e.g., temp dirs starting with dot on macOS).
-    // The depth == 0 check ensures the root itself is never filtered.
-    for entry in WalkDir::new(path)
-        .follow_links(false) // Don't follow symlinks to avoid cycles
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !should_skip_entry(e))
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() {
-            match chunk_file(entry.path(), options) {
-                Ok(result) => {
-                    all_chunks.extend(result.chunks);
-                    all_skipped.extend(result.skipped);
-                }
-                Err(e) => {
-                    all_skipped.push(SkippedFile {
-                        path: entry.path().display().to_string(),
-                        reason: format!("Error: {}", e),
-                    });
-                }
+    for entry in crate::walker::ProjectWalker::new(path).iter() {
+        let file_type = match entry.file_type() {
+            Some(ft) => ft,
+            None => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        // Apply the chunker's per-file filters: hidden / binary
+        // extensions are still excluded here even though the directory
+        // walk has been pre-filtered.
+        let entry_path = entry.path();
+        if is_binary_or_hidden(entry_path) {
+            continue;
+        }
+        match chunk_file(entry_path, options) {
+            Ok(result) => {
+                all_chunks.extend(result.chunks);
+                all_skipped.extend(result.skipped);
+            }
+            Err(e) => {
+                all_skipped.push(SkippedFile {
+                    path: entry_path.display().to_string(),
+                    reason: format!("Error: {}", e),
+                });
             }
         }
     }
@@ -312,29 +309,6 @@ fn chunk_directory<P: AsRef<Path>>(path: P, options: &ChunkOptions) -> TldrResul
         chunks: all_chunks,
         skipped: all_skipped,
     })
-}
-
-/// Check if a walkdir entry should be skipped
-fn should_skip_entry(entry: &walkdir::DirEntry) -> bool {
-    let name = entry.file_name().to_string_lossy();
-
-    // Skip hidden files/directories
-    for prefix in HIDDEN_PREFIXES {
-        if name.starts_with(prefix) {
-            return true;
-        }
-    }
-
-    // Skip known directories
-    if entry.file_type().is_dir() {
-        for skip_dir in SKIP_DIRECTORIES {
-            if name == *skip_dir {
-                return true;
-            }
-        }
-    }
-
-    false
 }
 
 /// Check if a file is binary or hidden

@@ -1362,11 +1362,39 @@ fn extract_elixir_def_name(def_call: Node, source: &[u8]) -> Option<String> {
 
 /// Find the first identifier or name node among direct children.
 fn find_first_identifier(node: Node) -> Option<Node> {
+    // Direct identifier child fast path.
     let mut cursor = node.walk();
-    let found = node
-        .children(&mut cursor)
-        .find(|&child| child.kind() == "identifier" || child.kind() == "name");
-    found
+    for child in node.children(&mut cursor) {
+        if child.kind() == "identifier" || child.kind() == "name" {
+            return Some(child);
+        }
+    }
+    // verification-and-metrics-completeness-v1 (P12.AGG12-11): C / C++
+    // parameter declarations wrap the parameter name in a sequence of
+    // declarator nodes — `pointer_declarator`, `array_declarator`,
+    // `parenthesized_declarator`, `init_declarator` — depending on the
+    // parameter's type (e.g. `const char *init` -> pointer_declarator >
+    // identifier). Recurse through these wrappers so the parameter name is
+    // recovered (without this, `tldr contracts c-sds/sds.c sdsnew`
+    // returned an empty preconditions list).
+    let mut cursor2 = node.walk();
+    for child in node.children(&mut cursor2) {
+        match child.kind() {
+            "pointer_declarator"
+            | "array_declarator"
+            | "parenthesized_declarator"
+            | "init_declarator"
+            | "function_declarator"
+            | "abstract_pointer_declarator"
+            | "reference_declarator" => {
+                if let Some(found) = find_first_identifier(child) {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Get text content of a node.
@@ -2196,6 +2224,26 @@ fn extract_typed_params_recursive(
     config: &LanguageConfig,
     line: u32,
 ) {
+    // verification-and-metrics-completeness-v1 (P12.AGG12-11): same
+    // function-declarator skip as the untyped variant — the C/C++
+    // `function_declarator` mixes the function-name identifier with the
+    // parameter list, so descend straight into the parameter_list to
+    // avoid mistaking the function name for a parameter.
+    if node.kind() == "function_declarator" {
+        if let Some(plist) = node.child_by_field_name("parameters") {
+            extract_typed_params_recursive(plist, source, conditions, config, line);
+            return;
+        }
+        let mut local = node.walk();
+        for child in node.children(&mut local) {
+            if child.kind() == "parameter_list" {
+                extract_typed_params_recursive(child, source, conditions, config, line);
+                return;
+            }
+        }
+        return;
+    }
+
     let mut cursor = node.walk();
 
     for param in node.children(&mut cursor) {
@@ -2322,6 +2370,47 @@ fn extract_untyped_params_recursive(
     line: u32,
     existing_vars: &HashSet<String>,
 ) {
+    // verification-and-metrics-completeness-v1 (P12.AGG12-11): when the
+    // current node is a C/C++ `function_declarator`, only descend into
+    // its `parameter_list` child. Otherwise the recursion sees the
+    // function-name `identifier` (a sibling of the parameter list inside
+    // the declarator) and emits a bogus precondition like
+    // `parameter sdsnew is required` for every C function. The `_declarator`
+    // suffix covers nested forms (`pointer_declarator`, `array_declarator`,
+    // `function_declarator`, `parenthesized_declarator`) that may wrap the
+    // parameter list when the function returns a pointer / array.
+    if node.kind() == "function_declarator" {
+        if let Some(plist) = node.child_by_field_name("parameters") {
+            extract_untyped_params_recursive(
+                plist,
+                source,
+                conditions,
+                config,
+                line,
+                existing_vars,
+            );
+            return;
+        }
+        // Some grammar versions don't expose a `parameters` field name —
+        // fall back to the first `parameter_list` child by kind.
+        let mut local = node.walk();
+        for child in node.children(&mut local) {
+            if child.kind() == "parameter_list" {
+                extract_untyped_params_recursive(
+                    child,
+                    source,
+                    conditions,
+                    config,
+                    line,
+                    existing_vars,
+                );
+                return;
+            }
+        }
+        // No parameter list at all: nothing to extract.
+        return;
+    }
+
     let mut cursor = node.walk();
 
     for param in node.children(&mut cursor) {

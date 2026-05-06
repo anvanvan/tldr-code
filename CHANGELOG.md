@@ -1,5 +1,190 @@
 # Changelog
 
+## verification-and-metrics-completeness-v1 — internal milestone
+
+NOT a published release. Second milestone shipped under the
+`no-synthetic-fixtures-v1` test architecture. Closes the four
+remaining P12-audit bugs left after `hygiene-and-crash-fixes-v1`:
+spec extraction completeness for Rust/C#/Java/Kotlin (1 HIGH +
+2 MED follow-ons folded under one bug ID), Ruby cognitive
+complexity scoring, C/C++ contracts parameter extraction, and
+the semantic-search file walker leaking minified vendor JS into
+non-JS projects. All four bugs reproduced live on the HEAD
+release binary against `/tmp/repos/<corpus>` before any fix —
+none had been silently closed by an earlier milestone. Tag:
+`verification-and-metrics-completeness-v1`. Manifest stays at
+0.3.0.
+
+### Fixed
+
+- `crates/tldr-cli/src/commands/contracts/test_recognizer.rs`:
+  `tldr specs --from-tests` now recognises Rust `#[test]` items
+  (including `tokio::test`, `async_std::test`, `rstest`, and
+  `test_case` aliases) by walking back through preceding
+  `attribute_item` siblings of each `function_item`. C# tests are
+  recognised by `[Test]` (NUnit), `[Fact]` / `[Theory]` (xUnit),
+  and `[TestMethod]` / `[DataTestMethod]` (MSTest) attribute lists
+  on `method_declaration` nodes — including `*Attribute` aliases
+  and qualified-path forms. Phase-12 baseline reported
+  `test_functions_scanned = 0` for both ecosystems despite real
+  test trees being present; post-fix counts on real repos are
+  ripgrep/ignore = 6 fns, csharp-newtonsoft-bson tests = 171 fns.
+  (P12.BUG-AGG12-2 — recogniser arm)
+
+- `crates/tldr-cli/src/commands/contracts/specs.rs`: added a
+  generic multi-language assertion-based spec extractor that runs
+  on every recognised test function (Rust / C# / Java / Kotlin /
+  JavaScript / TypeScript / PHP / Swift / Go / Scala / Ruby /
+  Elixir / Lua / Luau). Recognises `assertEquals` / `assertEqual`
+  / `assertSame` / `AreEqual` / `Equal` / `assert_eq` / `shouldBe`
+  → InputOutputSpec; `assertNotEquals` / `assert_ne` / `AreNotEqual`
+  → PropertySpec(inequality); `assertTrue` / `IsTrue` / `True` /
+  `assertFalse` / `IsFalse` → PropertySpec(truthy/falsy);
+  `assertNotNull` / `IsNotNull` / `assertNull` / `IsNull` →
+  PropertySpec(not_null/null); `assertThrows` / `assertFails` /
+  `Assert.Throws<E>` / `expectThrows` → ExceptionSpec. The walker
+  shares the test-recogniser predicate via a new
+  `is_test_function_node` public helper so both counters use the
+  same definition of "test function". Phase-12 baseline reported
+  `total_specs = 0` even when 571 Kotlin test functions were
+  scanned; post-fix on real corpora: kotlin-datetime = 565 specs,
+  csharp-newtonsoft-bson = 440 specs, java spring-petclinic =
+  5 specs, javascript express = 5 specs, ruby rails-html-sanitizer
+  = 84 specs. (P12.BUG-AGG12-2 — extractor arm)
+
+- `crates/tldr-core/src/metrics/cognitive.rs`: extended
+  `increases_nesting`, `count_cognitive_increment`, and
+  `count_cyclomatic_increment` to recognise the Ruby tree-sitter
+  AST kinds `if` / `unless` / `while` / `until` / `for` / `case`
+  / `begin` / `rescue` / `when` plus their `*_modifier`
+  trailing-conditional variants (`if_modifier`, `unless_modifier`,
+  `while_modifier`, `until_modifier`). Previously cognitive only
+  matched `*_statement` kinds (Python/JS/Java grammars) so every
+  Ruby function reported `cognitive = 0` regardless of branch
+  density. Phase-12 baseline on
+  `rails-html-sanitizer/lib/rails/html/scrubbers.rb`:
+  total_cognitive = 0 across 17 functions. Post-fix:
+  total_cognitive = 75, max = 21, `PermitScrubber.scrub` = 14
+  (multiple if + return-if + unless + nested unless-modifier).
+  (P12.BUG-AGG12-10)
+
+- `crates/tldr-cli/src/commands/contracts/contracts.rs`:
+  `extract_typed_params_recursive` and
+  `extract_untyped_params_recursive` now treat the C/C++
+  `function_declarator` node as a wrapper and descend straight
+  into its `parameter_list` child, instead of iterating its
+  children and matching the function-name `identifier` sibling
+  as a parameter. `find_first_identifier` was extended to recurse
+  through `pointer_declarator` / `array_declarator` /
+  `parenthesized_declarator` / `init_declarator` /
+  `abstract_pointer_declarator` / `reference_declarator` so the
+  parameter name is recovered from `const char *init` and similar
+  C declarator chains. Phase-12 baseline on `c-sds/sds.c::sdsnew`:
+  reported precondition `variable=sdsnew` (the function name).
+  Post-fix: reports `variable=init` (the actual first parameter)
+  and `sdsnew` does not appear as a precondition variable on any
+  C/C++ function. (P12.BUG-AGG12-11)
+
+- `crates/tldr-core/src/semantic/chunker.rs`: replaced the raw
+  `walkdir::WalkDir` + tiny `SKIP_DIRECTORIES` walk in
+  `chunk_directory` with the shared `tldr_core::walker::ProjectWalker`,
+  which honours `.gitignore`, the canonical `DEFAULT_EXCLUDE_DIRS`
+  list (covers `dox/`, `out/`, `obj/`, JVM build dirs, Python
+  venvs, etc.), AND the `dir_has_generated_sentinel` check that
+  P11 added (skips e.g. `docs/` directories whose top level
+  contains `doxygen.css` / `doxygen.svg`). The chunker's per-file
+  `is_binary_or_hidden` filter is preserved. Phase-12 baseline on
+  `cpp-tinyxml2`: 9 of 10 `tldr semantic "parse XML element"`
+  hits came from `docs/jquery.js` / `docs/clipboard.js`. Post-fix:
+  zero vendor JS hits in any of the 5 audited repos, top results
+  are authored source. (P12.BUG-AGG12-12)
+
+### Tests
+
+- `crates/tldr-cli/tests/verification_and_metrics_completeness_v1.rs`:
+  **10 tests using only real `/tmp/repos/<corpus>` codebases** (no
+  `TempDir`, no inline source). Each test gates on the corpus
+  existing and silently no-ops otherwise (per
+  `no-synthetic-fixtures-v1` §1). Tests cover Rust/C#/Kotlin/Java
+  test recognition, Python regression, Ruby/Python cognitive
+  regression, C `sdsnew` first-parameter check, C++ `NewElement`
+  function-name-not-emitted check, semantic vendor-exclusion on
+  `cpp-tinyxml2`. 10/10 passing.
+
+### Multi-language verification (real-repo, post-fix)
+
+- `tldr specs --from-tests` (P12.AGG12-2) — 7 corpora:
+
+  | Language   | Repo                                          | scanned | specs |
+  |------------|-----------------------------------------------|--------:|------:|
+  | rust       | ripgrep/crates/ignore/tests                   | 6       | 0†    |
+  | csharp     | csharp-newtonsoft-bson/Src/.../Tests          | 171     | 440   |
+  | kotlin     | kotlin-datetime/core/common/test              | 571     | 565   |
+  | java       | spring-petclinic/src/test/java                | 59      | 5     |
+  | python     | flask/tests                                   | 81      | 26    |
+  | javascript | express/test                                  | 1127    | 5     |
+  | ruby       | rails-html-sanitizer/test                     | 176     | 84    |
+
+  † Rust `assert!()` / `assert_eq!()` are macro_invocations whose
+  arguments live inside a `token_tree` rather than parsed
+  call_expressions; basic test counting works (≥ 1 #[test]
+  recognised), spec extraction from macro args is intentionally
+  out of scope for this milestone.
+
+- `tldr cognitive` (P12.AGG12-10) — 4 corpora (1 was JS-skipped on
+  this machine):
+
+  | Language | File                                                                  | total | max | n  |
+  |----------|-----------------------------------------------------------------------|------:|----:|---:|
+  | ruby     | rails-html-sanitizer/lib/rails/html/scrubbers.rb                      | 75    | 21  | 17 |
+  | python   | flask/src/flask/app.py                                                | 409   | 49  | 40 |
+  | java     | spring-petclinic/.../PetController.java                               | 33    | 16  | 11 |
+  | rust     | ripgrep/crates/core/flags/parse.rs                                    | 44    | 12  | 17 |
+
+- `tldr contracts <fn>` (P12.AGG12-11) — first parameter of a real
+  function across 4 langs (1 was python-skipped due to absent
+  helper file):
+
+  | Language | Function (file)                              | first precondition variable |
+  |----------|----------------------------------------------|-----------------------------|
+  | c        | sdsnew (c-sds/sds.c)                         | `init` (NOT `sdsnew`)       |
+  | cpp      | NewElement (cpp-tinyxml2/tinyxml2.cpp)       | `name` (NOT `NewElement`)   |
+  | rust     | parse (ripgrep/.../flags/parse.rs)           | (no preconditions emitted)  |
+  | java     | initOwnerBinder (spring-petclinic/.../PetController.java) | `dataBinder`   |
+
+- `tldr semantic <q>` (P12.AGG12-12) — 5 corpora; vendor-JS
+  hit count must be 0:
+
+  | Repo               | results | top hit (file)                                                                              |
+  |--------------------|--------:|---------------------------------------------------------------------------------------------|
+  | cpp-tinyxml2       | 7       | setversion.py (NOT docs/jquery.js or docs/clipboard.js)                                     |
+  | flask              | 10      | flask/tests/test_basic.py                                                                   |
+  | ripgrep            | 10      | ripgrep/crates/core/flags/lowargs.rs                                                        |
+  | spring-petclinic   | 10      | OwnerRepository.java                                                                        |
+  | kotlin-datetime    | 10      | kotlin-datetime/core/jvm/src/Converters.kt                                                  |
+
+### Pre-fix verification (per `no-synthetic-fixtures-v1` §2)
+
+All four bugs reproduced LIVE on the HEAD `9e90390` release
+binary before any fix:
+
+- AGG12-2 rust: `test_functions_scanned = 0` on
+  ripgrep/crates/ignore/tests (live).
+- AGG12-2 csharp: `test_functions_scanned = 0` on
+  csharp-newtonsoft-bson tests (live).
+- AGG12-2 kotlin: `test_functions_scanned = 571`,
+  `total_specs = 0` (live; 571 fns counted but no specs emitted).
+- AGG12-10 ruby: total/max cognitive = 0 across 17 functions of
+  rails-html-sanitizer scrubbers.rb (live).
+- AGG12-11 c: `tldr contracts c-sds/sds.c sdsnew` reported
+  `variable=sdsnew, constraint="parameter sdsnew is required"`
+  (live; function name as parameter).
+- AGG12-12 semantic: 9/10 results inside
+  `cpp-tinyxml2/docs/jquery.js` and `docs/clipboard.js` (live).
+
+None were "already fixed by an earlier milestone". All four
+required code changes in this milestone.
+
 ## hygiene-and-crash-fixes-v1 — internal milestone
 
 NOT a published release. **First milestone shipped under the

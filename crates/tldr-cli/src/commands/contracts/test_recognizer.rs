@@ -29,9 +29,11 @@
 //! | Scala       | `test("...")` calls (Munit/ScalaTest FunSuite)             |
 //! | Elixir      | `test "..." do ... end` blocks (ExUnit)                    |
 //! | Lua / Luau  | `it(...)` / `describe(...)` blocks (busted)                |
+//! | Rust        | `fn` items immediately preceded by `#[test]`               |
+//! | C#          | Methods with `[Test]` / `[Fact]` / `[TestMethod]`          |
 //! | C / C++ /   | (No widely standard test framework — fall back to file     |
-//! | Rust / C#   |  count when name suggests test, function count = 0; the    |
-//! | OCaml       |  framework adapter can be wired later.)                    |
+//! | OCaml       |  count when name suggests test, function count = 0; the   |
+//! |             |  framework adapter can be wired later.)                    |
 //!
 //! For languages without a clear convention, the recognizer treats files
 //! whose name contains `test` (case-insensitive) as test files but reports
@@ -190,13 +192,35 @@ fn is_candidate_test_file(path: &Path, language: Language) -> bool {
                     || stem.ends_with("_test")
                     || file_name.starts_with("test_"))
         }
+        // Rust: built-in `#[test]` framework — files under `tests/` are
+        // integration tests, and any source file may contain `#[cfg(test)]`
+        // mod blocks. Treat any `.rs` whose path contains `test` (a tests/
+        // directory or a *_test.rs filename) or `bench` as a candidate;
+        // matches_test_function then filters down to actual `#[test]` items.
+        Language::Rust => {
+            lower.ends_with(".rs")
+                && (path.components().any(|c| c.as_os_str() == "tests")
+                    || stem.contains("test")
+                    || stem.contains("bench"))
+        }
+        // C#: NUnit / xUnit / MSTest — files named `*Tests.cs` or under
+        // a Tests directory. matches_test_function filters down to methods
+        // carrying `[Test]` / `[Fact]` / `[TestMethod]` etc.
+        Language::CSharp => {
+            lower.ends_with(".cs")
+                && (stem.ends_with("Test")
+                    || stem.ends_with("Tests")
+                    || path.components().any(|c| {
+                        let s = c.as_os_str().to_string_lossy().to_ascii_lowercase();
+                        s == "test" || s == "tests"
+                    }))
+        }
         // Languages without a single dominant convention. Fall back to the
         // weak heuristic of "filename contains 'test'" so directories laid
-        // out as `tests/` still count their files (a clear improvement
-        // over the previous all-zero behaviour). The function-count walker
-        // still returns 0 for these — wiring grammar-specific recognisers
-        // is left as TODO.
-        Language::Rust | Language::C | Language::Cpp | Language::CSharp | Language::Ocaml => {
+        // out as `tests/` still count their files. The function-count
+        // walker still returns 0 for these — wiring grammar-specific
+        // recognisers is left as TODO.
+        Language::C | Language::Cpp | Language::Ocaml => {
             lower.contains("test") || lower.contains("spec")
         }
     }
@@ -226,6 +250,15 @@ fn walk_count(node: &Node, source: &[u8], language: Language, count: &mut u32) {
     }
 }
 
+/// Public wrapper around the per-language test-function predicate.
+///
+/// `tldr specs --from-tests` re-uses this from the generic spec extractor
+/// so the same definition of "test function" used to count tests is used
+/// to harvest assertions inside them.
+pub fn is_test_function_node(node: &Node, source: &[u8], language: Language) -> bool {
+    matches_test_function(node, source, language)
+}
+
 /// Per-language predicate: is this AST node a test function declaration?
 fn matches_test_function(node: &Node, source: &[u8], language: Language) -> bool {
     match language {
@@ -239,8 +272,115 @@ fn matches_test_function(node: &Node, source: &[u8], language: Language) -> bool
         Language::Scala => scala_is_test_call(node, source),
         Language::Elixir => elixir_is_test_macro(node, source),
         Language::Lua | Language::Luau => lua_is_test_call(node, source),
-        Language::Rust | Language::C | Language::Cpp | Language::CSharp | Language::Ocaml => false,
+        Language::Rust => rust_is_test_function(node, source),
+        Language::CSharp => csharp_has_test_attribute(node, source),
+        Language::C | Language::Cpp | Language::Ocaml => false,
     }
+}
+
+// -- Rust: `#[test]` attribute precedes a `fn` item ---------------------------
+//
+// In tree-sitter-rust, `#[test]` is parsed as an `attribute_item` that is a
+// SIBLING (preceding) of the `function_item`, not a child. So at every
+// `function_item` we walk back to the previous siblings collecting any
+// `attribute_item` nodes; if any contains an `attribute` whose head
+// identifier is `test`, this is a unit test. We also accept aliases
+// commonly used in async/integration setups: `tokio::test`, `async_std::test`,
+// `rstest`, `proptest`, plus the common `test_case` macro.
+fn rust_is_test_function(node: &Node, source: &[u8]) -> bool {
+    if node.kind() != "function_item" {
+        return false;
+    }
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "attribute_item" => {
+                if rust_attribute_is_test(&p, source) {
+                    return true;
+                }
+                prev = p.prev_sibling();
+            }
+            "line_comment" | "block_comment" => {
+                prev = p.prev_sibling();
+            }
+            _ => break,
+        }
+    }
+    false
+}
+
+fn rust_attribute_is_test(attr_item: &Node, source: &[u8]) -> bool {
+    // attribute_item -> [#, [, attribute(...), ]]
+    let mut cursor = attr_item.walk();
+    for child in attr_item.children(&mut cursor) {
+        if child.kind() == "attribute" {
+            // attribute can be `test`, `tokio::test`, `test_case::test_case`,
+            // etc. Walk and collect the tail identifier(s).
+            let text = node_text(child, source);
+            // Strip any argument list `(...)` and whitespace; take the path tail.
+            let head = text
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()
+                .unwrap_or("");
+            let tail = head.rsplit("::").next().unwrap_or("");
+            if matches!(
+                tail,
+                "test" | "tokio_test" | "async_test" | "rstest" | "test_case"
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// -- C#: methods with `[Test]` / `[Fact]` / `[TestMethod]` etc. --------------
+//
+// tree-sitter-c-sharp uses `method_declaration` whose direct children include
+// one or more `attribute_list` nodes. Each `attribute_list` contains
+// `attribute` children whose first identifier names the attribute (e.g.
+// "Test", "Fact", "TestMethod", "TestCase", "Theory").
+fn csharp_has_test_attribute(node: &Node, source: &[u8]) -> bool {
+    if node.kind() != "method_declaration" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "attribute_list" {
+            let mut inner = child.walk();
+            for attr in child.children(&mut inner) {
+                if attr.kind() == "attribute" && csharp_attribute_is_test(&attr, source) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn csharp_attribute_is_test(attribute: &Node, source: &[u8]) -> bool {
+    // Read the tail identifier of the attribute name.
+    let text = node_text(*attribute, source);
+    let head = text
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    let tail = head.rsplit('.').next().unwrap_or("");
+    matches!(
+        tail,
+        "Test"
+            | "TestAttribute"
+            | "Fact"
+            | "FactAttribute"
+            | "Theory"
+            | "TheoryAttribute"
+            | "TestMethod"
+            | "TestMethodAttribute"
+            | "TestCase"
+            | "TestCaseAttribute"
+            | "DataTestMethod"
+            | "DataTestMethodAttribute"
+    )
 }
 
 // -- Python: `def test_*` -----------------------------------------------------

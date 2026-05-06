@@ -585,6 +585,25 @@ impl<'a> CognitiveCalculator<'a> {
                 | "catch_clause"
                 | "except_clause"
                 | "except_handler"
+                // verification-and-metrics-completeness-v1 (P12.AGG12-10):
+                // Ruby tree-sitter grammar exposes control-flow nodes
+                // without the `_statement` suffix used by Python/JS/Java.
+                // Without these arms `tldr cognitive` reported `0` for
+                // every Ruby function regardless of branch density. The
+                // `*_modifier` forms cover the trailing-conditional
+                // shorthand (`return X if cond` / `return X unless cond`).
+                | "if"
+                | "unless"
+                | "while"
+                | "until"
+                | "for"
+                | "case"
+                | "begin"
+                | "rescue"
+                | "if_modifier"
+                | "unless_modifier"
+                | "while_modifier"
+                | "until_modifier"
         )
     }
 
@@ -623,6 +642,21 @@ impl<'a> CognitiveCalculator<'a> {
             "match_statement" | "switch_statement" => Some((1, "switch")),
             // ternary adds +1 (no nesting penalty per SonarQube - chains are flat)
             "conditional_expression" | "ternary_expression" => Some((1, "?:")),
+            // P12.AGG12-10: Ruby AST kinds. `if`/`unless` are SonarSource
+            // "if" cognates; `while`/`until` are loops; `for` is a loop;
+            // `case` is a switch; `begin` is the equivalent of `try`;
+            // `rescue` is the catch clause; the *_modifier suffix variants
+            // are the trailing-conditional shorthand and count exactly the
+            // same as their statement form.
+            "if" => Some((1, "if")),
+            "unless" => Some((1, "if")), // Ruby `unless` is just inverted `if`
+            "while" | "until" => Some((1, "while")),
+            "for" => Some((1, "for")),
+            "case" => Some((1, "switch")),
+            "rescue" => Some((1, "catch")),
+            "if_modifier" => Some((1, "if")),
+            "unless_modifier" => Some((1, "if")),
+            "while_modifier" | "until_modifier" => Some((1, "while")),
             _ => None,
         };
 
@@ -744,6 +778,12 @@ impl<'a> CognitiveCalculator<'a> {
             "except_clause" | "catch_clause" | "except_handler" => self.cyclomatic += 1,
             "case_clause" | "match_arm" | "switch_case" => self.cyclomatic += 1,
             "conditional_expression" | "ternary_expression" => self.cyclomatic += 1,
+            // Ruby AST kinds (P12.AGG12-10).
+            "if" | "unless" | "if_modifier" | "unless_modifier" => self.cyclomatic += 1,
+            "while" | "until" | "while_modifier" | "until_modifier" => self.cyclomatic += 1,
+            "for" => self.cyclomatic += 1,
+            "rescue" => self.cyclomatic += 1,
+            "when" => self.cyclomatic += 1, // case-arm cognate
             "boolean_operator" | "binary_expression" => {
                 if self.get_logical_operator(node).is_some() {
                     self.cyclomatic += 1;

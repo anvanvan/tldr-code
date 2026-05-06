@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::Args;
+use tldr_core::ast::ParserPool;
 use tldr_core::walker::walk_project;
 use tldr_core::Language;
 use tree_sitter::{Node, Parser, Tree};
@@ -161,6 +162,16 @@ pub fn run_specs(test_path: &Path, function_filter: Option<&str>) -> ContractsRe
                 if info.is_test_file {
                     test_files_scanned = 1;
                     test_functions_scanned = info.test_function_count;
+                    // verification-and-metrics-completeness-v1
+                    // (P12.AGG12-2): for the languages whose test
+                    // recogniser yields a non-zero count, also extract
+                    // input/output/exception/property specs from common
+                    // assertion patterns. Previously these languages
+                    // reported `total_specs = 0` even with hundreds of
+                    // recognised test functions.
+                    let extracted =
+                        extract_generic_specs(test_path, &source, language);
+                    merge_specs(&mut all_specs, extracted);
                 }
             }
         }
@@ -217,6 +228,14 @@ pub fn run_specs(test_path: &Path, function_filter: Option<&str>) -> ContractsRe
             if info.is_test_file {
                 test_files_scanned += 1;
                 test_functions_scanned += info.test_function_count;
+                // verification-and-metrics-completeness-v1 (P12.AGG12-2):
+                // generic assertion-based spec extractor for languages whose
+                // recogniser counts tests but the legacy Python extractor
+                // never ran on. Covers Java/Kotlin/C#/Rust/JS/TS/PHP/Swift/
+                // Go/Scala/Ruby/Elixir/Lua: any language whose test
+                // functions can be located by `recognize`.
+                let extracted = extract_generic_specs(file_path, &source, language);
+                merge_specs(&mut all_specs, extracted);
             }
         }
     }
@@ -1184,6 +1203,620 @@ fn strip_string_quotes(s: &str) -> String {
 // =============================================================================
 
 /// Merge specs from a file into the aggregate.
+// =============================================================================
+// Generic Multi-Language Spec Extraction (P12.AGG12-2)
+// =============================================================================
+//
+// Walks every language's tree-sitter AST that has at least one assertion
+// pattern we can recognise and emits InputOutput / Property / Exception specs
+// from common assertion call shapes:
+//
+// Recognised assertion calls (call name -> spec kind):
+//   assertEquals(expected, actual)        -> InputOutputSpec
+//   assertEqual(expected, actual)         -> InputOutputSpec
+//   AreEqual(expected, actual)            -> InputOutputSpec   (NUnit)
+//   Equal(expected, actual)               -> InputOutputSpec   (xUnit)
+//   assertSame(expected, actual)          -> InputOutputSpec
+//   expect(actual).toBe(expected)         -> InputOutputSpec   (Jest, partial)
+//   assertTrue(cond)                      -> PropertySpec      (bool)
+//   assertFalse(cond)                     -> PropertySpec      (bool)
+//   IsTrue(cond) / IsFalse(cond)          -> PropertySpec      (NUnit/MSTest)
+//   assertNotNull(x) / assertNull(x)      -> PropertySpec      (nullness)
+//   IsNotNull(x) / IsNull(x)              -> PropertySpec      (NUnit/MSTest)
+//   assertNotEquals(a, b)                 -> PropertySpec      (inequality)
+//   AreNotEqual / NotEqual                -> PropertySpec      (inequality)
+//   assertThrows(E.class, () -> body)     -> ExceptionSpec
+//   assertFails { body }                  -> ExceptionSpec     (Kotlin)
+//   Assert.Throws<E>(() => body)          -> ExceptionSpec     (NUnit)
+//   should_panic / panic_test             -> ExceptionSpec     (Rust attr)
+//
+// The walker recognises the function-under-test (FUT) from the SECOND
+// positional argument of equality assertions (since most JVM assertion
+// libraries put expected first, actual second). When ambiguous we pick the
+// argument that is itself a call_expression / method_invocation / similar
+// callable-shaped node.
+
+/// Top-level entry point for generic spec extraction. Parses `source` with
+/// the appropriate tree-sitter grammar for `language`, walks every test
+/// function (using the same recogniser as test counting), and extracts
+/// specs from each function body.
+fn extract_generic_specs(
+    path: &Path,
+    source: &str,
+    language: Language,
+) -> Vec<FunctionSpecs> {
+    if source.trim().is_empty() {
+        return Vec::new();
+    }
+    let pool = ParserPool::new();
+    let tree = match pool.parse(source, language).ok() {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut specs: HashMap<String, FunctionSpecs> = HashMap::new();
+    let bytes = source.as_bytes();
+    walk_for_test_bodies(tree.root_node(), bytes, language, path, &mut specs);
+
+    specs
+        .into_values()
+        .map(|mut fs| {
+            fs.summary = generate_summary(&fs);
+            fs
+        })
+        .collect()
+}
+
+/// Walk the AST. When a node looks like a recognised test function for the
+/// language, descend into its body and harvest assertions; otherwise recurse.
+fn walk_for_test_bodies(
+    node: Node,
+    source: &[u8],
+    language: Language,
+    path: &Path,
+    specs: &mut HashMap<String, FunctionSpecs>,
+) {
+    if super::test_recognizer::is_test_function_node(&node, source, language) {
+        let test_name = test_function_display_name(&node, source);
+        harvest_assertions_in(&node, source, language, &test_name, path, specs);
+        // Don't double-count nested matches inside a single recognised test.
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_test_bodies(child, source, language, path, specs);
+    }
+}
+
+/// Best-effort display name for the recognised test (function name when
+/// available, otherwise an anonymous placeholder).
+fn test_function_display_name(node: &Node, source: &[u8]) -> String {
+    if let Some(name) = node.child_by_field_name("name") {
+        return get_node_text(name, source).to_string();
+    }
+    // Walk children for the first identifier child (covers Swift,
+    // Kotlin, etc. whose grammar exposes the name as a positional child).
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let kind = child.kind();
+        if kind == "identifier" || kind == "simple_identifier" || kind == "name" {
+            return get_node_text(child, source).to_string();
+        }
+    }
+    "<anonymous>".to_string()
+}
+
+/// Harvest every assertion-shaped call inside a test function body and
+/// translate into the appropriate spec.
+fn harvest_assertions_in(
+    test_func: &Node,
+    source: &[u8],
+    language: Language,
+    test_func_name: &str,
+    _path: &Path,
+    specs: &mut HashMap<String, FunctionSpecs>,
+) {
+    walk_for_assertion_calls(*test_func, source, language, test_func_name, specs);
+}
+
+fn walk_for_assertion_calls(
+    node: Node,
+    source: &[u8],
+    language: Language,
+    test_func_name: &str,
+    specs: &mut HashMap<String, FunctionSpecs>,
+) {
+    let kind = node.kind();
+    let is_call = matches!(
+        kind,
+        "call_expression"
+            | "invocation_expression"
+            | "method_invocation"
+            | "macro_invocation"
+            | "call"
+            | "function_call"
+            | "function_call_statement"
+    );
+    if is_call {
+        if let Some(callee_text) = generic_callee_name(&node, source) {
+            let callee_tail = callee_text.rsplit('.').next().unwrap_or(&callee_text);
+            // Strip generic params: `Throws<E>` -> `Throws`
+            let callee_tail = callee_tail.split('<').next().unwrap_or(callee_tail);
+            classify_assertion_call(
+                &node,
+                source,
+                language,
+                callee_tail,
+                test_func_name,
+                specs,
+            );
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_for_assertion_calls(child, source, language, test_func_name, specs);
+    }
+}
+
+/// Tail identifier of the callable expression.
+fn generic_callee_name(call: &Node, source: &[u8]) -> Option<String> {
+    if let Some(f) = call.child_by_field_name("function") {
+        return Some(get_node_text(f, source).to_string());
+    }
+    if let Some(f) = call.child_by_field_name("method") {
+        return Some(get_node_text(f, source).to_string());
+    }
+    if let Some(f) = call.child_by_field_name("name") {
+        return Some(get_node_text(f, source).to_string());
+    }
+    // Fall back to first identifier child.
+    let mut cursor = call.walk();
+    for child in call.children(&mut cursor) {
+        match child.kind() {
+            "identifier"
+            | "simple_identifier"
+            | "field_access"
+            | "member_access_expression"
+            | "navigation_expression"
+            | "scoped_identifier" => {
+                return Some(get_node_text(child, source).to_string());
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Read positional arguments of a call node, ignoring punctuation and
+/// non-argument children (e.g. trailing closures, generic params).
+fn collect_call_args<'a>(call: Node<'a>) -> Vec<Node<'a>> {
+    let mut out: Vec<Node<'a>> = Vec::new();
+    let arg_list = call
+        .child_by_field_name("arguments")
+        .or_else(|| {
+            // Find first argument-list child by kind.
+            let mut cursor = call.walk();
+            for child in call.children(&mut cursor) {
+                let k = child.kind();
+                if k == "argument_list"
+                    || k == "value_arguments"
+                    || k == "arguments"
+                    || k == "argument_list_no_paren"
+                    // Rust macro_invocation wraps args in token_tree.
+                    || k == "token_tree"
+                {
+                    return Some(child);
+                }
+            }
+            None
+        })
+        .unwrap_or(call);
+
+    let mut cursor = arg_list.walk();
+    for child in arg_list.children(&mut cursor) {
+        let k = child.kind();
+        // Skip punctuation and trivia.
+        if k == "("
+            || k == ")"
+            || k == ","
+            || k == ":"
+            || k == "{"
+            || k == "}"
+            || k == "["
+            || k == "]"
+        {
+            continue;
+        }
+        // Skip the function head when we're falling back to the call node.
+        if k == "identifier" && arg_list.id() == call.id() {
+            continue;
+        }
+        // Unwrap one-level argument wrappers.
+        if k == "argument" || k == "value_argument" {
+            // Take the first non-trivial child as the actual expression.
+            let mut inner = child.walk();
+            for grand in child.children(&mut inner) {
+                let gk = grand.kind();
+                if gk == ":" || gk == "name" {
+                    continue;
+                }
+                out.push(grand);
+                break;
+            }
+            continue;
+        }
+        out.push(child);
+    }
+    out
+}
+
+/// Classify a single assertion call based on the tail of its callee name.
+fn classify_assertion_call(
+    call: &Node,
+    source: &[u8],
+    _language: Language,
+    callee_tail: &str,
+    test_func_name: &str,
+    specs: &mut HashMap<String, FunctionSpecs>,
+) {
+    let line = call.start_position().row as u32 + 1;
+
+    // Helper to get a fresh entry in `specs`.
+    fn ensure<'a>(
+        specs: &'a mut HashMap<String, FunctionSpecs>,
+        name: &str,
+    ) -> &'a mut FunctionSpecs {
+        specs.entry(name.to_string()).or_insert_with(|| FunctionSpecs {
+            function_name: name.to_string(),
+            summary: String::new(),
+            test_count: 0,
+            input_output_specs: vec![],
+            exception_specs: vec![],
+            property_specs: vec![],
+        })
+    }
+
+    // Equality assertions: assertEquals(expected, actual) / AreEqual etc.
+    let is_equality = matches!(
+        callee_tail,
+        "assertEquals"
+            | "assertEqual"
+            | "assertSame"
+            | "AreEqual"
+            | "AreSame"
+            | "Equal"
+            | "assert_eq"
+            | "assert_equal"
+            | "should_eq"
+            | "shouldBe"
+            | "shouldEqual"
+    );
+
+    // Inequality assertions
+    let is_inequality = matches!(
+        callee_tail,
+        "assertNotEquals"
+            | "assertNotEqual"
+            | "AreNotEqual"
+            | "NotEqual"
+            | "assert_ne"
+            | "assertNotSame"
+    );
+
+    // Boolean truthy / falsy assertions
+    let is_true = matches!(
+        callee_tail,
+        "assertTrue" | "IsTrue" | "True" | "assert" | "assert_true"
+    );
+    let is_false = matches!(
+        callee_tail,
+        "assertFalse" | "IsFalse" | "False" | "assert_false"
+    );
+
+    // Nullness assertions
+    let is_not_null = matches!(
+        callee_tail,
+        "assertNotNull" | "IsNotNull" | "NotNull" | "assert_some"
+    );
+    let is_null = matches!(
+        callee_tail,
+        "assertNull" | "IsNull" | "Null" | "assert_none"
+    );
+
+    // Exception assertions
+    let is_throws = matches!(
+        callee_tail,
+        "assertThrows"
+            | "assertFails"
+            | "Throws"
+            | "ThrowsAsync"
+            | "Throws_"
+            | "should_panic"
+            | "expectThrows"
+    );
+
+    let args = collect_call_args(*call);
+    if args.is_empty() {
+        return;
+    }
+
+    if is_equality && args.len() >= 2 {
+        // Conventional order is (expected, actual). Pick the side that
+        // looks like a function call as the FUT call.
+        let (call_arg, value_arg) = match (
+            looks_like_call(args[1]),
+            looks_like_call(args[0]),
+        ) {
+            (true, _) => (args[1], args[0]),
+            (false, true) => (args[0], args[1]),
+            _ => return,
+        };
+        if let Some((fname, inputs)) = generic_extract_call_info(call_arg, source) {
+            let output = try_eval_literal(value_arg, source);
+            let fs = ensure(specs, &fname);
+            fs.input_output_specs.push(InputOutputSpec {
+                function: fname,
+                inputs,
+                output,
+                test_function: test_func_name.to_string(),
+                line,
+                confidence: Confidence::High,
+            });
+        }
+        return;
+    }
+
+    if is_inequality && args.len() >= 2 {
+        let call_arg = if looks_like_call(args[1]) {
+            args[1]
+        } else if looks_like_call(args[0]) {
+            args[0]
+        } else {
+            return;
+        };
+        let other = if call_arg.id() == args[1].id() {
+            args[0]
+        } else {
+            args[1]
+        };
+        if let Some((fname, _inputs)) = generic_extract_call_info(call_arg, source) {
+            let val = std::str::from_utf8(
+                &source[other.start_byte()..other.end_byte()],
+            )
+            .unwrap_or("");
+            let constraint = format!("result != {}", val);
+            let fs = ensure(specs, &fname);
+            fs.property_specs.push(PropertySpec {
+                function: fname,
+                property_type: "inequality".to_string(),
+                constraint,
+                test_function: test_func_name.to_string(),
+                line,
+                confidence: Confidence::Medium,
+            });
+        }
+        return;
+    }
+
+    if (is_true || is_false) && !args.is_empty() {
+        // First arg is the boolean expression; if it's a call_expression,
+        // take its name. Otherwise emit a generic property on the contained
+        // call when present.
+        let call_arg = first_callable_inside(args[0]);
+        if let Some(c) = call_arg {
+            if let Some((fname, _)) = generic_extract_call_info(c, source) {
+                let fs = ensure(specs, &fname);
+                fs.property_specs.push(PropertySpec {
+                    function: fname,
+                    property_type: if is_true {
+                        "truthy".to_string()
+                    } else {
+                        "falsy".to_string()
+                    },
+                    constraint: if is_true {
+                        "result is true".to_string()
+                    } else {
+                        "result is false".to_string()
+                    },
+                    test_function: test_func_name.to_string(),
+                    line,
+                    confidence: Confidence::Medium,
+                });
+            }
+        }
+        return;
+    }
+
+    if (is_null || is_not_null) && !args.is_empty() {
+        let call_arg = first_callable_inside(args[0]);
+        if let Some(c) = call_arg {
+            if let Some((fname, _)) = generic_extract_call_info(c, source) {
+                let fs = ensure(specs, &fname);
+                fs.property_specs.push(PropertySpec {
+                    function: fname,
+                    property_type: if is_not_null {
+                        "not_null".to_string()
+                    } else {
+                        "null".to_string()
+                    },
+                    constraint: if is_not_null {
+                        "result != null".to_string()
+                    } else {
+                        "result == null".to_string()
+                    },
+                    test_function: test_func_name.to_string(),
+                    line,
+                    confidence: Confidence::Medium,
+                });
+            }
+        }
+        return;
+    }
+
+    if is_throws {
+        // Pick the lambda/closure argument and find a call inside it.
+        for arg in &args {
+            if let Some(c) = first_callable_inside(*arg) {
+                if let Some((fname, inputs)) = generic_extract_call_info(c, source) {
+                    let exc = guess_exception_type(call, source);
+                    let fs = ensure(specs, &fname);
+                    fs.exception_specs.push(ExceptionSpec {
+                        function: fname,
+                        exception_type: exc,
+                        match_pattern: None,
+                        inputs,
+                        test_function: test_func_name.to_string(),
+                        line,
+                        confidence: Confidence::Medium,
+                    });
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Multi-language version of `extract_call_info`. Walks the call node
+/// looking for the callee identifier (handles the various AST shapes
+/// across Java/Kotlin/C#/Rust/etc.) and collects positional argument
+/// literals via `try_eval_literal`. The Python-only filter list of
+/// builtins is dropped here: in non-Python tests, names like `len` are
+/// genuine functions-under-test.
+fn generic_extract_call_info(
+    call: Node,
+    source: &[u8],
+) -> Option<(String, Vec<serde_json::Value>)> {
+    // Skip macros that wrap the FUT (Rust): assert!(actual_call(...)) — we
+    // already handled the assert wrapper at the caller layer.
+    let raw_callee = generic_callee_name(&call, source)?;
+    // Take the tail identifier (strip generic params and method access).
+    let head = raw_callee.split('<').next().unwrap_or(&raw_callee);
+    let tail = head.rsplit('.').next().unwrap_or(head);
+    let tail = tail.rsplit("::").next().unwrap_or(tail);
+    let func_name = tail.trim().to_string();
+    if func_name.is_empty() {
+        return None;
+    }
+
+    // Skip very common assertion-library helpers when they slipped through
+    // (e.g. nested `assertTrue(..)` inside another assert).
+    if is_known_assertion_callee(&func_name) {
+        return None;
+    }
+
+    let args = collect_call_args(call);
+    let inputs: Vec<serde_json::Value> = args
+        .into_iter()
+        .map(|n| try_eval_literal(n, source))
+        .collect();
+
+    Some((func_name, inputs))
+}
+
+fn is_known_assertion_callee(name: &str) -> bool {
+    matches!(
+        name,
+        "assertEquals"
+            | "assertEqual"
+            | "assertSame"
+            | "assertTrue"
+            | "assertFalse"
+            | "assertNull"
+            | "assertNotNull"
+            | "assertNotEquals"
+            | "assertThrows"
+            | "assertFails"
+            | "AreEqual"
+            | "AreNotEqual"
+            | "AreSame"
+            | "IsTrue"
+            | "IsFalse"
+            | "IsNull"
+            | "IsNotNull"
+            | "Throws"
+            | "ThrowsAsync"
+            | "Equal"
+            | "NotEqual"
+            | "True"
+            | "False"
+            | "Null"
+            | "NotNull"
+            | "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "assert_true"
+            | "assert_false"
+            | "assert_some"
+            | "assert_none"
+            | "should_eq"
+            | "shouldBe"
+            | "shouldEqual"
+    )
+}
+
+/// Best-effort: does `n` look like a function call we can extract a name from?
+fn looks_like_call(n: Node) -> bool {
+    matches!(
+        n.kind(),
+        "call_expression"
+            | "invocation_expression"
+            | "method_invocation"
+            | "call"
+            | "function_call"
+            | "function_call_statement"
+            | "macro_invocation"
+    )
+}
+
+/// Walk into a node looking for the first callable subnode (handles
+/// lambda wrappers, parenthesised expressions, blocks, etc.).
+fn first_callable_inside(n: Node) -> Option<Node> {
+    if looks_like_call(n) {
+        return Some(n);
+    }
+    let mut cursor = n.walk();
+    for child in n.children(&mut cursor) {
+        if let Some(found) = first_callable_inside(child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Guess an exception type from the assertion call. Looks for type-shaped
+/// children inside the argument list (e.g. `IllegalArgumentException.class`,
+/// `Throws<NullReferenceException>(...)`). Returns `Throwable` as a fallback.
+fn guess_exception_type(call: &Node, source: &[u8]) -> String {
+    // Walk the call's text up to the first '(' and collect any
+    // capitalised-identifier sub-token.
+    let text = std::str::from_utf8(&source[call.start_byte()..call.end_byte()])
+        .unwrap_or("");
+    let mut acc = String::new();
+    for ch in text.chars() {
+        if acc.contains('(') || acc.contains('{') {
+            break;
+        }
+        acc.push(ch);
+    }
+    // Common type-positional patterns:
+    //   assertThrows(IllegalArgumentException.class, ...)
+    //   Assert.Throws<NullReferenceException>(...)
+    if let Some(start) = acc.find('<') {
+        if let Some(end) = acc[start + 1..].find('>') {
+            return acc[start + 1..start + 1 + end].trim().to_string();
+        }
+    }
+    if let Some(idx) = acc.find('(') {
+        let after = &acc[idx + 1..];
+        if let Some(dot) = after.find(".class") {
+            return after[..dot].trim().to_string();
+        }
+    }
+    "Exception".to_string()
+}
+
 fn merge_specs(all_specs: &mut HashMap<String, FunctionSpecs>, new_specs: Vec<FunctionSpecs>) {
     for new_fs in new_specs {
         let entry = all_specs
