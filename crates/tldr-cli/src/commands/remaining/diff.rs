@@ -842,25 +842,60 @@ fn detect_changes(
 ) -> Vec<ASTChange> {
     let mut changes = Vec::new();
 
-    // Build lookup maps by name
-    let _map_a: HashMap<&str, &ExtractedNode> =
-        nodes_a.iter().map(|n| (n.name.as_str(), n)).collect();
-    let map_b: HashMap<&str, &ExtractedNode> =
-        nodes_b.iter().map(|n| (n.name.as_str(), n)).collect();
+    // real-repo-fixes-v1 (P9.BUG-R8): build a multi-value index keyed by
+    // node name so overloads (`@overload def locate_app(...)` × N) and
+    // duplicate-named methods across classes (`__init__` in flask's
+    // `ScriptInfo` vs `AppGroup`) pair up by structural identity instead
+    // of collapsing into a single map entry. The previous
+    // `HashMap<&str, &ExtractedNode>` kept only the *last* node per name,
+    // so `tldr diff <file> <file>` falsely reported every overload as an
+    // update and every duplicate-named method as moved.
+    let mut index_b: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (j, n) in nodes_b.iter().enumerate() {
+        index_b.entry(n.name.as_str()).or_default().push(j);
+    }
 
     // Track which nodes have been matched
     let mut matched_a: Vec<bool> = vec![false; nodes_a.len()];
     let mut matched_b: Vec<bool> = vec![false; nodes_b.len()];
 
-    // First pass: exact name matches
+    // First pass: exact name matches with stable best-of pairing.
+    //
+    // For each A node, pick the unmatched B node with the same name that
+    // best matches by (kind, body, line) — in that priority. Self-diff
+    // (every A == every B) lands on the line-aligned twin every time, so
+    // `total_changes == 0` and `identical == true`.
     for (i, node_a) in nodes_a.iter().enumerate() {
+        // Reserved field on `ExtractedNode` — kept because callers may
+        // surface it in future. See struct comment.
         let _ = node_a.end_line;
-        if let Some(&node_b) = map_b.get(node_a.name.as_str()) {
-            // Same name exists in both files
+        let candidates = match index_b.get(node_a.name.as_str()) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let chosen = candidates
+            .iter()
+            .copied()
+            .filter(|&j| !matched_b[j])
+            .min_by_key(|&j| {
+                let n_b = &nodes_b[j];
+                // Lower is better. Priority order: same kind, then exact
+                // body match, then closest line. is_method tie-break
+                // distinguishes `__init__` of class A vs class B in the
+                // common case where each class has its own.
+                let kind_mismatch = (node_a.kind != n_b.kind) as u32;
+                let method_mismatch = (node_a.is_method != n_b.is_method) as u32;
+                let body_mismatch = (node_a.normalized_body != n_b.normalized_body) as u32;
+                let line_diff =
+                    (node_a.line as i64 - n_b.line as i64).unsigned_abs() as u32;
+                (kind_mismatch, method_mismatch, body_mismatch, line_diff)
+            });
+
+        if let Some(j) = chosen {
             matched_a[i] = true;
-            if let Some(j) = nodes_b.iter().position(|n| n.name == node_a.name) {
-                matched_b[j] = true;
-            }
+            matched_b[j] = true;
+            let node_b = &nodes_b[j];
 
             // Check if body changed
             if node_a.normalized_body != node_b.normalized_body {

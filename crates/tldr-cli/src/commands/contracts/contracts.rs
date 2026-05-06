@@ -1248,8 +1248,19 @@ fn find_function_recursive<'a>(
             || child.kind() == "structure_item"      // OCaml top-level items
             || child.kind() == "module_definition"   // OCaml module/functor defs
             || child.kind() == "module_binding"      // OCaml module binding
-            || child.kind() == "functor"
-        // OCaml functors
+            || child.kind() == "functor"             // OCaml functors
+            // C/C++ preprocessor branch nodes — tree-sitter-cpp wraps `#if`/
+            // `#elif`/`#else` content in these, and `static inline` functions
+            // defined inside (e.g. tinyxml2.cpp:65 `TIXML_SNPRINTF`) are
+            // otherwise skipped by the recursive walk. real-repo-fixes-v1
+            // (P9.BUG-R1).
+            || child.kind() == "preproc_if"
+            || child.kind() == "preproc_ifdef"
+            || child.kind() == "preproc_else"
+            || child.kind() == "preproc_elif"
+            || child.kind() == "preproc_elifdef"
+            || child.kind() == "linkage_specification" // extern "C" { ... }
+            || child.kind() == "namespace_definition"  // C++ namespace { ... }
         {
             if let Some(found) =
                 find_function_recursive(child, function_name, source, config, depth + 1)

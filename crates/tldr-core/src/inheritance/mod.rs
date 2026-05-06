@@ -39,6 +39,7 @@
 //! println!("Found {} classes", report.count);
 //! ```
 
+pub mod cpp; // real-repo-fixes-v1 (P9.BUG-R4): C/C++ inheritance extraction
 pub mod csharp;
 pub mod filter;
 pub mod format;
@@ -127,7 +128,13 @@ pub fn extract_inheritance(
     let mut languages_seen = HashSet::new();
 
     for file_path in &files {
-        let file_lang = Language::from_path(file_path).unwrap_or(Language::Python);
+        // real-repo-fixes-v1 (P9.BUG-R4): use sibling-aware detection so a
+        // `.h` header next to `.cpp` translation units is parsed with the
+        // C++ grammar. Without this, tinyxml2.h (8 obvious public-inherit
+        // relations) was treated as plain C and contributed zero edges.
+        let file_lang = Language::from_path_with_siblings(file_path)
+            .or_else(|| Language::from_path(file_path))
+            .unwrap_or(Language::Python);
 
         // Skip if language filter is specified and doesn't match
         if let Some(filter_lang) = lang {
@@ -158,6 +165,9 @@ pub fn extract_inheritance(
             Language::CSharp => csharp::extract_classes(&source, file_path, &parser_pool)?,
             Language::Ruby => ruby::extract_classes(&source, file_path, &parser_pool)?,
             Language::Php => php::extract_classes(&source, file_path, &parser_pool)?,
+            // real-repo-fixes-v1 (P9.BUG-R4): plug C/C++ inheritance.
+            Language::Cpp => cpp::extract_classes(&source, file_path, &parser_pool)?,
+            Language::C => cpp::extract_classes_c(&source, file_path, &parser_pool)?,
             _ => Vec::new(), // Unsupported language
         };
 

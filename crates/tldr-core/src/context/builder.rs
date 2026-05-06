@@ -454,7 +454,7 @@ fn find_function_info<'a>(
     module_info: &'a crate::types::ModuleInfo,
     func_name: &str,
 ) -> Option<&'a FunctionInfo> {
-    // Check top-level functions
+    // Check top-level functions (exact match)
     for func in &module_info.functions {
         if func.name == func_name {
             return Some(func);
@@ -470,6 +470,31 @@ fn find_function_info<'a>(
             if class.name == class_name {
                 for method in &class.methods {
                     if method.name == method_name {
+                        return Some(method);
+                    }
+                }
+            }
+        }
+
+        // real-repo-fixes-v1 (P9.BUG-R3): for languages where the call
+        // graph emits qualified names (`Module.func`) but `extract` lists
+        // top-level bare functions (notably OCaml `Module.to_json` and
+        // Elixir `Module.func`), fall back to a last-segment match against
+        // top-level functions. Mirrors `analysis::impact::names_match`'s
+        // qualifier-stripping rule (cross-command-consistency-v3 P5.BUG-N3)
+        // so `tldr context to_json` and `tldr impact to_json` agree.
+        let last = func_name.rsplit('.').next().unwrap_or(func_name);
+        if !last.is_empty() && last != func_name {
+            for func in &module_info.functions {
+                if func.name == last {
+                    return Some(func);
+                }
+            }
+            // Also check class methods named with the last segment, in case
+            // the qualifier path matches a deeper hierarchy (Foo.Bar.method).
+            for class in &module_info.classes {
+                for method in &class.methods {
+                    if method.name == last {
                         return Some(method);
                     }
                 }

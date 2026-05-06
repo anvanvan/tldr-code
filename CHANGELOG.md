@@ -1,5 +1,177 @@
 # Changelog
 
+## real-repo-fixes-v1 — internal milestone
+
+NOT a published release. Closes 5 distinct bugs surfaced by the
+phase-9 real-repo audit (`/tmp/audit_phase9/REAL_REPO_AUDIT.md`)
+that the canonical-fixture matrix at
+`crates/tldr-cli/tests/language_command_matrix.rs` could not see
+because synthetic fixtures are too small and uniform to exercise
+real codebase patterns: macro-prefixed C++ classes (tinyxml2's
+`class TINYXML2_LIB Foo`), namespace-wrapped C# / C++ files,
+qualified-name call graphs in OCaml / Elixir, function overloads
+(`@overload def locate_app(...)`), and duplicate-name methods across
+classes. Tag: `real-repo-fixes-v1`.
+
+### Changed
+
+- `crates/tldr-cli/src/commands/contracts/contracts.rs:1228-1264` —
+  `find_function_recursive` now descends into the C/C++ preprocessor
+  branch nodes (`preproc_if`/`preproc_ifdef`/`preproc_else`/
+  `preproc_elif`/`preproc_elifdef`), `linkage_specification`
+  (`extern "C" { ... }`), and `namespace_definition`. Without these,
+  `tldr contracts /tmp/repos/cpp-tinyxml2/tinyxml2.cpp TIXML_SNPRINTF`
+  failed with `Error: function 'TIXML_SNPRINTF' not found` even
+  though `tldr extract` and `tldr complexity` both reported the
+  function — it lives inside an `#elif defined …` block at line 65.
+  P9.BUG-R1.
+- `crates/tldr-cli/src/commands/patterns/interface.rs:78-129` —
+  `function_node_kinds` and `class_node_kinds` extended to enumerate
+  Kotlin (`function_declaration`, `class_declaration`,
+  `object_declaration`) and Swift (`function_declaration`,
+  `class_declaration`, `protocol_declaration`). The two languages
+  previously hit the `_ => &[]` fallback, so `tldr interface` always
+  returned zero classes/functions for them. P9.BUG-R6/R7.
+- `crates/tldr-cli/src/commands/patterns/interface.rs:1264-1267` —
+  `extract_interface` now uses `Language::from_path_with_siblings`
+  instead of `Language::from_path`, so `tldr interface tinyxml2.h`
+  (with `tinyxml2.cpp` sibling) parses with the C++ grammar. The
+  prior path classifier returned C for every `.h`, which the
+  C grammar then misparsed into zero classes. P9.BUG-R2.
+- `crates/tldr-cli/src/commands/patterns/interface.rs:1342-1494` —
+  introduces `is_interface_container` (recurses into namespaces /
+  `linkage_specification` / `preproc_*` / `ERROR` / `compound_statement`
+  / `global_statement`), `needs_deep_walk` (cpp/c/csharp/kotlin/swift),
+  and `deep_collect`/`is_inside_class_ancestor` so classes nested
+  inside `namespace foo { … }` (cpp/csharp) or wrapped in a misparsed
+  `function_definition` (cpp macro headers) surface as top-level
+  exports. Top-level functions stay separate from class methods via
+  the ancestor check. PHP's existing one-level recursion is
+  preserved. P9.BUG-R2/R5.
+- `crates/tldr-core/src/context/builder.rs:453-507` —
+  `find_function_info` now falls back to a last-segment match
+  against top-level functions (and class methods) when the call
+  graph stores qualified names like `Module.to_json` (OCaml) or
+  `Plug.init` (Elixir) but `tldr extract` lists the bare function
+  at the file root. Mirrors the qualifier-stripping rule already
+  in `analysis::impact::names_match` (cross-command-consistency-v3
+  P5.BUG-N3). Without this, `tldr context to_json --project
+  /tmp/repos/ocaml-dune` and `tldr context init --project
+  /tmp/repos/elixir-plug` returned 0 functions despite rich
+  call-graph hits in `tldr impact`. P9.BUG-R3.
+- `crates/tldr-core/src/inheritance/cpp.rs` (new file, 240 lines) —
+  C/C++ inheritance extractor. Walks `class_specifier` /
+  `struct_specifier` for the well-formed case AND recovers the
+  macro-prefixed misparse (`class MACRO Name : public Base`) where
+  tree-sitter-cpp emits a `function_definition` whose `type` field
+  is `class_specifier(name=MACRO)`, declarator=identifier(real
+  name), and a sibling `ERROR` node holding `: public Base`. Returns
+  per-class `InheritanceNode` with bases from the well-formed
+  `base_class_clause` and from the recovered ERROR-node bases.
+  Includes 6 unit tests covering single inheritance, multiple
+  inheritance, virtual inheritance, namespace-wrapped, template
+  bases, and the macro-prefixed misparse. P9.BUG-R4.
+- `crates/tldr-core/src/inheritance/mod.rs:42-56, 130-138, 161-164` —
+  registers `pub mod cpp`, plugs `Language::Cpp` and `Language::C`
+  into the per-file dispatch (with `cpp::extract_classes_c` for
+  plain C `.c` files), and switches the per-file language detection
+  from `from_path` to `from_path_with_siblings` so `.h` headers
+  next to `.cpp` translation units are parsed as C++. Without this
+  redirect, tinyxml2.h (8 obvious public-inheritance relations)
+  contributed zero edges. P9.BUG-R4.
+- `crates/tldr-cli/src/commands/remaining/diff.rs:836-952` —
+  `detect_changes` rebuilt to pair A-side nodes against the
+  best-matching unmatched B-side node by `(kind, is_method, body,
+  line)` priority instead of the prior name-keyed hashmap that kept
+  only the LAST node per name. Self-diff on flask's `cli.py` now
+  returns `identical: true, total_changes: 0` (was 12 false
+  updates from `@overload def locate_app` triplets and three
+  unrelated classes' `__init__` methods); same for cpp / swift /
+  kotlin / elixir self-diff. The pre-existing `let _ =
+  node_a.end_line` field-suppressor is preserved (the field is
+  reserved for future use, not gamed). P9.BUG-R8.
+
+### Architectural note
+
+Three of the five bugs share one pattern: **single-source-of-truth
+violations** — `tldr extract` and one or more sibling commands
+walked the AST with subtly different rules, so a function/class
+visible to `extract` was invisible to `contracts` (R1) or
+`interface` (R2/R5/R6/R7) or `inheritance` (R4). The fixes converge
+on the `extract` walker's rules: descend through preproc / linkage
+/ namespace containers, recover the macro-prefixed misparse, fall
+back to last-segment matching when call-graph names are qualified.
+This is the same anti-pattern `cross-command-consistency-v3`
+addressed for `tldr impact` (P5.BUG-N3) and `kotlin-extract-and-
+cpp-extensions-v1` addressed for `tldr extract` itself; the rest of
+the surface is now aligned.
+
+The diff bug (R8) is a different family — it's a domain-modelling
+gap (overloads / duplicate names) where the implementation assumed
+function names were unique within a file. The fix replaces the
+unique-key map with a multimap and a stable best-of pairing rule.
+Self-diff invariant (`identical: true, total_changes: 0`) now
+holds for every language in the audit corpus.
+
+### Retained
+
+- The well-formed `class Foo : public Base { … };` cpp parse path is
+  unchanged — `extract_class_specifier` covers it, and the
+  macro-recovery path only fires on actual `function_definition` /
+  `declaration` misparses where the `type` field is itself a
+  `class_specifier`.
+- All non-Cpp/Csharp/Kotlin/Swift `tldr interface` callers fall
+  through to the original `visit_top_level` path with PHP's
+  one-level recursion intact; no regression for python / go /
+  typescript / php / scala / ruby / rust / java.
+- `tldr context` continues to verify candidates via
+  `extract_file` + `find_function_info` and prefer non-test paths;
+  only the `find_function_info` matcher widened, so the verification
+  pipeline downstream is unchanged.
+- C++ inheritance edges from forward declarations (`class Foo;`)
+  and well-formed `class Foo : public Bar { };` continue to surface;
+  the macro recovery is purely additive.
+- `tldr diff`'s rename / move / extract / inline detection stays
+  unchanged — only the first-pass name-match step was rewritten.
+
+### Quantification
+
+| Suite | Before | After |
+| --- | --- | --- |
+| `real_repo_fixes_v1` (new) | n/a | 13/13 GREEN |
+| `vuln_migration_v1_red` (master regression) | 168/168 | 168/168 |
+| `language_command_matrix` | 926/0/28 | 926/0/28 |
+| `tldr contracts /tmp/repos/cpp-tinyxml2/tinyxml2.cpp TIXML_SNPRINTF` | "function not found" | rc=0, 2 preconditions extracted |
+| `tldr interface /tmp/repos/cpp-tinyxml2/tinyxml2.h` classes | 0 | 26 (incl. all 8 forward-declared XML*) |
+| `tldr interface .../BsonDataWriterTests.cs` classes | 0 | 1 (BsonDataWriterTests) |
+| `tldr interface .../UtcOffset.kt` classes | 0 | 1 (UtcOffset) |
+| `tldr interface .../Span+Extras.swift` classes | 0 | 4 (Span × 4 extensions) |
+| `tldr context to_json --project /tmp/repos/ocaml-dune` functions | 0 | 5 |
+| `tldr context init --project /tmp/repos/elixir-plug` functions | 0 | 2 |
+| `tldr inheritance /tmp/repos/cpp-tinyxml2` edges | 0 | 10 (XMLText/XMLComment/XMLDeclaration/XMLUnknown/XMLDocument/XMLElement → XMLNode, MemPoolT → MemPool, XMLPrinterHTML5 → XMLPrinter, TestUtil → XMLVisitor) |
+| `tldr diff <python> <python>` self-diff | identical=false, 12 changes | identical=true, 0 changes |
+| `tldr diff <cpp> <cpp>` self-diff | identical=false, 130 changes | identical=true, 0 changes |
+| `tldr diff <swift> <swift>` self-diff | identical=false, 10 changes | identical=true, 0 changes |
+| `tldr diff <kotlin> <kotlin>` self-diff | identical=false, 4 changes | identical=true, 0 changes |
+| `tldr diff <elixir> <elixir>` self-diff | identical=false, 8 changes | identical=true, 0 changes |
+| `tldr diff <go|c|ts|php|csharp|scala|lua|ocaml> <self>` (regression) | identical=true | identical=true |
+
+### Standing rules upheld
+
+- One atomic commit, one CHANGELOG entry, one local annotated tag
+- `Cargo.lock` not staged (explicit-add list only)
+- No push, no `cargo publish`, no version bump (manifest stays at
+  0.3.0)
+- No `#[allow(...)]` suppression, no test weakening, no scope cuts —
+  every bug fixed at the root (walker rules, language dispatch,
+  match-pairing rule), not behind a command-level shim
+- No `git stash`, no destructive git
+- 168/168 master regression preserved; 926/0/28 language matrix
+  preserved
+- Binary reinstalled to `~/.cargo/bin/tldr` and `~/.local/bin/tldr`,
+  ad-hoc codesigned, semantic feature count = 3 (similar /
+  semantic / embed)
+
 ## language-command-matrix-clones-test-fix-v1 — followup
 
 NOT a published release. Test-only fix correcting the

@@ -77,7 +77,9 @@ fn function_node_kinds(lang: Language) -> &'static [&'static str] {
         }
         Language::Elixir => &["call"], // `def` and `defp` are calls in elixir tree-sitter
         Language::Ocaml => &["let_binding", "value_definition"],
-        _ => &[],
+        // real-repo-fixes-v1 (P9.BUG-R6/R7): wire kotlin/swift surface forms
+        // for top-level/standalone function definitions.
+        Language::Kotlin | Language::Swift => &["function_declaration"],
     }
 }
 
@@ -110,7 +112,18 @@ fn class_node_kinds(lang: Language) -> &'static [&'static str] {
         Language::Lua | Language::Luau => &[], // Lua doesn't have class syntax
         Language::Elixir => &["call"],         // defmodule is a call in elixir tree-sitter
         Language::Ocaml => &["module_definition", "type_definition"],
-        _ => &[],
+        // real-repo-fixes-v1 (P9.BUG-R6): kotlin classes/objects/interfaces.
+        // Kotlin's tree-sitter grammar emits `class_declaration` for
+        // `class`, `interface`, `enum class`, `data class`, etc., and
+        // `object_declaration` for singleton `object` blocks.
+        Language::Kotlin => &["class_declaration", "object_declaration"],
+        // real-repo-fixes-v1 (P9.BUG-R7): swift classes/protocols. The
+        // tree-sitter-swift grammar uses `class_declaration` for
+        // class/struct/enum/actor/extension and `protocol_declaration`
+        // separately. Including all gives a useful interface surface even
+        // when files only contain extensions (e.g.
+        // swift-collections/.../Span+Extras.swift).
+        Language::Swift => &["class_declaration", "protocol_declaration"],
     }
 }
 
@@ -1247,9 +1260,12 @@ fn extract_method_info(func_node: Node, source: &[u8], lang: Language) -> Method
 /// Extract the public interface from a source file.
 ///
 /// Detects the language from the file extension and uses the appropriate
-/// tree-sitter grammar and node kinds.
+/// tree-sitter grammar and node kinds. Uses sibling-aware detection so a
+/// `.h` header next to `.cpp` translation units is parsed with the C++
+/// grammar — without this, `tldr interface tinyxml2.h` parses as C and
+/// returns zero classes (real-repo-fixes-v1 P9.BUG-R2).
 pub fn extract_interface(path: &Path, source: &str) -> PatternsResult<InterfaceInfo> {
-    let lang = Language::from_path(path).unwrap_or(Language::Python);
+    let lang = Language::from_path_with_siblings(path).unwrap_or(Language::Python);
     extract_interface_with_lang(path, source, lang)
 }
 
@@ -1316,7 +1332,65 @@ pub fn extract_interface_with_lang(
     })
 }
 
+/// Container node kinds whose children should be treated as top-level for
+/// the purpose of public-interface extraction.
+///
+/// Real-world repos commonly wrap top-level classes/functions in:
+/// * C++: `namespace foo { ... }`, `extern "C" { ... }`, `#if/#elif` preproc
+/// * C#: `namespace Foo { ... }` and `namespace Foo;` (file-scoped)
+/// * C/C++: preproc conditional branches gating typedefs and inline functions
+///
+/// Without recursion, `tldr interface` reported zero classes for cpp/csharp
+/// even though `tldr extract` listed them — real-repo-fixes-v1 (P9.BUG-R2/R5).
+fn is_interface_container(kind: &str) -> bool {
+    matches!(
+        kind,
+        "namespace_definition"
+            | "namespace_declaration"
+            | "file_scoped_namespace_declaration"
+            | "linkage_specification"
+            | "preproc_if"
+            | "preproc_ifdef"
+            | "preproc_else"
+            | "preproc_elif"
+            | "preproc_elifdef"
+            | "declaration_list"
+            // tree-sitter-cpp commonly produces ERROR / function_definition
+            // wrappers in real-world headers (e.g. tinyxml2.h) when macro
+            // names like `TINYXML2_LIB` confuse the parser. Recurse into
+            // these so embedded class_specifier nodes still surface.
+            | "ERROR"
+            | "compound_statement"
+            // C# wraps the whole file content under various namespace forms
+            // and global_statement/file_scoped_namespace bodies.
+            | "global_statement"
+    )
+}
+
+/// Languages where misparses are common enough that we should walk the full
+/// AST looking for class/function nodes, not just direct children of root.
+///
+/// For these languages `tldr extract` already does a deep walk; matching that
+/// behaviour for `tldr interface` keeps the two commands consistent.
+/// real-repo-fixes-v1 (P9.BUG-R2/R5/R6/R7).
+fn needs_deep_walk(lang: Language) -> bool {
+    matches!(
+        lang,
+        Language::Cpp
+            | Language::C
+            | Language::CSharp
+            | Language::Kotlin
+            | Language::Swift
+    )
+}
+
 /// Collect top-level function and class definitions from the AST root.
+///
+/// Recurses one level into language-appropriate container nodes (PHP
+/// declaration list; C++/C# namespaces; cpp preprocessor branches) so that
+/// public types defined inside `namespace { ... }` or `#if ... #endif`
+/// blocks are surfaced — without this, real cpp/csharp codebases report zero
+/// classes (P9.BUG-R2/R5).
 fn collect_top_level_definitions(
     root: Node,
     source: &[u8],
@@ -1327,9 +1401,125 @@ fn collect_top_level_definitions(
 ) -> (Vec<FunctionInfo>, Vec<ClassInfo>) {
     let mut functions = Vec::new();
     let mut classes = Vec::new();
-    let mut cursor = root.walk();
+    if needs_deep_walk(lang) {
+        // Walk the whole AST, collecting top-level (non-method) functions
+        // and class-like nodes wherever they appear. Mirrors `tldr extract`'s
+        // behaviour for languages where misparses or namespace wrapping are
+        // common in real-world code.
+        deep_collect(
+            root,
+            source,
+            lang,
+            func_kinds,
+            class_kinds,
+            &mut functions,
+            &mut classes,
+        );
+    } else {
+        visit_top_level(
+            root,
+            source,
+            lang,
+            func_kinds,
+            class_kinds,
+            decorator_kinds,
+            &mut functions,
+            &mut classes,
+            0,
+        );
+    }
+    (functions, classes)
+}
 
-    for child in root.children(&mut cursor) {
+/// Walk the entire AST of a file, collecting class-like nodes and any
+/// function definitions that are NOT methods inside a class.
+///
+/// Used for cpp/c/csharp/kotlin/swift where:
+/// * cpp headers often have macro-prefixed `class TINYXML2_LIB Foo` that
+///   confuse tree-sitter into emitting ERROR / function_definition wrappers
+///   around the namespace body, so plain root-children iteration misses them.
+/// * csharp wraps everything under one or more `namespace_declaration` /
+///   `file_scoped_namespace_declaration` nodes.
+/// * kotlin/swift normally have classes at the file root, but extension-only
+///   files (Span+Extras.swift) and nested object_declaration trees benefit
+///   from a full walk.
+fn deep_collect(
+    node: Node,
+    source: &[u8],
+    lang: Language,
+    func_kinds: &[&str],
+    class_kinds: &[&str],
+    functions: &mut Vec<FunctionInfo>,
+    classes: &mut Vec<ClassInfo>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let kind = child.kind();
+        if class_kinds.contains(&kind) {
+            // Avoid double-counting nested classes when an enclosing class
+            // already collected its inner methods/types via extract_class_info.
+            // Top-level rule: a class node is "top-level" iff it isn't itself
+            // contained in another class-kind ancestor.
+            if !is_inside_class_ancestor(child, class_kinds)
+                && is_node_public(child, source, lang)
+            {
+                let info = extract_class_info(child, source, lang);
+                // Skip empty/anonymous misparses where extract returned no name.
+                if !info.name.is_empty() {
+                    classes.push(info);
+                }
+            }
+            // Still recurse into the body — nested classes that are themselves
+            // public should also surface (mirrors tree-walk behaviour of
+            // `tldr extract` for cpp / csharp).
+            deep_collect(child, source, lang, func_kinds, class_kinds, functions, classes);
+            continue;
+        }
+        if func_kinds.contains(&kind)
+            && !is_inside_class_ancestor(child, class_kinds)
+            && is_node_public(child, source, lang)
+        {
+            functions.push(extract_function_info(child, source, lang));
+        }
+        deep_collect(child, source, lang, func_kinds, class_kinds, functions, classes);
+    }
+}
+
+/// Check whether a node is contained within a class/struct/interface ancestor.
+/// Used to distinguish top-level functions from methods.
+fn is_inside_class_ancestor(node: Node, class_kinds: &[&str]) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if class_kinds.contains(&parent.kind()) {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_top_level(
+    node: Node,
+    source: &[u8],
+    lang: Language,
+    func_kinds: &[&str],
+    class_kinds: &[&str],
+    decorator_kinds: &[&str],
+    functions: &mut Vec<FunctionInfo>,
+    classes: &mut Vec<ClassInfo>,
+    depth: usize,
+) {
+    // Bound recursion conservatively — we only ever need to descend through
+    // a handful of namespace/preproc levels in real-world code.
+    const MAX_CONTAINER_DEPTH: usize = 8;
+    if depth > MAX_CONTAINER_DEPTH {
+        return;
+    }
+
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
         let kind = child.kind();
 
         if func_kinds.contains(&kind) {
@@ -1371,12 +1561,24 @@ fn collect_top_level_definitions(
                     classes.push(extract_class_info(class_def, source, lang));
                 }
             }
+        } else if is_interface_container(kind) {
+            // Recurse into namespace / preproc / linkage containers so that
+            // classes defined inside `namespace foo { ... }` (cpp/csharp) or
+            // gated by `#if ... #endif` (cpp) surface as top-level exports.
+            visit_top_level(
+                child,
+                source,
+                lang,
+                func_kinds,
+                class_kinds,
+                decorator_kinds,
+                functions,
+                classes,
+                depth + 1,
+            );
         } else if lang == Language::Php {
-            // For some languages, definitions may be nested in other constructs
-            // (e.g., Go has top-level declarations that contain the actual definitions)
-            // Recurse one level for these
-            // PHP wraps everything in a program > php_tag + declaration list
-            // Recurse into children.
+            // PHP wraps everything in a program > php_tag + declaration list.
+            // Recurse one level for these.
             let mut inner_cursor = child.walk();
             for inner_child in child.children(&mut inner_cursor) {
                 let inner_kind = inner_child.kind();
@@ -1392,8 +1594,6 @@ fn collect_top_level_definitions(
             }
         }
     }
-
-    (functions, classes)
 }
 
 // =============================================================================
