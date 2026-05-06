@@ -2287,9 +2287,22 @@ fn check_hotspots(lang: &str) {
 fn check_clones(lang: &str) {
     let tmp = TempDir::new().unwrap();
     fixtures::build_fixture_with_clone(lang, tmp.path());
+    // language-command-matrix-clones-test-fix-v1: the canonical clone
+    // fixture (`build_fixture_with_clone`) writes two near-identical
+    // functions IN THE SAME FILE. By design `tldr clones` excludes
+    // same-file pairs unless `--include-within-file` is passed (see
+    // crates/tldr-core/src/analysis/clones/types.rs default and
+    // crates/tldr-cli/src/commands/clones.rs --include-within-file).
+    // Pass the flag here to exercise intra-file clone detection on the
+    // canonical fixture.
     let (status, json, stdout, stderr) = run_tldr(&[
         "clones",
         tmp.path().to_str().unwrap(),
+        "--include-within-file",
+        "--min-tokens",
+        "10",
+        "--min-lines",
+        "1",
         "--format",
         "json",
         "--quiet",

@@ -1,5 +1,45 @@
 # Changelog
 
+## language-command-matrix-clones-test-fix-v1 — followup
+
+NOT a published release. Test-only fix correcting the
+`check_clones` cells in `crates/tldr-cli/tests/language_command_matrix.rs`
+that were failing across all 18 languages after
+`language-command-matrix-strengthen-v1` (commit 41c3497).
+
+The product is correct: `tldr clones` excludes same-file pairs by
+default, and intra-file clone detection is an explicit opt-in via
+`--include-within-file` (see
+`crates/tldr-core/src/analysis/clones/types.rs` default and
+`crates/tldr-cli/src/commands/clones.rs`). The canonical clone
+fixture (`build_fixture_with_clone`, `fixtures/mod.rs:274`) writes
+`c_dup_one` and `c_dup_two` as two near-identical functions IN THE
+SAME FILE, so the test must pass `--include-within-file` to exercise
+the detector's intra-file path.
+
+### Fixed
+
+- `check_clones` now invokes `tldr clones` with
+  `--include-within-file --min-tokens 10 --min-lines 1`. The
+  `--min-lines 1` accommodates languages whose c_dup fixture is
+  written single-line (rust, typescript, javascript, go, c, cpp,
+  kotlin, swift, ocaml, php, java, csharp, scala). The strengthened
+  `≥1 clone_pair OR stats.clones_found ≥ 1` assertion is preserved.
+- Added an inline comment documenting the rationale and citing the
+  product source (types.rs default + commands/clones.rs flag) so
+  future readers don't mistake the flag for test gaming.
+
+### Cell totals after fix
+
+`language_command_matrix`: **926 passed, 0 failed, 28 ignored**
+(was 908 passed, 18 failed, 28 ignored). The 18 `clones × <lang>`
+cells are restored to GREEN.
+
+### Files modified
+
+- `crates/tldr-cli/tests/language_command_matrix.rs`
+- `CHANGELOG.md`
+
 ## language-command-matrix-strengthen-v1 — followup
 
 NOT a published release. Tightens shape-only invariants in 5
