@@ -258,6 +258,125 @@ pub fn build_git_fixture(lang: &str, root: &Path) {
     );
 }
 
+/// Build a canonical fixture and additionally write a third file (`c_dup.<ext>`)
+/// containing a near-exact duplicate of the entry file's `helper` function.
+/// Used by clone-detection (`tldr clones`) and similarity (`tldr dice`,
+/// `tldr similar`) tests so the detector has something to find.
+///
+/// Languages whose duplication is non-trivial to express in 1–2 lines (e.g.
+/// OCaml's structural typing, complex Java/C# class file rules) get a
+/// language-aware duplicate body — kept minimal so as not to drift the
+/// existing 13×18 matrix's invariants.
+///
+/// The duplicate file is intentionally small (mirrors `helper`) so this
+/// helper does NOT affect the existing fixture's `total_edges`,
+/// `total_dead`, or `import` counts.
+pub fn build_fixture_with_clone(lang: &str, root: &Path) {
+    build_fixture(lang, root);
+    let (relpath, body) = clone_dup_payload(lang);
+    write_file(&root.join(relpath), body);
+}
+
+/// Per-language `(relpath, body)` pair for the clone-fixture extension.
+/// Each body is a trivial function that mirrors `helper` (returns a
+/// constant) under a different name (`c_dup`) to ensure the clone
+/// detector finds at least one candidate pair.
+fn clone_dup_payload(lang: &str) -> (&'static str, &'static str) {
+    match lang {
+        "python" => (
+            "c_dup.py",
+            "def c_dup_one():\n    x = 1\n    y = 2\n    z = x + y\n    return z\n\n\
+             def c_dup_two():\n    x = 1\n    y = 2\n    z = x + y\n    return z\n",
+        ),
+        "typescript" => (
+            "c_dup.ts",
+            "export function cDupOne(): number { const x = 1; const y = 2; const z = x + y; return z; }\n\
+             export function cDupTwo(): number { const x = 1; const y = 2; const z = x + y; return z; }\n",
+        ),
+        "javascript" => (
+            "c_dup.js",
+            "export function cDupOne() { const x = 1; const y = 2; const z = x + y; return z; }\n\
+             export function cDupTwo() { const x = 1; const y = 2; const z = x + y; return z; }\n",
+        ),
+        "go" => (
+            "c_dup.go",
+            "package main\n\nfunc CDupOne() int { x := 1; y := 2; z := x + y; return z }\n\
+             func CDupTwo() int { x := 1; y := 2; z := x + y; return z }\n",
+        ),
+        "rust" => (
+            "src/c_dup.rs",
+            "pub fn c_dup_one() -> i32 { let x = 1; let y = 2; let z = x + y; z }\n\
+             pub fn c_dup_two() -> i32 { let x = 1; let y = 2; let z = x + y; z }\n",
+        ),
+        "java" => (
+            "CDup.java",
+            "class CDup {\n  int cDupOne() { int x = 1; int y = 2; int z = x + y; return z; }\n  \
+             int cDupTwo() { int x = 1; int y = 2; int z = x + y; return z; }\n}\n",
+        ),
+        "c" => (
+            "c_dup.c",
+            "int c_dup_one(void) { int x = 1; int y = 2; int z = x + y; return z; }\n\
+             int c_dup_two(void) { int x = 1; int y = 2; int z = x + y; return z; }\n",
+        ),
+        "cpp" => (
+            "c_dup.cpp",
+            "int c_dup_one() { int x = 1; int y = 2; int z = x + y; return z; }\n\
+             int c_dup_two() { int x = 1; int y = 2; int z = x + y; return z; }\n",
+        ),
+        "ruby" => (
+            "c_dup.rb",
+            "def c_dup_one\n  x = 1\n  y = 2\n  z = x + y\n  z\nend\n\
+             def c_dup_two\n  x = 1\n  y = 2\n  z = x + y\n  z\nend\n",
+        ),
+        "kotlin" => (
+            "CDup.kt",
+            "fun cDupOne(): Int { val x = 1; val y = 2; val z = x + y; return z }\n\
+             fun cDupTwo(): Int { val x = 1; val y = 2; val z = x + y; return z }\n",
+        ),
+        "swift" => (
+            "CDup.swift",
+            "func cDupOne() -> Int { let x = 1; let y = 2; let z = x + y; return z }\n\
+             func cDupTwo() -> Int { let x = 1; let y = 2; let z = x + y; return z }\n",
+        ),
+        "csharp" => (
+            "CDup.cs",
+            "static class CDup {\n  public static int CDupOne() { int x = 1; int y = 2; int z = x + y; return z; }\n  \
+             public static int CDupTwo() { int x = 1; int y = 2; int z = x + y; return z; }\n}\n",
+        ),
+        "scala" => (
+            "CDup.scala",
+            "object CDup {\n  def cDupOne(): Int = { val x = 1; val y = 2; val z = x + y; z }\n  \
+             def cDupTwo(): Int = { val x = 1; val y = 2; val z = x + y; z }\n}\n",
+        ),
+        "php" => (
+            "c_dup.php",
+            "<?php\nfunction c_dup_one() { $x = 1; $y = 2; $z = $x + $y; return $z; }\n\
+             function c_dup_two() { $x = 1; $y = 2; $z = $x + $y; return $z; }\n",
+        ),
+        "lua" => (
+            "c_dup.lua",
+            "local function c_dup_one()\n  local x = 1\n  local y = 2\n  local z = x + y\n  return z\nend\n\
+             local function c_dup_two()\n  local x = 1\n  local y = 2\n  local z = x + y\n  return z\nend\nreturn { c_dup_one = c_dup_one, c_dup_two = c_dup_two }\n",
+        ),
+        "luau" => (
+            "c_dup.luau",
+            "local function c_dup_one(): number\n  local x = 1\n  local y = 2\n  local z = x + y\n  return z\nend\n\
+             local function c_dup_two(): number\n  local x = 1\n  local y = 2\n  local z = x + y\n  return z\nend\nreturn { c_dup_one = c_dup_one, c_dup_two = c_dup_two }\n",
+        ),
+        "elixir" => (
+            "c_dup.ex",
+            "defmodule CDup do\n  def c_dup_one do\n    x = 1\n    y = 2\n    z = x + y\n    z\n  end\n\n  \
+             def c_dup_two do\n    x = 1\n    y = 2\n    z = x + y\n    z\n  end\nend\n",
+        ),
+        "ocaml" => (
+            "c_dup.ml",
+            "let c_dup_one () = let x = 1 in let y = 2 in let z = x + y in z\n\
+             let c_dup_two () = let x = 1 in let y = 2 in let z = x + y in z\n",
+        ),
+        other => panic!("unknown language for clone payload: {:?}", other),
+    }
+}
+
 /// Append a literal string to a file. Used by `build_git_fixture` to
 /// create per-commit deltas.
 fn append_trailing_line(path: &Path, line: &str) {

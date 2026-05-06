@@ -46,6 +46,8 @@
 mod fixtures;
 
 use serde_json::Value;
+#[cfg(feature = "semantic")]
+use serial_test::serial;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
@@ -1672,3 +1674,1468 @@ fn test_patterns_on_elixir() {
 fn test_patterns_on_ocaml() {
     check_patterns("ocaml");
 }
+
+// ============================================================================
+// language-command-matrix-extension-v1: extension to ~50 commands × 18 langs.
+// ============================================================================
+//
+// Each new command below adds 18 cells (one per supported language). Every
+// cell asserts (1) exit code 0, (2) JSON parses, (3) one shape-specific
+// invariant matching the canonical schema (verified against the actual
+// command's JSON output, not pre-designed).
+//
+// Capability gaps that fail are gated with `#[ignore = "<reason>"]` citing
+// either:
+//  - a known judgment-call deferral (e.g. "vuln autodetect coverage limited
+//    to py/rust/ts/js per AA5"),
+//  - a specific extractor limitation (e.g. "OCaml class detection no-op
+//    in extract_ocaml_classes").
+//
+// The `for_all_langs!` macro expands one `check_<cmd>` per language to keep
+// the file readable. Each language line is a single `#[test] fn` so cargo
+// test reports each cell independently.
+
+/// Expand 18 `#[test] fn test_<short>_on_<lang>() { check_<short>("<lang>"); }`
+/// stubs from a single invocation. The macro takes the short test stem
+/// (e.g. `tree`, `dead_stores`) and the corresponding `check_<stem>`
+/// function is invoked with the lang as a string. Languages can be
+/// individually gated with `lang, ignore = "<reason>"`.
+///
+/// Usage:
+/// ```
+/// gen_lang_tests!(tree, check_tree,
+///     python; typescript; ...; ocaml;
+/// );
+/// ```
+macro_rules! gen_lang_tests {
+    ($stem:ident, $check:ident, $($lang:ident $(, ignore = $reason:literal)?);* $(;)?) => {
+        $(
+            paste::paste! {
+                #[test]
+                $(#[ignore = $reason])?
+                fn [<test_ $stem _on_ $lang>]() {
+                    $check(stringify!($lang));
+                }
+            }
+        )*
+    };
+}
+
+/// Variant of `gen_lang_tests!` that adds `#[serial(embedding_cache)]` to
+/// each test. fastembed shares a single on-disk model cache; concurrent
+/// first-touches race on cache-file creation and one process gets a
+/// "No such file or directory" error. Used for embed / semantic / similar.
+#[cfg(feature = "semantic")]
+macro_rules! gen_lang_tests_serial {
+    ($stem:ident, $check:ident, $($lang:ident $(, ignore = $reason:literal)?);* $(;)?) => {
+        $(
+            paste::paste! {
+                #[test]
+                #[serial(embedding_cache)]
+                $(#[ignore = $reason])?
+                fn [<test_ $stem _on_ $lang>]() {
+                    $check(stringify!($lang));
+                }
+            }
+        )*
+    };
+}
+
+/// Stub that defines no tests when the `semantic` feature is off. Embed,
+/// semantic, and similar are gated on the feature; without it the tldr
+/// binary exits with a "feature not enabled" error and the matrix would
+/// fail across the board.
+#[cfg(not(feature = "semantic"))]
+macro_rules! gen_lang_tests_serial {
+    ($stem:ident, $check:ident, $($lang:ident $(, ignore = $reason:literal)?);* $(;)?) => {};
+}
+
+// ============================================================================
+// Generic shape helper used by many of the new commands.
+// ============================================================================
+
+/// Run a tldr subcommand against the canonical fixture root, asserting
+/// exit code 0 and that the output parses as a JSON object (or array).
+/// Returns the parsed JSON for further per-command shape checks.
+fn run_on_fixture(lang: &str, args_after_path: &[&str], cmd: &str) -> Value {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let mut full = vec![cmd, tmp.path().to_str().unwrap()];
+    full.extend_from_slice(args_after_path);
+    full.extend_from_slice(&["--format", "json", "--quiet"]);
+    let (status, json, stdout, stderr) = run_tldr(&full);
+    if !status.success() {
+        fail_cell(cmd, lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.is_null() {
+        fail_cell(cmd, lang, "stdout was not parseable JSON", &stdout, &stderr);
+    }
+    json
+}
+
+/// Same as `run_on_fixture` but operates on the entry-file path rather
+/// than the fixture root. Used for commands like `cohesion <FILE>`.
+fn run_on_entry_file(lang: &str, args_after_file: &[&str], cmd: &str) -> Value {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let file = entry_file(lang, tmp.path());
+    let mut full = vec![cmd, file.to_str().unwrap()];
+    full.extend_from_slice(args_after_file);
+    full.extend_from_slice(&["--format", "json", "--quiet"]);
+    let (status, json, stdout, stderr) = run_tldr(&full);
+    if !status.success() {
+        fail_cell(cmd, lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.is_null() {
+        fail_cell(cmd, lang, "stdout was not parseable JSON", &stdout, &stderr);
+    }
+    json
+}
+
+// ============================================================================
+// L1: tree
+// ============================================================================
+fn check_tree(lang: &str) {
+    let json = run_on_fixture(lang, &[], "tree");
+    // tree returns a recursive node: { name, type, children?, path? }
+    let typ = json.get("type").and_then(Value::as_str).unwrap_or("");
+    if typ != "dir" {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("tree", lang, "root .type != \"dir\"", &s, "");
+    }
+    let children = json
+        .get("children")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if children == 0 {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("tree", lang, "tree.children empty", &s, "");
+    }
+}
+
+// ============================================================================
+// L1: importers
+// ============================================================================
+fn check_importers(lang: &str) {
+    // Use a sentinel module name; the canonical fixtures don't all import
+    // the same module name, so we look up `util` (most langs) or a known
+    // module. The contract here is: schema is well-formed; importers
+    // array exists. Module resolution is per-language.
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let module = match lang {
+        "go" => "example.com/x/util",
+        _ => "util",
+    };
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "importers",
+        module,
+        tmp.path().to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("importers", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if !json.is_object() {
+        fail_cell("importers", lang, "output is not a JSON object", &stdout, &stderr);
+    }
+    if json.get("importers").and_then(Value::as_array).is_none() {
+        fail_cell(
+            "importers",
+            lang,
+            ".importers is not an array",
+            &stdout,
+            &stderr,
+        );
+    }
+    // Total field must be present.
+    if json.get("total").and_then(Value::as_u64).is_none() {
+        fail_cell("importers", lang, ".total missing or not a number", &stdout, &stderr);
+    }
+}
+
+// ============================================================================
+// L2: hubs
+// ============================================================================
+fn check_hubs(lang: &str) {
+    let json = run_on_fixture(lang, &[], "hubs");
+    if json.get("hubs").and_then(Value::as_array).is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("hubs", lang, ".hubs is not an array", &s, "");
+    }
+}
+
+// ============================================================================
+// L2: whatbreaks
+// ============================================================================
+fn check_whatbreaks(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "whatbreaks",
+        "helper",
+        tmp.path().to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("whatbreaks", lang, "non-zero exit", &stdout, &stderr);
+    }
+    // Schema: { wrapper, path, target, target_type, sub_results }
+    for key in ["target", "target_type", "sub_results"] {
+        if json.get(key).is_none() {
+            fail_cell(
+                "whatbreaks",
+                lang,
+                &format!("missing required key `{key}`"),
+                &stdout,
+                &stderr,
+            );
+        }
+    }
+}
+
+// ============================================================================
+// L2: change-impact
+// ============================================================================
+fn check_change_impact(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let entry = entry_file(lang, tmp.path());
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "change-impact",
+        tmp.path().to_str().unwrap(),
+        "--files",
+        entry.to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("change-impact", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("changed_files").and_then(Value::as_array).is_none() {
+        fail_cell(
+            "change-impact",
+            lang,
+            ".changed_files is not an array",
+            &stdout,
+            &stderr,
+        );
+    }
+    if json.get("affected_functions").and_then(Value::as_array).is_none() {
+        fail_cell(
+            "change-impact",
+            lang,
+            ".affected_functions is not an array",
+            &stdout,
+            &stderr,
+        );
+    }
+}
+
+// ============================================================================
+// L3: reaching-defs
+// ============================================================================
+fn check_reaching_defs(lang: &str) {
+    let json = run_on_entry_file(lang, &["helper"], "reaching-defs");
+    if json.get("blocks").and_then(Value::as_array).is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("reaching-defs", lang, ".blocks is not an array", &s, "");
+    }
+    if json.get("function").and_then(Value::as_str) != Some("helper") {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell(
+            "reaching-defs",
+            lang,
+            ".function != \"helper\"",
+            &s,
+            "",
+        );
+    }
+}
+
+// ============================================================================
+// L3: available
+// ============================================================================
+fn check_available(lang: &str) {
+    let json = run_on_entry_file(lang, &["helper"], "available");
+    // Schema: { avail_in: {block_id: exprs[]}, avail_out: {...}, all_exprs[],
+    //           entry_block, uncertain_exprs[], confidence }
+    for key in ["avail_in", "avail_out", "all_exprs"] {
+        if json.get(key).is_none() {
+            let s = serde_json::to_string(&json).unwrap_or_default();
+            fail_cell(
+                "available",
+                lang,
+                &format!(".{key} missing"),
+                &s,
+                "",
+            );
+        }
+    }
+}
+
+// ============================================================================
+// L4: dead-stores
+// ============================================================================
+fn check_dead_stores(lang: &str) {
+    let json = run_on_entry_file(lang, &["helper"], "dead-stores");
+    if json.get("function").and_then(Value::as_str) != Some("helper") {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("dead-stores", lang, ".function != \"helper\"", &s, "");
+    }
+    if json.get("count").and_then(Value::as_u64).is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("dead-stores", lang, ".count missing or not a number", &s, "");
+    }
+}
+
+// ============================================================================
+// L5: slice
+// ============================================================================
+fn check_slice(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let file = entry_file(lang, tmp.path());
+    let (_, ext_json, _, _) = run_tldr(&[
+        "extract",
+        file.to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    let helper_line = extract_helper_line(&ext_json).unwrap_or(2);
+    let line_str = helper_line.to_string();
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "slice",
+        file.to_str().unwrap(),
+        "helper",
+        &line_str,
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("slice", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("function").and_then(Value::as_str) != Some("helper") {
+        fail_cell("slice", lang, ".function != \"helper\"", &stdout, &stderr);
+    }
+    if json.get("lines").and_then(Value::as_array).is_none() {
+        fail_cell("slice", lang, ".lines is not an array", &stdout, &stderr);
+    }
+}
+
+// ============================================================================
+// L5: chop
+// ============================================================================
+fn check_chop(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let file = entry_file(lang, tmp.path());
+    let (_, ext_json, _, _) = run_tldr(&[
+        "extract",
+        file.to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    let helper_line = extract_helper_line(&ext_json).unwrap_or(2);
+    let src = helper_line.to_string();
+    // Use the same line as both source and target — chop's contract is
+    // "intersection of fwd+bwd slice"; with a single-line target this
+    // exercises the path-existence schema without depending on per-language
+    // helper-body line counts.
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "chop",
+        file.to_str().unwrap(),
+        "helper",
+        &src,
+        &src,
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("chop", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("function").and_then(Value::as_str) != Some("helper") {
+        fail_cell("chop", lang, ".function != \"helper\"", &stdout, &stderr);
+    }
+    if json.get("lines").and_then(Value::as_array).is_none() {
+        fail_cell("chop", lang, ".lines is not an array", &stdout, &stderr);
+    }
+}
+
+/// Find the `helper` function's start line in an `extract` JSON output.
+/// Returns `None` if not found; callers fall back to a sane default.
+fn extract_helper_line(json: &Value) -> Option<u64> {
+    let funcs = json.get("functions").and_then(Value::as_array);
+    if let Some(arr) = funcs {
+        for f in arr {
+            if f.get("name").and_then(Value::as_str) == Some("helper") {
+                if let Some(l) = f.get("line").and_then(Value::as_u64) {
+                    return Some(l);
+                }
+                if let Some(l) = f.get("line_start").and_then(Value::as_u64) {
+                    return Some(l);
+                }
+            }
+        }
+    }
+    let classes = json.get("classes").and_then(Value::as_array);
+    if let Some(arr) = classes {
+        for c in arr {
+            if let Some(ms) = c.get("methods").and_then(Value::as_array) {
+                for m in ms {
+                    if m.get("name").and_then(Value::as_str) == Some("helper") {
+                        if let Some(l) = m.get("line").and_then(Value::as_u64) {
+                            return Some(l);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// ============================================================================
+// L5: taint (per-function shape; clean fixture so flows expected empty)
+// ============================================================================
+fn check_taint(lang: &str) {
+    let json = run_on_entry_file(lang, &["helper"], "taint");
+    if json.get("function").and_then(Value::as_str) != Some("helper") {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("taint", lang, ".function != \"helper\"", &s, "");
+    }
+    for key in ["sources", "sinks", "flows"] {
+        if json.get(key).and_then(Value::as_array).is_none() {
+            let s = serde_json::to_string(&json).unwrap_or_default();
+            fail_cell(
+                "taint",
+                lang,
+                &format!(".{key} is not an array"),
+                &s,
+                "",
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Resources (per-function lifecycle)
+// ============================================================================
+fn check_resources(lang: &str) {
+    let json = run_on_entry_file(lang, &["helper"], "resources");
+    for key in ["resources", "leaks", "double_closes", "use_after_closes"] {
+        if json.get(key).and_then(Value::as_array).is_none() {
+            let s = serde_json::to_string(&json).unwrap_or_default();
+            fail_cell(
+                "resources",
+                lang,
+                &format!(".{key} is not an array"),
+                &s,
+                "",
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Security: vuln (gated to py/rust/ts/js for autodetect coverage)
+// ============================================================================
+fn check_vuln(lang: &str) {
+    let json = run_on_fixture(lang, &[], "vuln");
+    if json.get("findings").and_then(Value::as_array).is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("vuln", lang, ".findings is not an array", &s, "");
+    }
+    if json.get("summary").is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("vuln", lang, ".summary missing", &s, "");
+    }
+}
+
+// ============================================================================
+// Security: secure
+// ============================================================================
+fn check_secure(lang: &str) {
+    let json = run_on_fixture(lang, &[], "secure");
+    if json.get("summary").is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("secure", lang, ".summary missing", &s, "");
+    }
+    if json.get("findings").and_then(Value::as_array).is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("secure", lang, ".findings is not an array", &s, "");
+    }
+}
+
+// ============================================================================
+// Security: api-check
+// ============================================================================
+fn check_api_check(lang: &str) {
+    let json = run_on_fixture(lang, &[], "api-check");
+    if json.get("findings").and_then(Value::as_array).is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("api-check", lang, ".findings is not an array", &s, "");
+    }
+    if json.get("summary").is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("api-check", lang, ".summary missing", &s, "");
+    }
+}
+
+// ============================================================================
+// Quality: churn (needs git fixture)
+// ============================================================================
+fn check_churn(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_git_fixture(lang, tmp.path());
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "churn",
+        tmp.path().to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("churn", lang, "non-zero exit", &stdout, &stderr);
+    }
+    let files = json.get("files").and_then(Value::as_array);
+    if files.map(|a| a.is_empty()).unwrap_or(true) {
+        fail_cell(
+            "churn",
+            lang,
+            ".files empty — git history did not produce churn data",
+            &stdout,
+            &stderr,
+        );
+    }
+}
+
+// ============================================================================
+// Quality: debt
+// ============================================================================
+fn check_debt(lang: &str) {
+    let json = run_on_fixture(lang, &[], "debt");
+    if json.get("issues").and_then(Value::as_array).is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("debt", lang, ".issues is not an array", &s, "");
+    }
+}
+
+// ============================================================================
+// Quality: health
+// ============================================================================
+fn check_health(lang: &str) {
+    let json = run_on_fixture(lang, &[], "health");
+    if json.get("summary").is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("health", lang, ".summary missing", &s, "");
+    }
+    let files = json
+        .get("summary")
+        .and_then(|s| s.get("files_analyzed"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if files == 0 {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell(
+            "health",
+            lang,
+            ".summary.files_analyzed = 0",
+            &s,
+            "",
+        );
+    }
+}
+
+// ============================================================================
+// Quality: hotspots (needs git)
+// ============================================================================
+fn check_hotspots(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_git_fixture(lang, tmp.path());
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "hotspots",
+        tmp.path().to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("hotspots", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("hotspots").and_then(Value::as_array).is_none() {
+        fail_cell("hotspots", lang, ".hotspots is not an array", &stdout, &stderr);
+    }
+    if json.get("summary").is_none() {
+        fail_cell("hotspots", lang, ".summary missing", &stdout, &stderr);
+    }
+}
+
+// ============================================================================
+// Quality: clones (needs duplicate fixture)
+// ============================================================================
+fn check_clones(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture_with_clone(lang, tmp.path());
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "clones",
+        tmp.path().to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("clones", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("clone_pairs").and_then(Value::as_array).is_none() {
+        fail_cell("clones", lang, ".clone_pairs is not an array", &stdout, &stderr);
+    }
+    if json.get("stats").is_none() {
+        fail_cell("clones", lang, ".stats missing", &stdout, &stderr);
+    }
+}
+
+// ============================================================================
+// Quality: dice (similarity between two files)
+// ============================================================================
+fn check_dice(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture_with_clone(lang, tmp.path());
+    let entry = entry_file(lang, tmp.path());
+    // Use the duplicated file as second target.
+    let (dup_rel, _) = match lang {
+        "rust" => ("src/c_dup.rs", ""),
+        "python" => ("c_dup.py", ""),
+        "typescript" => ("c_dup.ts", ""),
+        "javascript" => ("c_dup.js", ""),
+        "go" => ("c_dup.go", ""),
+        "java" => ("CDup.java", ""),
+        "c" => ("c_dup.c", ""),
+        "cpp" => ("c_dup.cpp", ""),
+        "ruby" => ("c_dup.rb", ""),
+        "kotlin" => ("CDup.kt", ""),
+        "swift" => ("CDup.swift", ""),
+        "csharp" => ("CDup.cs", ""),
+        "scala" => ("CDup.scala", ""),
+        "php" => ("c_dup.php", ""),
+        "lua" => ("c_dup.lua", ""),
+        "luau" => ("c_dup.luau", ""),
+        "elixir" => ("c_dup.ex", ""),
+        "ocaml" => ("c_dup.ml", ""),
+        _ => panic!("unknown"),
+    };
+    let dup_path = tmp.path().join(dup_rel);
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "dice",
+        entry.to_str().unwrap(),
+        dup_path.to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("dice", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("dice_coefficient").and_then(Value::as_f64).is_none() {
+        fail_cell(
+            "dice",
+            lang,
+            ".dice_coefficient missing or not a number",
+            &stdout,
+            &stderr,
+        );
+    }
+}
+
+// ============================================================================
+// Patterns: inheritance, deps, cohesion, coupling
+// ============================================================================
+fn check_inheritance(lang: &str) {
+    let json = run_on_fixture(lang, &[], "inheritance");
+    for key in ["edges", "nodes", "roots", "leaves"] {
+        if json.get(key).and_then(Value::as_array).is_none() {
+            let s = serde_json::to_string(&json).unwrap_or_default();
+            fail_cell(
+                "inheritance",
+                lang,
+                &format!(".{key} is not an array"),
+                &s,
+                "",
+            );
+        }
+    }
+}
+
+fn check_deps(lang: &str) {
+    let json = run_on_fixture(lang, &[], "deps");
+    if json.get("internal_dependencies").is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("deps", lang, ".internal_dependencies missing", &s, "");
+    }
+    if json.get("stats").is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("deps", lang, ".stats missing", &s, "");
+    }
+}
+
+fn check_cohesion(lang: &str) {
+    let json = run_on_entry_file(lang, &[], "cohesion");
+    if json.get("classes").and_then(Value::as_array).is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("cohesion", lang, ".classes is not an array", &s, "");
+    }
+    if json.get("summary").is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("cohesion", lang, ".summary missing", &s, "");
+    }
+}
+
+fn check_coupling(lang: &str) {
+    // coupling takes two files
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let entry = entry_file(lang, tmp.path());
+    // pick the "B" file (different filename per lang).
+    let b = match lang {
+        "python" => tmp.path().join("util.py"),
+        "typescript" => tmp.path().join("util.ts"),
+        "javascript" => tmp.path().join("util.js"),
+        "go" => tmp.path().join("util/util.go"),
+        "rust" => tmp.path().join("src/util.rs"),
+        "java" => tmp.path().join("Util.java"),
+        "c" => tmp.path().join("util.c"),
+        "cpp" => tmp.path().join("util.cpp"),
+        "ruby" => tmp.path().join("util.rb"),
+        "kotlin" => tmp.path().join("Util.kt"),
+        "swift" => tmp.path().join("Util.swift"),
+        "csharp" => tmp.path().join("Util.cs"),
+        "scala" => tmp.path().join("Util.scala"),
+        "php" => tmp.path().join("util.php"),
+        "lua" => tmp.path().join("util.lua"),
+        "luau" => tmp.path().join("util.luau"),
+        "elixir" => tmp.path().join("util.ex"),
+        "ocaml" => tmp.path().join("util.ml"),
+        _ => panic!("unknown lang"),
+    };
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "coupling",
+        entry.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("coupling", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("a_to_b").is_none() || json.get("b_to_a").is_none() {
+        fail_cell(
+            "coupling",
+            lang,
+            ".a_to_b or .b_to_a missing",
+            &stdout,
+            &stderr,
+        );
+    }
+}
+
+// ============================================================================
+// Contracts / Specs / Invariants / Verify / Interface
+// ============================================================================
+fn check_contracts(lang: &str) {
+    let json = run_on_entry_file(lang, &["helper"], "contracts");
+    if json.get("function").and_then(Value::as_str) != Some("helper") {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("contracts", lang, ".function != \"helper\"", &s, "");
+    }
+    for key in ["preconditions", "postconditions", "invariants"] {
+        if json.get(key).and_then(Value::as_array).is_none() {
+            let s = serde_json::to_string(&json).unwrap_or_default();
+            fail_cell(
+                "contracts",
+                lang,
+                &format!(".{key} is not an array"),
+                &s,
+                "",
+            );
+        }
+    }
+}
+
+/// Build a minimal `tests/` subdir and a single test file for the given
+/// language. Used by specs/invariants which require a tests dir input.
+fn write_minimal_test_dir(lang: &str, root: &std::path::Path) -> std::path::PathBuf {
+    let tdir = root.join("tests_dir_audit_v1");
+    std::fs::create_dir_all(&tdir).unwrap();
+    let (rel, body) = match lang {
+        "python" => (
+            "test_audit.py",
+            "def test_helper():\n    assert 1 + 1 == 2\n",
+        ),
+        "typescript" => (
+            "audit.test.ts",
+            "describe('helper', () => { it('works', () => { /* */ }); });\n",
+        ),
+        "javascript" => (
+            "audit.test.js",
+            "describe('helper', () => { it('works', () => { /* */ }); });\n",
+        ),
+        "go" => (
+            "audit_test.go",
+            "package x\nimport \"testing\"\nfunc TestAudit(t *testing.T) {}\n",
+        ),
+        "rust" => (
+            "audit.rs",
+            "#[test]\nfn test_audit() { assert_eq!(1 + 1, 2); }\n",
+        ),
+        "java" => (
+            "AuditTest.java",
+            "class AuditTest { void testAudit() {} }\n",
+        ),
+        "c" => ("audit_test.c", "void test_audit(void) {}\n"),
+        "cpp" => ("audit_test.cpp", "void test_audit() {}\n"),
+        "ruby" => (
+            "audit_test.rb",
+            "def test_audit; raise unless 1 + 1 == 2; end\n",
+        ),
+        "kotlin" => (
+            "AuditTest.kt",
+            "fun testAudit() {}\n",
+        ),
+        "swift" => (
+            "AuditTests.swift",
+            "func testAudit() {}\n",
+        ),
+        "csharp" => (
+            "AuditTest.cs",
+            "class AuditTest { void TestAudit() {} }\n",
+        ),
+        "scala" => (
+            "AuditTest.scala",
+            "object AuditTest { def testAudit(): Unit = () }\n",
+        ),
+        "php" => (
+            "AuditTest.php",
+            "<?php\nfunction test_audit() {}\n",
+        ),
+        "lua" => (
+            "audit_test.lua",
+            "local function test_audit() end\nreturn { test_audit = test_audit }\n",
+        ),
+        "luau" => (
+            "audit_test.luau",
+            "local function test_audit() end\nreturn { test_audit = test_audit }\n",
+        ),
+        "elixir" => (
+            "audit_test.exs",
+            "defmodule AuditTest do\n  def test_audit, do: :ok\nend\n",
+        ),
+        "ocaml" => (
+            "audit_test.ml",
+            "let test_audit () = ()\n",
+        ),
+        _ => panic!("unknown"),
+    };
+    fixtures::write_file(&tdir.join(rel), body);
+    tdir
+}
+
+fn check_specs(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let tdir = write_minimal_test_dir(lang, tmp.path());
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "specs",
+        "--from-tests",
+        tdir.to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("specs", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("functions").and_then(Value::as_array).is_none() {
+        fail_cell("specs", lang, ".functions is not an array", &stdout, &stderr);
+    }
+    if json.get("summary").is_none() {
+        fail_cell("specs", lang, ".summary missing", &stdout, &stderr);
+    }
+}
+
+fn check_invariants(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let tdir = write_minimal_test_dir(lang, tmp.path());
+    let entry = entry_file(lang, tmp.path());
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "invariants",
+        entry.to_str().unwrap(),
+        "--from-tests",
+        tdir.to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("invariants", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("functions").and_then(Value::as_array).is_none() {
+        fail_cell("invariants", lang, ".functions is not an array", &stdout, &stderr);
+    }
+    if json.get("summary").is_none() {
+        fail_cell("invariants", lang, ".summary missing", &stdout, &stderr);
+    }
+}
+
+fn check_verify(lang: &str) {
+    let json = run_on_fixture(lang, &[], "verify");
+    if json.get("sub_results").is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("verify", lang, ".sub_results missing", &s, "");
+    }
+}
+
+fn check_interface(lang: &str) {
+    let json = run_on_entry_file(lang, &[], "interface");
+    if json.get("all_exports").and_then(Value::as_array).is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("interface", lang, ".all_exports is not an array", &s, "");
+    }
+}
+
+// ============================================================================
+// Coverage (LCOV stub — language-agnostic; only the report parser runs)
+// ============================================================================
+fn check_coverage(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let lcov = tmp.path().join("coverage.lcov");
+    // Reference whichever entry file exists; the LCOV parser is line-based
+    // and language-agnostic, so a minimal stub is sufficient.
+    let entry_rel = entry_file(lang, tmp.path());
+    let entry_rel = entry_rel
+        .strip_prefix(tmp.path())
+        .unwrap_or_else(|_| std::path::Path::new("main"))
+        .to_string_lossy()
+        .into_owned();
+    let body = format!(
+        "TN:\nSF:{}\nDA:1,1\nDA:2,1\nDA:3,1\nLH:3\nLF:3\nend_of_record\n",
+        entry_rel
+    );
+    std::fs::write(&lcov, body).unwrap();
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "coverage",
+        lcov.to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("coverage", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("format").and_then(Value::as_str) != Some("lcov") {
+        fail_cell("coverage", lang, ".format != \"lcov\"", &stdout, &stderr);
+    }
+    if json.get("summary").is_none() {
+        fail_cell("coverage", lang, ".summary missing", &stdout, &stderr);
+    }
+}
+
+// ============================================================================
+// Search / semantic / similar / embed / context / definition
+// ============================================================================
+fn check_search(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "search",
+        "helper",
+        tmp.path().to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("search", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("results").and_then(Value::as_array).is_none() {
+        fail_cell("search", lang, ".results is not an array", &stdout, &stderr);
+    }
+}
+
+fn check_semantic(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "semantic",
+        "helper function returning a constant",
+        tmp.path().to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("semantic", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("results").and_then(Value::as_array).is_none() {
+        fail_cell("semantic", lang, ".results is not an array", &stdout, &stderr);
+    }
+}
+
+fn check_similar(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture_with_clone(lang, tmp.path());
+    let entry = entry_file(lang, tmp.path());
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "similar",
+        entry.to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("similar", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("similar_files").and_then(Value::as_array).is_none() {
+        fail_cell(
+            "similar",
+            lang,
+            ".similar_files is not an array",
+            &stdout,
+            &stderr,
+        );
+    }
+}
+
+fn check_embed(lang: &str) {
+    let json = run_on_fixture(lang, &[], "embed");
+    // embed returns { path, model, granularity, chunks_embedded, chunks_cached, latency_ms }
+    if json.get("model").and_then(Value::as_str).is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("embed", lang, ".model is not a string", &s, "");
+    }
+    let total = json
+        .get("chunks_embedded")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        + json
+            .get("chunks_cached")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+    if total == 0 {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell(
+            "embed",
+            lang,
+            "chunks_embedded + chunks_cached = 0",
+            &s,
+            "",
+        );
+    }
+}
+
+fn check_context(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    // Use `helper` as the entry — `main` is renamed to `Main` in csharp,
+    // and is parameterised in scala/swift/etc. `helper` is the canonical
+    // cross-language constant-return function in every fixture.
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "context",
+        "helper",
+        "--project",
+        tmp.path().to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("context", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("entry_point").and_then(Value::as_str).is_none() {
+        fail_cell(
+            "context",
+            lang,
+            ".entry_point missing or not a string",
+            &stdout,
+            &stderr,
+        );
+    }
+    if json.get("functions").and_then(Value::as_array).is_none() {
+        fail_cell("context", lang, ".functions is not an array", &stdout, &stderr);
+    }
+}
+
+fn check_definition(lang: &str) {
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let entry = entry_file(lang, tmp.path());
+    // Read the actual file content and find the byte-column of "helper" on
+    // any line. This is robust across all languages' indentation styles
+    // (Java's `class { public static int helper() }` puts helper at col 23+;
+    // Python's `def helper()` puts it at col 5).
+    let body = std::fs::read_to_string(&entry).unwrap_or_default();
+    let mut found: Option<(u32, u32)> = None;
+    for (i, line) in body.lines().enumerate() {
+        if let Some(col) = line.find("helper") {
+            // tldr definition is 1-indexed; the column points at the
+            // start of the identifier. Try the start byte of "helper".
+            found = Some(((i as u32) + 1, (col as u32) + 1));
+            break;
+        }
+    }
+    let (line_no, col_no) = found.unwrap_or((1, 1));
+    // Try the discovered position plus a few offsets within the identifier
+    // (definition can be picky about which byte exactly).
+    let mut last_status = None;
+    let mut last_stdout = String::new();
+    let mut last_stderr = String::new();
+    let mut last_json: Value = Value::Null;
+    for delta in [0i32, 1, 2, 3, 4] {
+        let l = line_no.to_string();
+        let c = (col_no as i32 + delta).max(1).to_string();
+        let (status, json, stdout, stderr) = run_tldr(&[
+            "definition",
+            entry.to_str().unwrap(),
+            &l,
+            &c,
+            "--format",
+            "json",
+            "--quiet",
+        ]);
+        last_status = Some(status);
+        last_stdout = stdout;
+        last_stderr = stderr;
+        last_json = json;
+        if last_status.unwrap().success() && last_json.get("symbol").is_some() {
+            break;
+        }
+    }
+    if !last_status.map(|s| s.success()).unwrap_or(false) {
+        fail_cell("definition", lang, "non-zero exit on all probed columns", &last_stdout, &last_stderr);
+    }
+    if last_json.get("symbol").is_none() && last_json.get("error").is_none() {
+        fail_cell(
+            "definition",
+            lang,
+            "neither .symbol nor .error in output",
+            &last_stdout,
+            &last_stderr,
+        );
+    }
+}
+
+// ============================================================================
+// Aggregated: explain, todo, diff
+// ============================================================================
+fn check_explain(lang: &str) {
+    let json = run_on_entry_file(lang, &["helper"], "explain");
+    if json.get("function").and_then(Value::as_str) != Some("helper") {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("explain", lang, ".function != \"helper\"", &s, "");
+    }
+    if json.get("signature").is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("explain", lang, ".signature missing", &s, "");
+    }
+}
+
+fn check_todo(lang: &str) {
+    let json = run_on_fixture(lang, &[], "todo");
+    if json.get("items").and_then(Value::as_array).is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("todo", lang, ".items is not an array", &s, "");
+    }
+    if json.get("summary").is_none() {
+        let s = serde_json::to_string(&json).unwrap_or_default();
+        fail_cell("todo", lang, ".summary missing", &s, "");
+    }
+}
+
+fn check_diff(lang: &str) {
+    // diff requires two files; we use entry vs entry+touch so the AST diff
+    // has something to compare. Even identical files produce a valid JSON.
+    let tmp = TempDir::new().unwrap();
+    fixtures::build_fixture(lang, tmp.path());
+    let entry = entry_file(lang, tmp.path());
+    let copy = tmp.path().join("entry_copy");
+    std::fs::copy(&entry, &copy).unwrap();
+    let (status, json, stdout, stderr) = run_tldr(&[
+        "diff",
+        entry.to_str().unwrap(),
+        copy.to_str().unwrap(),
+        "--format",
+        "json",
+        "--quiet",
+    ]);
+    if !status.success() {
+        fail_cell("diff", lang, "non-zero exit", &stdout, &stderr);
+    }
+    if json.get("changes").and_then(Value::as_array).is_none() {
+        fail_cell("diff", lang, ".changes is not an array", &stdout, &stderr);
+    }
+    if json.get("summary").is_none() {
+        fail_cell("diff", lang, ".summary missing", &stdout, &stderr);
+    }
+}
+
+// ============================================================================
+// Per-command × per-language test stubs.
+// ============================================================================
+//
+// Each `gen_lang_tests!` invocation expands to 18 `#[test] fn` items.
+
+gen_lang_tests!(tree, check_tree,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(importers, check_importers,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(hubs, check_hubs,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(whatbreaks, check_whatbreaks,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(change_impact, check_change_impact,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(reaching_defs, check_reaching_defs,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(available, check_available,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(dead_stores, check_dead_stores,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(slice, check_slice,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(chop, check_chop,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(taint, check_taint,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(resources, check_resources,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+// vuln: autodetect coverage limited to py/rust/ts/js per AA5. Non-supported
+// langs exit non-zero with a routing-error message ("taint analysis for
+// <lang> is not yet supported by autodetect; pass --lang <lang> explicitly")
+// and so are gated `#[ignore]` until autodetect is broadened.
+gen_lang_tests!(vuln, check_vuln,
+    python; typescript; javascript; rust;
+    go,       ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    java,     ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    c,        ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    cpp,      ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    ruby,     ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    kotlin,   ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    swift,    ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    csharp,   ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    scala,    ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    php,      ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    lua,      ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    luau,     ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    elixir,   ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+    ocaml,    ignore = "vuln autodetect coverage limited to py/rust/ts/js per AA5";
+);
+
+// secure: same gating as vuln — taint analysis autodetect limited to
+// py/rust/ts/js. The wrapper shares vuln's routing.
+gen_lang_tests!(secure, check_secure,
+    python; typescript; javascript; rust;
+    go,       ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    java,     ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    c,        ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    cpp,      ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    ruby,     ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    kotlin,   ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    swift,    ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    csharp,   ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    scala,    ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    php,      ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    lua,      ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    luau,     ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    elixir,   ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+    ocaml,    ignore = "secure autodetect coverage limited to py/rust/ts/js per AA5";
+);
+
+// api-check: rules library is Python/JS-focused per CLAUDE.md note. Returns
+// valid empty-findings JSON on other langs which satisfies the shape check
+// — handler exits 0 with `findings: []` so all 18 cells pass schema. No
+// gating needed.
+gen_lang_tests!(api_check, check_api_check,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(churn, check_churn,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(debt, check_debt,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(health, check_health,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(hotspots, check_hotspots,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(clones, check_clones,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(dice, check_dice,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(inheritance, check_inheritance,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(deps, check_deps,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(cohesion, check_cohesion,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(coupling, check_coupling,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(contracts, check_contracts,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+// specs: pytest-focused, but specs handler returns valid empty-functions
+// JSON on non-py langs (handler scans tests dir uniformly). Schema check
+// holds across all 18.
+gen_lang_tests!(specs, check_specs,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(invariants, check_invariants,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(verify, check_verify,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(interface, check_interface,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+// coverage: LCOV parser is fully language-agnostic.
+gen_lang_tests!(coverage, check_coverage,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(search, check_search,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+// semantic / similar / embed: each uses the fastembed model cache via
+// the `semantic` cargo feature. Cache initialization is not safe under
+// parallel first-touches — `serial(embedding_cache)` lock follows the
+// same pattern as `exhaustive_matrix.rs`.
+gen_lang_tests_serial!(semantic, check_semantic,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests_serial!(similar, check_similar,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests_serial!(embed, check_embed,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(context, check_context,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(definition, check_definition,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(explain, check_explain,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(todo, check_todo,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);
+
+gen_lang_tests!(diff, check_diff,
+    python; typescript; javascript; go; rust; java; c; cpp; ruby;
+    kotlin; swift; csharp; scala; php; lua; luau; elixir; ocaml;
+);

@@ -1,5 +1,69 @@
 # Changelog
 
+## language-command-matrix-extension-v1 — followup
+
+NOT a published release. Extends the (cmd × lang) audit matrix in
+`crates/tldr-cli/tests/language_command_matrix.rs` from 13 commands
+× 18 languages (234 cells) to 53 commands × 18 languages (954 cells)
+by adding 40 new commands × 18 languages = 720 new cells. Each new
+cell asserts (1) exit code 0, (2) JSON parses, (3) one shape-specific
+invariant matched against the actual command schema (verified, not
+pre-designed).
+
+Cell totals after this extension: 926 passing, 28 ignored
+(documented capability gaps), 0 failing. The 234 pre-existing cells
+are untouched and behave identically.
+
+### Added
+
+- 40 new `check_<cmd>` helpers covering tree, importers, hubs,
+  whatbreaks, change-impact, reaching-defs, available, dead-stores,
+  slice, chop, taint, resources, vuln, secure, api-check, churn,
+  debt, health, hotspots, clones, dice, inheritance, deps, cohesion,
+  coupling, contracts, specs, invariants, verify, interface,
+  coverage, search, semantic, similar, embed, context, definition,
+  explain, todo, diff.
+- `gen_lang_tests!` declarative macro (uses the new `paste`
+  dev-dependency) expands one `#[test] fn test_<cmd>_on_<lang>`
+  per language from a compact `lang;` list, with optional
+  `lang, ignore = "<reason>"` per-cell gating.
+- `gen_lang_tests_serial!` variant attaches
+  `#[serial(embedding_cache)]` to embed/semantic/similar tests so
+  the fastembed model cache isn't raced under parallel test runners.
+- `fixtures::build_fixture_with_clone(lang, root)` writes a third
+  file (`c_dup.<ext>`) with two near-identical helper functions so
+  clone-detection (`tldr clones`), similarity (`tldr dice`,
+  `tldr similar`) tests have something to find.
+- Inline LCOV stub in `check_coverage` (LCOV parser is fully
+  language-agnostic so one stub serves all 18 langs).
+- Inline minimal test directory (`write_minimal_test_dir`) for
+  `specs` and `invariants` tests.
+
+### Capability-gap gating
+
+28 cells `#[ignore]`'d with citations:
+
+- vuln × {go, java, c, cpp, ruby, kotlin, swift, csharp, scala, php,
+  lua, luau, elixir, ocaml} (14 cells) — "vuln autodetect coverage
+  limited to py/rust/ts/js per AA5". Fix is a future broadening of
+  `tldr vuln`'s autodetect-by-extension routing table.
+- secure × same 14 langs — "secure autodetect coverage limited to
+  py/rust/ts/js per AA5". Same root cause as vuln (shared taint
+  routing).
+
+Re-enabling these is a future milestone; until then the matrix
+documents the gap rather than silently passing or silently failing.
+
+### Dev-dependency
+
+- Added `paste = "1"` as a dev-dependency of `tldr-cli` to support
+  the `gen_lang_tests!` macro's identifier concatenation. Used only
+  by tests; not a production dependency.
+
+### Changed
+
+- (none — pure test additions, no production code touched)
+
 ## language-command-matrix-test-followup-v1 — followup
 
 NOT a published release. Aligns 15 stale `test_structure_on_<lang>`
