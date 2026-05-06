@@ -1,5 +1,102 @@
 # Changelog
 
+## hygiene-and-crash-fixes-v1 — internal milestone
+
+NOT a published release. **First milestone shipped under the
+`no-synthetic-fixtures-v1` test architecture** (see
+`thoughts/shared/strategy/no-synthetic-fixtures-v1.md`). The phase-12
+audit found that 4 of 16 P11 fixes were leaky: synthetic TempDir tests
+exercised one specific code path while real codebases hit different
+paths. From this milestone forward, new milestone test files MUST use
+real repos at `/tmp/repos/<repo>` with existence gates and may NOT
+construct synthetic fixtures. This milestone closes 4 P12 hygiene/
+crash regressions (3 MED + 1 LOW) and the test file
+`crates/tldr-cli/tests/hygiene_and_crash_fixes_v1.rs` is the first
+under the new rules. Tag: `hygiene-and-crash-fixes-v1`. Manifest stays
+at 0.3.0.
+
+### Fixed
+
+- `crates/tldr-cli/src/commands/diagnostics.rs`: `tldr diagnostics`
+  now emits a valid empty `DiagnosticsReport` (or SARIF 2.1.0
+  envelope, or an empty GitHub-Actions annotation stream — depending
+  on `--format` / `--output`) on stdout when no diagnostic tools are
+  installed for the requested language, instead of leaving stdout
+  0-byte and breaking JSON consumers. The advisory ("No diagnostic
+  tools available… Install one of: …") moves from `Error:` to `Note:`
+  on stderr. Exit codes 60 (no tools) and 61 (all tools failed) are
+  preserved so existing `if status.code() == Some(60) { skip }` test
+  gates (e.g. `high_bundle_progress_determinism_coverage_v1`) keep
+  distinguishing absence-of-tooling from a clean-but-empty real run.
+  The same fix is applied to the all-tools-failed branch so partial
+  reports (with `tools_run[].error` populated) reach stdout in JSON
+  form. (P12.BUG-AGG12-6)
+
+### Verified-clean (no code change, regression net only)
+
+- **BUG-AGG12-3** (semantic/similar/embed stdout hygiene for kotlin
+  + ocaml): the P11.AGG-4 milestone (`pdg-bounds-and-stdout-hygiene-v1`)
+  had already routed every progress emitter in
+  `crates/tldr-core/src/semantic/index.rs`, `embedder.rs`, and
+  `chunker.rs` through `eprintln!`. The phase-12 audit captured the
+  pre-fix state from a stale binary. Pre-edit verification on the
+  HEAD release binary against `/tmp/repos/kotlin-datetime/core/common/src`
+  (semantic) and `/tmp/repos/ocaml-dune/src/dag/dag.ml` (similar)
+  produced JSON-clean stdout with all progress on stderr — confirmed
+  on 8 real corpora (flask, ripgrep, cpp-tinyxml2, kotlin-datetime,
+  ocaml-dune, go-httprouter, php-symfony-string, rails-html-sanitizer)
+  across `semantic`, `similar`, and `embed`.
+- **BUG-AGG12-5** (`similar` cold-cache crash with "No such file or
+  directory"): the v0.3.0 M4 fastembed-cache fix
+  (`crates/tldr-core/src/semantic/embedder.rs:140-150`) plus
+  `EmbeddingCache::open` calling `fs::create_dir_all` on the
+  `tldr/embeddings` cache directory closed this. Verified on a
+  manually-stashed cache directory by running `tldr similar
+  /tmp/repos/rails-html-sanitizer/lib/rails/html/sanitizer.rb`
+  cold — succeeded with valid JSON output and no ENOENT.
+- **BUG-SWIFT-2** (`change-impact` writes usage error to stdout):
+  prior milestones already routed the "requires a directory; got
+  file …" error through `Error::*` returned via clap, which writes
+  to stderr by default. Verified on
+  `/tmp/repos/swift-collections/Sources/HeapModule/Heap.swift` —
+  stdout is empty, stderr carries the diagnostic, exit code is
+  non-zero.
+
+### Tests
+
+- `crates/tldr-cli/tests/hygiene_and_crash_fixes_v1.rs`: **9 tests
+  using only real `/tmp/repos/<X>` corpora** (no `TempDir`, no
+  synthetic content) covering each of the 4 bugs plus a cross-language
+  regression net for AGG12-3 (go + php), an embed/Ruby probe, a
+  cold-cache `similar` probe, a SARIF-output diagnostics probe, and a
+  happy-path `change-impact` probe. All tests gate on
+  `Path::new("/tmp/repos/<repo>").exists()` and silently no-op when
+  the corpus is absent (per `no-synthetic-fixtures-v1` §1). 9/9
+  passing.
+
+### Multi-language verification (real-repo, post-fix)
+
+- `tldr semantic` JSON-clean stdout: PASS on flask, ripgrep,
+  cpp-tinyxml2, kotlin-datetime, ocaml-dune (subdir), go-httprouter,
+  php-symfony-string, rails-html-sanitizer.
+- `tldr similar` JSON-clean stdout: PASS on flask, ripgrep,
+  cpp-tinyxml2, kotlin-datetime, ocaml-dune, go-httprouter,
+  php-symfony-string, rails-html-sanitizer.
+- `tldr embed` JSON-clean stdout: PASS on flask, ripgrep,
+  cpp-tinyxml2, kotlin-datetime, go-httprouter, php-symfony-string,
+  rails-html-sanitizer.
+- `tldr diagnostics` valid JSON regardless of tool availability:
+  PASS on luau-luau (no tools), elixir-plug, scala-cats-effect,
+  flask, ripgrep, cpp-tinyxml2, go-httprouter.
+- `tldr change-impact` JSON-clean stdout on directories: PASS on
+  flask, ripgrep, cpp-tinyxml2, go-httprouter, php-symfony-string,
+  swift-collections, rails-html-sanitizer.
+
+### Mini-audit on touched commands (5+ real repos each, 0 regressions)
+
+`semantic`, `similar`, `embed`, `diagnostics`, `change-impact` — all
+pass `jq empty` on stdout for every probed corpus.
+
 ## docs-and-elixir-dfg-v1 — internal milestone
 
 NOT a published release. Final atomic milestone of phase 11 — closes

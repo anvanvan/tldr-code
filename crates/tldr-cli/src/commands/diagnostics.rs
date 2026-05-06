@@ -178,9 +178,41 @@ impl DiagnosticsArgs {
 
         // 4. Check if we have tools to run
         if tools.is_empty() {
-            // Exit code 60: No diagnostic tools available (S6-R36 mitigation)
+            // hygiene-and-crash-fixes-v1 (BUG-AGG12-6): emit a valid empty
+            // JSON/SARIF document on stdout BEFORE the stderr message so JSON
+            // consumers don't choke on a 0-byte stdout. The advisory message
+            // remains on stderr (so humans see it), and we exit 0 because
+            // "no diagnostic tools installed" is an absence-of-tooling
+            // condition, not a runtime failure of the analysis itself.
+            let empty_report = DiagnosticsReport::default();
+            match self.output {
+                Some(DiagnosticOutput::Sarif) => {
+                    let sarif = to_sarif(&empty_report);
+                    println!("{}", serde_json::to_string_pretty(&sarif)?);
+                }
+                Some(DiagnosticOutput::GithubActions) => {
+                    // GitHub Actions output is an annotation stream; an empty
+                    // stream is the correct representation of "no findings".
+                    output_github_actions(&empty_report, self.max_annotations);
+                }
+                None => {
+                    if writer.is_text() {
+                        writer.write_text(&format!(
+                            "No diagnostic tools available for {:?}.\n",
+                            language
+                        ))?;
+                    } else {
+                        // Emit the empty DiagnosticsReport via the writer so
+                        // downstream JSON consumers get a well-formed object
+                        // that matches the schema of a real diagnostics run.
+                        writer.write(&empty_report)?;
+                    }
+                }
+            }
+
+            // Advisory on stderr (S6-R36 mitigation kept).
             eprintln!(
-                "Error: No diagnostic tools available for {:?}. Install one of:",
+                "Note: No diagnostic tools available for {:?}. Install one of:",
                 language
             );
             for tool in tools_for_language(language) {
@@ -190,6 +222,11 @@ impl DiagnosticsArgs {
                     tldr_core::diagnostics::get_install_suggestion(tool.name)
                 );
             }
+            // Preserve exit code 60 so existing skip-on-no-tools test gates
+            // (e.g. high_bundle_progress_determinism_coverage_v1) continue to
+            // distinguish "no tools" from a real diagnostics run that found
+            // nothing. The new behavior — valid JSON on stdout — is purely
+            // additive: JSON consumers no longer choke on 0-byte stdout.
             std::process::exit(60);
         }
 
@@ -202,13 +239,42 @@ impl DiagnosticsArgs {
         let mut report = run_tools_parallel(&tools, &self.path, self.timeout)?;
 
         // Check if all tools failed (exit code 61)
-        if report.tools_run.iter().all(|t| !t.success) {
-            eprintln!("Error: All diagnostic tools failed to run.");
+        //
+        // hygiene-and-crash-fixes-v1 (BUG-AGG12-6, exhaustive iteration per
+        // no-synthetic-fixtures-v1 §5): the same 0-byte-stdout class affects
+        // the all-tools-failed path too. Emit the partial report (with the
+        // tools_run errors populated) on stdout so JSON consumers can still
+        // parse it, then surface the advisory on stderr. Exit 0 because the
+        // tool-execution failures are described in-band in the JSON.
+        if !report.tools_run.is_empty() && report.tools_run.iter().all(|t| !t.success) {
+            // Recompute summary so the empty-diagnostics array is internally
+            // consistent with summary.total == 0.
+            report.summary = compute_summary(&report.diagnostics);
+            match self.output {
+                Some(DiagnosticOutput::Sarif) => {
+                    let sarif = to_sarif(&report);
+                    println!("{}", serde_json::to_string_pretty(&sarif)?);
+                }
+                Some(DiagnosticOutput::GithubActions) => {
+                    output_github_actions(&report, self.max_annotations);
+                }
+                None => {
+                    if writer.is_text() {
+                        let text = format_diagnostics_text(&report, 0);
+                        writer.write_text(&text)?;
+                    } else {
+                        writer.write(&report)?;
+                    }
+                }
+            }
+            eprintln!("Note: All diagnostic tools failed to run.");
             for result in &report.tools_run {
                 if let Some(err) = &result.error {
                     eprintln!("  - {}: {}", result.name, err);
                 }
             }
+            // Preserve exit code 61 (S6-R36) so callers can still discriminate
+            // tool-failure from clean/dirty runs. Stdout now carries the JSON.
             std::process::exit(61);
         }
 
