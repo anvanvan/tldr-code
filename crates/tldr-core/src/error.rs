@@ -289,6 +289,16 @@ impl TldrError {
                 // entrypoints) treat this variant as a per-file
                 // skip and continue.
                 | TldrError::FileTooLarge { .. }
+                // kotlin-extract-and-cpp-extensions-v1 (P6.BUG-N2): a
+                // single file with an unrecognised extension picked
+                // up by a directory walk (e.g. a `.zzz` next to
+                // valid `.cpp` sources, or any extension the
+                // single-bucket classifier hasn't been taught yet)
+                // must not abort the whole walk. Per-file commands
+                // (`tldr extract somefile.zzz`) still surface this
+                // as a hard error because they consult the error
+                // directly, not via `is_recoverable`.
+                | TldrError::UnsupportedLanguage(_)
         )
     }
 

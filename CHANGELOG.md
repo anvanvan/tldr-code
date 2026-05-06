@@ -1,5 +1,124 @@
 # Changelog
 
+## kotlin-extract-and-cpp-extensions-v1 — internal milestone
+
+NOT a published release. Closes 2 actionable bugs from the phase-6
+UX audit (`/tmp/audit_phase6/FINDINGS.md`). Both were single-bucket
+classifier defects: one in the Kotlin AST extractor (wrong
+tree-sitter node kind for class names), one in the language
+extension table (rare but valid C++ spellings missing). The phase-5
+audit had verified qualified-name resolution on Python only; phase-6
+extended the same probe to Kotlin and surfaced the cascading
+"empty class name → impact index keyed under '' → Function not
+found" failure mode.
+
+### Changed
+
+- `crates/tldr-core/src/ast/extract.rs:6188-6210, 6234-6256` —
+  `extract_kotlin_class_info` and `extract_kotlin_object_info` now
+  resolve the class/object name via `child_by_field_name("name")`
+  with a `simple_identifier` / `type_identifier` child-scan
+  fallback, mirroring the working `extract_kotlin_function_info`
+  pattern. Previously both functions only searched for a
+  `type_identifier` child, which the Kotlin tree-sitter grammar
+  rarely emits for class declarations — every real Kotlin class
+  came back with an empty `name` string. The cascade: `tldr impact
+  KnownBuilds.buildOn` and unqualified `tldr impact buildOn` both
+  failed with "Function not found" because the impact name index
+  was keyed under "" for every Kotlin class. Fixing the extractor
+  closes both the surface bug (visible empty `name` field) and the
+  downstream impact failure with one change.
+- `crates/tldr-core/src/types.rs:84-104` — `Language::extensions`
+  for `Cpp` widened from `[".cpp", ".cc", ".cxx", ".hpp"]` to
+  `[".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h++"]`,
+  bringing the canonical-classification list in line with
+  `scan_extensions()` (which already covered the rare spellings for
+  directory walks).
+- `crates/tldr-core/src/types.rs:158-195` —
+  `Language::from_extension` extended with the same four rare Cpp
+  spellings (`.c++`, `.hh`, `.hxx`, `.h++`). Previously the
+  per-file classifier (used by `parse_file_with_lang`'s autodetect
+  branch) returned `None` for these extensions, which surfaced as
+  `Error: Unsupported language: hxx` when the structure walker
+  reached such a file. `.h` deliberately stays in the C bucket;
+  sibling-aware widening (`from_path_with_siblings`) handles the
+  C/Cpp `.h` ambiguity for single-file `tldr extract`.
+- `crates/tldr-core/src/error.rs:278-303` —
+  `TldrError::is_recoverable` now returns `true` for
+  `UnsupportedLanguage(_)`. The walker error path
+  (`get_code_structure`, `analysis::importers`,
+  `analysis::arch_rules`, `analysis::deps`) consults this predicate
+  to decide whether a per-file failure aborts the entire walk or
+  becomes a `eprintln!` warning + `continue`. Per-file commands
+  (`tldr extract somefile.unknown`) consult the error directly and
+  still surface `UnsupportedLanguage` as a hard failure, so the
+  per-file "this extension is not supported" UX is preserved while
+  the directory-walk "skip and keep going" UX is repaired.
+
+### Architectural note
+
+Both bugs are instances of the same anti-pattern: a single-bucket
+classifier rejecting valid input and the rejection propagating as a
+hard failure instead of a per-file skip. The fixes follow the same
+two-step pattern `language-coverage-fixes-v1` introduced for `.h`:
+1. **Widen the classification table** so the bucket covers the full
+   real-world set of inputs (Kotlin: `simple_identifier` accepted
+   for class names; Cpp: `.c++`/`.hh`/`.hxx`/`.h++` accepted).
+2. **Soften the walker's error policy** so a per-file classifier
+   miss never aborts the directory traversal — match the
+   `ParseError`/`PermissionDenied`/`FileTooLarge` precedent that
+   already routes those through the recoverable path.
+
+After this milestone the Kotlin and Cpp classification surfaces are
+the only ones in their respective layers (no parallel "kotlin class
+name extractor v2" or "alternative cpp ext list" is left).
+
+### Retained
+
+- `extract_kotlin_function_info`'s name-resolution pattern was
+  already correct; it stays untouched.
+- `Language::scan_extensions()` for Cpp was already complete
+  (`.cpp/.cc/.cxx/.c++/.hpp/.hh/.hxx/.h++/.h`) — only the
+  single-bucket `from_extension` and `extensions()` siblings needed
+  widening.
+- `Language::from_path_with_siblings` (cross-command-consistency-v3)
+  for `.h` → Cpp autodetect when there is positive sibling evidence
+  — orthogonal to this fix; both stay in place.
+- All other `is_recoverable` semantics (`ParseError`,
+  `PermissionDenied`, `FunctionNotFound`, `FileTooLarge`) — only
+  `UnsupportedLanguage` was added, with the same skip-and-continue
+  contract.
+
+### Quantification
+
+| Suite | Before | After |
+| --- | --- | --- |
+| `kotlin_extract_and_cpp_extensions_v1` (new) | n/a | 6/6 GREEN |
+| `vuln_migration_v1_red` (master regression) | 168/168 | 168/168 |
+| `cross_command_consistency_v3` | 5/5 | 5/5 |
+| `language_coverage_fixes_v1` | 5/5 | 5/5 |
+| `naming_majority_determinism_v1` | 2/2 | 2/2 |
+| `tldr extract /tmp/k.kt` Kotlin class names | `["", ""]` | `["Person", "Animal"]` |
+| `tldr extract /tmp/k.kt` Kotlin object name | `""` | `"MySingleton"` |
+| `tldr impact buildOn` on synthetic Kotlin object | "Function not found" | resolves to KnownBuilds.buildOn target |
+| `tldr structure /tmp/cppx` (mixed `.cpp`/`.hxx`/`.hh`/`.h++`/`.c++`) | aborts: `Error: Unsupported language: hxx` | walks all 5 files |
+| `tldr extract /tmp/cppx/t.hxx` autodetect language | "Unsupported language: hxx" | `"cpp"` |
+| `tldr structure` walk with stray `.zzz` | aborts whole walk | skips `.zzz`, completes walk |
+
+### Standing rules upheld
+
+- One atomic commit, one CHANGELOG entry, one local annotated tag
+- `Cargo.lock` not staged (explicit-add list only)
+- No push, no `cargo publish`, no version bump (manifest stays at 0.3.0)
+- No `#[allow(...)]` suppression, no test weakening, no scope cuts —
+  both bugs fixed at the root (classification table + recoverable
+  policy), not papered over with command-level shims
+- No `git stash`, no destructive git
+- 168/168 master regression preserved
+- Binary reinstalled to `~/.cargo/bin/tldr` and `~/.local/bin/tldr`,
+  ad-hoc codesigned, semantic feature count = 3 (similar / semantic
+  / embed)
+
 ## cross-command-consistency-v3 — internal milestone
 
 NOT a published release. Closes 3 actionable bugs from the phase-5

@@ -89,7 +89,15 @@ impl Language {
             Language::Rust => &[".rs"],
             Language::Java => &[".java"],
             Language::C => &[".c", ".h"],
-            Language::Cpp => &[".cpp", ".cc", ".cxx", ".hpp"],
+            // kotlin-extract-and-cpp-extensions-v1 (P6.BUG-N2): include
+            // the rare-but-valid `.c++`, `.hh`, `.hxx`, `.h++` Cpp
+            // spellings so the single-bucket classifier (used by
+            // `parse_file_with_lang` autodetection and by per-file
+            // `tldr extract`) doesn't reject them as `Unsupported
+            // language`. `.h` stays in the C bucket — sibling-aware
+            // widening (`from_path_with_siblings`) flips it to Cpp
+            // when there is positive evidence in the parent dir.
+            Language::Cpp => &[".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h++"],
             Language::Ruby => &[".rb"],
             Language::Kotlin => &[".kt", ".kts"],
             Language::Swift => &[".swift"],
@@ -171,7 +179,15 @@ impl Language {
             ".rs" => Some(Language::Rust),
             ".java" => Some(Language::Java),
             ".c" | ".h" => Some(Language::C),
-            ".cpp" | ".cc" | ".cxx" | ".hpp" => Some(Language::Cpp),
+            // kotlin-extract-and-cpp-extensions-v1 (P6.BUG-N2): mirror
+            // the canonical `extensions()` widening so per-file
+            // classification (used by `parse_file_with_lang` when no
+            // hint is supplied, and by `tldr extract` autodetect)
+            // accepts the rare Cpp spellings. The walker's
+            // `scan_extensions()` already handled them.
+            ".cpp" | ".cc" | ".cxx" | ".c++" | ".hpp" | ".hh" | ".hxx" | ".h++" => {
+                Some(Language::Cpp)
+            }
             ".rb" => Some(Language::Ruby),
             ".kt" | ".kts" => Some(Language::Kotlin),
             ".swift" => Some(Language::Swift),

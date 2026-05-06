@@ -6186,18 +6186,28 @@ fn extract_kotlin_classes_detailed(node: &Node, source: &str, classes: &mut Vec<
 }
 
 fn extract_kotlin_class_info(node: &Node, source: &str) -> ClassInfo {
-    // Kotlin uses type_identifier for class name
-    let name = {
-        let mut cursor = node.walk();
-        let mut found = String::new();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "type_identifier" {
-                found = get_node_text(&child, source);
-                break;
+    // kotlin-extract-and-cpp-extensions-v1 (P6.BUG-N1): Kotlin's
+    // tree-sitter grammar emits class names as `simple_identifier` (or
+    // occasionally `type_identifier` for type aliases). The historical
+    // implementation only looked for `type_identifier`, which produced
+    // empty `name` strings on every real Kotlin class — and cascaded
+    // into `tldr impact <Class>.<method>` returning "Function not
+    // found" because the impact name index was keyed under "". Mirror
+    // the working `extract_kotlin_function_info` pattern: prefer the
+    // `name` field, fall back to a `simple_identifier` /
+    // `type_identifier` child scan.
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| get_node_text(&n, source))
+        .unwrap_or_else(|| {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "simple_identifier" || child.kind() == "type_identifier" {
+                    return get_node_text(&child, source);
+                }
             }
-        }
-        found
-    };
+            String::new()
+        });
 
     let line_number = node.start_position().row as u32 + 1;
     let line_end = node.end_position().row as u32 + 1;
@@ -6232,18 +6242,23 @@ fn extract_kotlin_class_info(node: &Node, source: &str) -> ClassInfo {
 }
 
 fn extract_kotlin_object_info(node: &Node, source: &str) -> ClassInfo {
-    // Object declaration uses type_identifier for name
-    let name = {
-        let mut cursor = node.walk();
-        let mut found = String::new();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "type_identifier" {
-                found = get_node_text(&child, source);
-                break;
+    // kotlin-extract-and-cpp-extensions-v1 (P6.BUG-N1): same name-field
+    // bug as `extract_kotlin_class_info` — Kotlin's `object_declaration`
+    // emits `simple_identifier` for the singleton name. Prefer the
+    // `name` field, fall back to a `simple_identifier` /
+    // `type_identifier` child scan.
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| get_node_text(&n, source))
+        .unwrap_or_else(|| {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "simple_identifier" || child.kind() == "type_identifier" {
+                    return get_node_text(&child, source);
+                }
             }
-        }
-        found
-    };
+            String::new()
+        });
 
     let line_number = node.start_position().row as u32 + 1;
     let line_end = node.end_position().row as u32 + 1;
