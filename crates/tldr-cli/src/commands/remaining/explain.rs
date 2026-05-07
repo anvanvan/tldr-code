@@ -1471,6 +1471,85 @@ fn enrich_with_project_graph(
             .callees
             .push(CallInfo::new(dst_name, dst_file, 0));
     }
+
+    // sibling-resolver-gaps-v1 (P14.AGG14-14): the Swift call-graph
+    // builder may attribute a callee's `dst_file` to a test file that
+    // *uses* the method (e.g. `Tests/HeapTests/HeapTests.swift`) rather
+    // than the file that *defines* it (e.g.
+    // `Sources/HeapModule/Heap+UnsafeHandle.swift`). For each callee
+    // whose attributed file does NOT define a matching function, search
+    // the project for a definition file and rewrite `.file` to the
+    // canonical definition. Skip if no unique definition is found
+    // (preserves the original attribution as a best-effort fallback).
+    if language == Language::Swift {
+        // Build a unique candidate set from the call-graph edges, plus
+        // any same-language file under the project root the walker
+        // already visited. Resolve relative paths against `project_root`
+        // so `function_is_defined_in_file` can call `extract_file`
+        // successfully regardless of whether the call-graph emitted
+        // relative or absolute paths.
+        let resolve = |p: &std::path::Path| -> std::path::PathBuf {
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                project_root.join(p)
+            }
+        };
+        let mut cand_set: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        for e in graph.edges() {
+            cand_set.insert(resolve(&e.dst_file));
+            cand_set.insert(resolve(&e.src_file));
+        }
+        let candidates: Vec<std::path::PathBuf> = cand_set.into_iter().collect();
+        for callee in report.callees.iter_mut() {
+            let attributed_file = resolve(std::path::Path::new(&callee.file));
+            // If the attributed file already defines the callee, leave
+            // it alone (the common, correct case).
+            if function_is_defined_in_file(&attributed_file, &callee.name, language) {
+                continue;
+            }
+            // Collect every project file (from the graph's edges) that
+            // actually defines the callee, then prefer the
+            // non-test-scope one.
+            let mut def_files: Vec<std::path::PathBuf> = Vec::new();
+            for cand in &candidates {
+                if function_is_defined_in_file(cand, &callee.name, language) {
+                    def_files.push(cand.clone());
+                }
+            }
+            if def_files.is_empty() {
+                continue;
+            }
+            // Prefer files whose path does NOT contain `/Tests/` or
+            // `/test/` over those that do. This matches the convention
+            // that swift-collections etc. keep production sources under
+            // `Sources/` and tests under `Tests/`.
+            def_files.sort_by_key(|p| {
+                let s = p.to_string_lossy().to_lowercase();
+                let is_test = s.contains("/tests/")
+                    || s.contains("/test/")
+                    || s.contains("test.swift")
+                    || s.ends_with("tests.swift");
+                if is_test {
+                    1
+                } else {
+                    0
+                }
+            });
+            if let Some(canonical) = def_files.first() {
+                // Emit a project-relative path when possible (matches
+                // the existing convention used by callees from the
+                // call-graph edges) so downstream consumers see a
+                // homogeneous shape.
+                let display = canonical
+                    .strip_prefix(&project_root)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| canonical.display().to_string());
+                callee.file = display;
+            }
+        }
+    }
 }
 
 /// Enrich `report.callers` using `find_references` for languages whose

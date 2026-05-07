@@ -464,6 +464,20 @@ pub fn find_definition_by_position(
     match find_definition_by_name(&symbol_name, file, project, lang_hint) {
         Ok(result) => Ok(result),
         Err(RemainingError::SymbolNotFound { .. }) => {
+            // sibling-resolver-gaps-v1 (P14.AGG14-6): when the
+            // resolver returned a qualified name (e.g. `m.reset` from
+            // a lua `function m.reset()` line, or `Class::method` for
+            // C++), the per-file definition lookup may not match the
+            // dotted form. Retry once with the trailing segment so the
+            // user gets a useful answer rather than "not found".
+            let trailing = trailing_segment(&symbol_name);
+            if trailing != symbol_name && !trailing.is_empty() {
+                if let Ok(result) =
+                    find_definition_by_name(&trailing, file, project, lang_hint)
+                {
+                    return Ok(result);
+                }
+            }
             // Pass 3: import-scope resolution. If the cursor sits on an
             // imported alias (`click` in `click.echo(...)`), resolve to
             // the `import` line.
@@ -482,6 +496,20 @@ pub fn find_definition_by_position(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Last `.` / `::`-separated segment (e.g. `m.reset` -> `reset`,
+/// `XMLDocument::Parse` -> `Parse`, `plain` -> `plain`). Used by the
+/// keyword-skip fallback in the position-based definition lookup.
+fn trailing_segment(s: &str) -> String {
+    let mut tail = s;
+    if let Some(idx) = s.rfind("::") {
+        tail = &s[idx + 2..];
+    }
+    if let Some(idx) = tail.rfind('.') {
+        tail = &tail[idx + 1..];
+    }
+    tail.to_string()
 }
 
 /// Pass 1: local-scope resolution.
@@ -3056,13 +3084,80 @@ fn find_symbol_at_position(
         )));
     }
 
+    // sibling-resolver-gaps-v1 (P14.AGG14-6): if the user passed a
+    // column that lands on a language keyword (`function`/`func`/`fn`
+    // /`def`/`export`/...), advance past the keyword to the next
+    // identifier on the line. Reproduced across 8 languages: e.g.
+    // `tldr definition foo.lua 44 1` for the line `function m.reset()`
+    // previously errored with "symbol 'function' not found in scope".
+    // Walking past the keyword resolves to `m.reset` (or `reset`)
+    // matching the surrounding tokens. Repeat once more if the next
+    // identifier is also a keyword (e.g. `pub fn` for rust, where col=1
+    // is `pub` and the function lives at col=8). For Go, also skip a
+    // balanced `(receiver Type)` parameter group between `func` and the
+    // method name.
+    let mut effective_column = column as usize;
+    for _ in 0..6 {
+        let candidate =
+            extract_identifier_at_column(line_text, effective_column.min(line_text.len()));
+        if !candidate.is_empty() && is_language_keyword(&candidate, language) {
+            // Skip the keyword: walk to the end of the identifier run,
+            // then over any non-identifier bytes (whitespace, `(`, etc.)
+            // until the next identifier-byte starts. If the first
+            // non-identifier byte we hit is `(`, walk over the whole
+            // balanced group first (Go-style method receivers).
+            let bytes = line_text.as_bytes();
+            let is_ident =
+                |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+            let mut i = effective_column.min(bytes.len());
+            while i < bytes.len() && is_ident(bytes[i]) {
+                i += 1;
+            }
+            // Skip whitespace.
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            // Skip a balanced (...) group (e.g. go method receiver).
+            if i < bytes.len() && bytes[i] == b'(' {
+                let mut depth = 0i32;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            i += 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            } else {
+                while i < bytes.len() && !is_ident(bytes[i]) {
+                    i += 1;
+                }
+            }
+            if i < bytes.len() {
+                effective_column = i;
+                continue;
+            }
+        }
+        break;
+    }
+
     let tree = PARSER_POOL
         .parse_with_path(source, language, Some(file))
         .map_err(|e| RemainingError::parse_error(file.to_path_buf(), e.to_string()))?;
 
     // Convert 1-indexed line to 0-indexed
     let target_line = target_line_0;
-    let target_col = column as usize;
+    let target_col = effective_column;
 
     // Find the node at the position
     let root = tree.root_node();
@@ -3082,6 +3177,33 @@ fn find_symbol_at_position(
     })?;
 
     if is_identifier_kind(node.kind()) {
+        // sibling-resolver-gaps-v1 (P14.AGG14-6): when the keyword-skip
+        // landed us on the head of a dotted/qualified name (e.g.
+        // `m.reset` in lua, `ps.ByName` in go, `Class::method` in c++),
+        // return the full qualified expression rather than just the
+        // first identifier — that's what the user means by "what is
+        // defined on this line".
+        if let Some(parent) = node.parent() {
+            let pkind = parent.kind();
+            if matches!(
+                pkind,
+                "dot_index_expression"
+                    | "member_expression"
+                    | "field_expression"
+                    | "selector_expression"
+                    | "qualified_identifier"
+                    | "scoped_identifier"
+                    | "field_access"
+                    | "name_qualified"
+                    | "field_identifier"
+            ) {
+                if let Ok(full) = parent.utf8_text(source.as_bytes()) {
+                    if !full.is_empty() && full.contains(text) {
+                        return Ok(clamp_symbol(full));
+                    }
+                }
+            }
+        }
         return Ok(clamp_symbol(text));
     }
 
@@ -3148,6 +3270,80 @@ fn extract_identifier_at_column(line: &str, col: usize) -> String {
     }
     let slice = &line[start..end];
     clamp_symbol(slice)
+}
+
+/// Returns true for tokens that are language keywords (and therefore
+/// not legal symbol names). Used by [`find_symbol_at_position`] to
+/// skip the keyword when the user passes `col=1` on a definition line
+/// like `function foo()` or `func (r *Receiver) Bar()`.
+///
+/// sibling-resolver-gaps-v1 (P14.AGG14-6): the keyword set covers the
+/// 8 languages where the bug was directly reproduced
+/// (lua/luau/go/rust/python/typescript/scala/swift/ruby/php/c/cpp/java/csharp)
+/// plus a small superset so the same skip logic also helps adjacent
+/// langs without harm. Definition lookup over any of these tokens is
+/// not a meaningful operation; the resolver should advance to the next
+/// identifier rather than report "symbol 'fn' not found".
+fn is_language_keyword(word: &str, language: Language) -> bool {
+    // Conservative shared set used regardless of language — these are
+    // never legal identifier names anywhere in the supported corpus.
+    const SHARED: &[&str] = &[
+        "fn", "func", "function", "def", "defp", "defmodule", "defmacro",
+        "defmacrop", "defstruct", "let", "var", "const", "class", "struct",
+        "trait", "interface", "module", "namespace", "package", "import",
+        "from", "use", "using", "export", "pub", "public", "private",
+        "protected", "static", "final", "abstract", "override", "async",
+        "await", "return", "if", "else", "elif", "while", "for", "do",
+        "match", "switch", "case", "break", "continue", "type", "typedef",
+        "enum", "implements", "extends", "self", "this", "super", "void",
+        "new", "delete", "object", "trait",
+    ];
+    if SHARED.contains(&word) {
+        return true;
+    }
+    // Per-language extras for variants that are legal identifiers in
+    // *some* langs but keywords in others (e.g. ocaml `let`, rust `mod`).
+    match language {
+        Language::Rust => matches!(
+            word,
+            "fn" | "mod"
+                | "impl"
+                | "trait"
+                | "where"
+                | "ref"
+                | "mut"
+                | "dyn"
+                | "as"
+                | "in"
+                | "loop"
+                | "move"
+                | "unsafe"
+                | "extern"
+                | "crate"
+                | "Self"
+        ),
+        Language::Ocaml => matches!(
+            word,
+            "let" | "rec"
+                | "and"
+                | "in"
+                | "fun"
+                | "function"
+                | "module"
+                | "open"
+                | "type"
+                | "of"
+                | "match"
+                | "with"
+                | "begin"
+                | "end"
+                | "val"
+        ),
+        Language::Java | Language::CSharp | Language::Kotlin => {
+            matches!(word, "synchronized" | "throws" | "throw" | "try" | "catch" | "finally")
+        }
+        _ => false,
+    }
 }
 
 /// Returns true for any tree-sitter node kind that represents an identifier

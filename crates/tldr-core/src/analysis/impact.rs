@@ -340,6 +340,185 @@ pub fn impact_analysis_with_ast_fallback(
     }
 }
 
+/// Enrich `report.targets` with cross-file callers discovered via
+/// `find_references`. Mirrors the original CLI-side helper introduced in
+/// `language-adapter-fixes-v1` (P13.AGG13-4); promoted to tldr-core in
+/// `sibling-resolver-gaps-v1` (P14.AGG14-4) so `whatbreaks`'s internal
+/// impact path benefits from the same enrichment that the user-facing
+/// `impact` command does.
+///
+/// For each call site of `target_func` in the project:
+///   1. Locate the enclosing function in the call site's file by parsing
+///      with [`crate::extract_file`] and finding the function whose
+///      `[line_number, line_end]` range contains the call.
+///   2. For each target tree, append a top-level synthetic caller entry
+///      per unique (caller_function, caller_file) pair. Dedup against
+///      existing direct callers using last-segment-aware name matching
+///      (P14.AGG14-1) so the call-graph's qualified `Class.method` form
+///      and references' bare `method` form are recognised as the same
+///      caller.
+///   3. Replace the "Entry point — no callers found" note when callers
+///      are added.
+pub fn enrich_impact_with_references(
+    report: &mut ImpactReport,
+    project_root: &Path,
+    target_func: &str,
+    language: Language,
+) {
+    use crate::analysis::references::{find_references, ReferenceKind, ReferencesOptions};
+    use crate::extract_file;
+
+    if report.targets.is_empty() {
+        return;
+    }
+
+    let mut options = ReferencesOptions::new();
+    options.kinds = Some(vec![ReferenceKind::Call]);
+    options.language = Some(language.as_str().to_string());
+    options.limit = Some(500);
+
+    let refs_report = match find_references(target_func, project_root, &options) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    let mut file_funcs_cache: HashMap<PathBuf, Vec<(String, u32, u32)>> = HashMap::new();
+
+    let mut additions: Vec<(String, PathBuf, u32)> = Vec::new();
+    for r in &refs_report.references {
+        let caller_file = r.file.clone();
+        let funcs = file_funcs_cache
+            .entry(caller_file.clone())
+            .or_insert_with(|| {
+                let module = match extract_file(&caller_file, None) {
+                    Ok(m) => m,
+                    Err(_) => return Vec::new(),
+                };
+                let mut out: Vec<(String, u32, u32)> = Vec::new();
+                for f in &module.functions {
+                    out.push((f.name.clone(), f.line_number, f.line_end));
+                }
+                for class in &module.classes {
+                    for m in &class.methods {
+                        out.push((m.name.clone(), m.line_number, m.line_end));
+                        out.push((
+                            format!("{}.{}", class.name, m.name),
+                            m.line_number,
+                            m.line_end,
+                        ));
+                    }
+                }
+                out
+            });
+        let enclosing = funcs
+            .iter()
+            .find(|(_, start, end)| {
+                let line = r.line as u32;
+                line >= *start && (*end == 0 || line <= *end)
+            })
+            .map(|(name, _, _)| name.clone())
+            .unwrap_or_else(|| "<module>".to_string());
+
+        let is_self = report.targets.values().any(|tree| {
+            paths_equivalent_root(&tree.file, project_root, &caller_file)
+                && (enclosing == target_func
+                    || last_segment_eq_pub(&enclosing, target_func))
+        });
+        if is_self {
+            continue;
+        }
+
+        let key_pair = (enclosing.clone(), caller_file.clone());
+        if additions
+            .iter()
+            .any(|(n, f, _)| n == &key_pair.0 && f == &key_pair.1)
+        {
+            continue;
+        }
+        additions.push((enclosing, caller_file, r.line as u32));
+    }
+
+    if additions.is_empty() {
+        return;
+    }
+
+    for tree in report.targets.values_mut() {
+        for (name, file, line) in &additions {
+            // P14.AGG14-1: last-segment-aware dedup so call-graph
+            // qualified-name (`Class.method`) and references bare-name
+            // (`method`) collapse to the same caller.
+            let already_present = tree.callers.iter().any(|c| {
+                let names_match = &c.function == name
+                    || last_segment_eq_pub(&c.function, name)
+                    || last_segment_eq_pub(name, &c.function);
+                names_match && paths_equivalent_root(&c.file, project_root, file)
+            });
+            if already_present {
+                continue;
+            }
+            tree.callers.push(CallerTree {
+                function: name.clone(),
+                file: file.clone(),
+                caller_count: 0,
+                callers: vec![],
+                truncated: false,
+                note: Some(format!(
+                    "Discovered via references at line {} (call graph missing edge)",
+                    line
+                )),
+                confidence: None,
+                receiver_type: None,
+            });
+            tree.caller_count = tree.callers.len();
+            if let Some(n) = &tree.note {
+                if n.contains("Entry point") || n.contains("no callers") {
+                    tree.note = Some(
+                        "caller_count derived from references enrichment (call graph missing cross-file edges)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Path equality with project-root anchoring used by the references
+/// enrichment helper.
+fn paths_equivalent_root(a: &Path, project_root: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let ca = a
+        .canonicalize()
+        .or_else(|_| project_root.join(a).canonicalize())
+        .ok();
+    let cb = b
+        .canonicalize()
+        .or_else(|_| project_root.join(b).canonicalize())
+        .ok();
+    match (ca, cb) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Trailing-segment equality after `.` or `::`. Used for last-segment
+/// aware caller-dedup in [`enrich_impact_with_references`].
+fn last_segment_eq_pub(qualified: &str, target: &str) -> bool {
+    let last_dot = qualified.rfind('.');
+    let last_cc = qualified.rfind("::").map(|i| i + 1);
+    let cut = match (last_dot, last_cc) {
+        (Some(d), Some(c)) => Some(d.max(c)),
+        (Some(d), None) => Some(d),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
+    match cut {
+        Some(i) if i + 1 < qualified.len() => &qualified[i + 1..] == target,
+        _ => qualified == target,
+    }
+}
+
 /// Search for a function in the AST of files under `root`.
 ///
 /// Returns a list of (function_name, file_path) pairs if found, or None.

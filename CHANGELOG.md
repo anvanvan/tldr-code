@@ -1,5 +1,141 @@
 # Changelog
 
+## sibling-resolver-gaps-v1 — internal milestone
+
+NOT a published release. Closes the **sibling-resolver gap pattern**
+identified in the Phase-14 audit (Section 5 of
+`/tmp/audit_phase14/AGGREGATE_REPORT.md`): cases where a P13 fix was
+applied to one command but its sibling commands sharing the same
+broken resolver were missed. All 7 bugs reproduced live against the
+P14-A release binary on real repos under `/tmp/repos/<corpus>` BEFORE
+any fix.
+
+### Per-bug pre/post-fix evidence (file-redirect)
+
+| Bug ID         | Pre-fix repro                                                                                                              | Pre-fix result                                                                                            | Post-fix result                                                                                                 |
+|----------------|----------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| P14.AGG14-1    | `tldr impact findPaginatedForOwnersLastName /tmp/repos/spring-petclinic --format json`                                     | `caller_count=2`, both entries `processFindForm` (call-graph emitted qualified, references emitted bare)  | `caller_count=1`, single `OwnerController.processFindForm` entry (last-segment-aware dedup)                     |
+| P14.AGG14-4    | `tldr whatbreaks WriteToken /tmp/repos/csharp-newtonsoft-bson-full --format json`                                          | `summary.direct_caller_count=0`, `Entry point - no callers found`                                         | `summary.direct_caller_count=2` (WriteTokenAsync, WriteEnd), matching `tldr impact WriteToken`                  |
+| P14.AGG14-5(a) | `tldr api-check --lang luau /tmp/repos/luau-luau --format json`                                                            | scanned `.cpp`/`.h`/`.py` files (~533 findings across hundreds of files)                                  | scans only `.lua`/`.luau` files (24 findings, 0 non-luau extensions)                                            |
+| P14.AGG14-5(b) | `tldr debt --lang luau /tmp/repos/luau-luau --format json`                                                                 | no `language` field at all (consumer-visible regression vs `clones --lang luau` which emits `language`)   | `"language": "luau"` at top level                                                                               |
+| P14.AGG14-6    | `tldr definition /tmp/repos/lua-lsp/script/files.lua 44 1 --format json` (same pattern in go/rust/python/typescript/...)   | exit 1, "symbol 'function' not found in scope" (same pattern: 'func', 'fn', 'def', 'export' across langs) | exit 0, returns the actual symbol (`reset` for lua, `ByName` for go, `main` for rust, `_make_timedelta`, etc.) |
+| P14.AGG14-13   | `tldr references m.reset /tmp/repos/lua-lsp --format json`                                                                 | 6 references in `files.lua` + `scope.lua` only (no cross-module alias callers)                            | 13 references including cross-module `lclient.lua:files.reset()` and `workspace.lua:files.resetText()` sites    |
+| P14.AGG14-14   | `tldr explain /tmp/repos/swift-collections/Sources/HeapModule/Heap+UnsafeHandle.swift 'Heap._heapify' --format json`       | `trickleDownMin`/`trickleDownMax` callees `.file = Tests/HeapTests/HeapTests.swift` (test file, not def)  | `.file = Sources/HeapModule/Heap+UnsafeHandle.swift` (canonical definition file)                                |
+| P14.AGG14-19   | `tldr cognitive /tmp/repos/express/lib/application.js --format json`                                                       | `functions: [logerror, tryRender]` (2 — missed all 17 CommonJS-assigned `app.X = function(){}` defs)      | `functions.length = 19` (matches `tldr halstead` and `tldr complexity` siblings)                                |
+
+### Implementation summary
+
+- **AGG14-1, AGG14-4** (shared "references-enrichment" surface):
+  promoted the CLI-side `enrich_targets_with_references` helper from
+  `crates/tldr-cli/src/commands/impact.rs` into
+  `crates/tldr-core/src/analysis/impact.rs::enrich_impact_with_references`,
+  re-exported via `tldr_core::enrich_impact_with_references`. Both
+  the user-facing `tldr impact` and the internal
+  `whatbreaks_analysis::run_impact_analysis` now call the same
+  helper, closing the AGG14-4 sibling gap. The dedup inside the
+  helper was upgraded to last-segment-aware matching
+  (`Class.method` ↔ bare `method`) so the call-graph-emitted
+  qualified caller and the references-emitted bare caller collapse
+  to one entry, fixing AGG14-1.
+
+- **AGG14-5** (luau --lang flag bypass): plumbed `cli.lang` into
+  `ApiCheckArgs::run` (added `Option<Language>` parameter; main
+  dispatch passes `cli.lang`); added a `map_language_to_api_language`
+  helper so the existing per-file `detect_language` dispatch can be
+  filtered to only the user-pinned language. Mirrors the
+  `language-adapter-fixes-v1` (P13.AGG13-10) fix to `clones`. For
+  `debt`, added a top-level `language` field on `DebtReport`
+  populated from `options.language`, mirroring the existing top-level
+  field on `ClonesReport`. Updated 4 call sites of `DebtReport`
+  (struct literal initializers in `debt_tests.rs`).
+
+- **AGG14-6** (definition keyword-position): in
+  `find_symbol_at_position` (`commands/remaining/definition.rs`),
+  when the resolved column lands on a language keyword, walk past
+  the keyword + balanced `(...)` group + whitespace to the next
+  identifier on the line. Added `is_language_keyword(word, language)`
+  with a conservative shared keyword set + per-language extras
+  (rust `mod`/`impl`/`Self`/..., ocaml `let`/`rec`/..., java/csharp
+  `synchronized`). When the resolved tree-sitter node is an
+  identifier whose parent is a dotted/scoped expression
+  (`dot_index_expression`, `scoped_identifier`, `member_expression`,
+  `qualified_identifier`, `field_access`, ...), prefer the parent
+  expression text so `m.reset` (lua) and `Class::method` (cpp) are
+  returned as the resolved symbol instead of the head identifier.
+  Added a trailing-segment fallback in `find_definition_by_name`
+  (the per-file lookup) so qualified symbols that the per-language
+  in-file finder can't match still resolve to the bare method when
+  it exists.
+
+- **AGG14-13** (lua references cross-module aliases): added
+  `enrich_lua_alias_callers` to `commands/references.rs`. When the
+  language is detected as Lua/Luau and the symbol contains a `.`,
+  also query `find_references` for the bare trailing segment and
+  append hits whose context contains `\.<bare>(` (i.e. a method
+  invocation through some alias). Mirrors the
+  `critical-regressions-v1` (P13.AGG13-12) enrichment in
+  `tldr explain`. Auto-detects language from `--lang` AND from
+  `Language::from_directory(path)` so the enrichment runs even
+  without `--lang` on a Lua-only project.
+
+- **AGG14-14** (swift explain callee file attribution): in
+  `enrich_with_project_graph::callees` (`commands/remaining/explain.rs`),
+  for `language == Language::Swift`, after the standard
+  edge-walking pass, re-attribute every callee whose `.file` does
+  NOT define a matching function. Build a candidate set from every
+  unique `dst_file`/`src_file` in the project graph, resolve
+  relative paths against `project_root`, and pick the
+  non-test-scope file that defines the callee. Falls back silently
+  to the original attribution when no such file is found
+  (preserves behaviour for callees the call-graph already
+  attributed correctly).
+
+- **AGG14-19** (js cognitive CommonJS gap): in
+  `analyze_cognitive` (`metrics/cognitive.rs`), after the
+  tree-sitter walker pass, for `JavaScript`/`TypeScript` augment
+  with `augment_cognitive_with_extractor_functions` which uses the
+  `extract_file` AST extractor (the same source halstead/complexity
+  rely on) to discover CommonJS-style `app.X = function name(){}`
+  assignments. For each extractor-known function not yet present
+  in the cognitive list, locate the AST node via `find_function_node`
+  and run the same `CognitiveCalculator` so the metrics stay
+  identical to the canonical SonarSource implementation.
+
+### Multi-language non-regression matrix
+
+| Probe                                                              | csharp impact (AGG13-4) | cpp api-check (no `--lang`) | python debt (no `--lang`) | python definition (col != 1) | rust definition (col != 1) | python cognitive | rust cognitive |
+|--------------------------------------------------------------------|------------------------:|----------------------------:|--------------------------:|-----------------------------:|---------------------------:|-----------------:|---------------:|
+| Pre-fix baseline (P14-A `7cadee5`)                                 |                       2 |                          13 |                      1540 |                            ✓ |                          ✓ |               40 |             11 |
+| Post-fix (this milestone)                                          |                       2 |                          13 |                      1540 |                            ✓ |                          ✓ |               40 |             11 |
+
+Plus: cognitive on java (`OwnerController.java`) returns 12 functions
+(unchanged); cognitive on go (`router.go`) returns 22 (unchanged).
+
+### Mini-audit on touched commands (5+ real repos each)
+
+| Command       | spring-petclinic | flask | express | ripgrep | csharp-newtonsoft-bson-full | luau-luau | swift-collections |
+|---------------|-----------------:|------:|--------:|--------:|----------------------------:|----------:|------------------:|
+| impact `main` | 4 targets | 1 | 0 | 5 | 0 | n/a | n/a |
+| whatbreaks `main` | 0 callers | 2 | 0 | n/a | 0 | n/a | n/a |
+| api-check `--lang <lang>` | n/a | 1 finding | 12 | 29 | 2 | 24 (luau-only) | n/a |
+| debt `--lang <lang>` | 45 min, java | 1540, py | 50, js | 985, rust | n/a | 0, luau | n/a |
+| references | n/a | 17 (`__init__`) | n/a | 20 (`main`) | 3 (`WriteToken`) | n/a | n/a |
+| explain | 0 callees (java pre-existing) | 2 callees | n/a | 1 callee | n/a | n/a | 3 callees |
+| cognitive | 12 functions | 40 | 19 | 11 | n/a | n/a | n/a |
+| definition (col=1 keyword) | n/a | resolves `_make_timedelta` | n/a | resolves `main` | n/a | n/a | n/a |
+
+All cells PASS (no new failures vs the P14-A baseline).
+
+### Test counts
+
+- New test file `crates/tldr-cli/tests/sibling_resolver_gaps_v1.rs`: **19/19 PASS**
+- P14-A `context_file_func_and_cpp_qualified_v1`: **25/25 PASS**
+- P13-A `critical_regressions_v1`: **9/9 PASS**
+- P13-B `language_adapter_fixes_v1`: **14/14 PASS**
+- P13-C `quality_metrics_and_schema_v1`: **10/10 PASS**
+- `vuln_migration_v1_red`: **168/168 PASS**
+- `language_command_matrix`: **926/0/28** (passed/failed/ignored)
+
 ## context-file-func-cross-lang-and-cpp-qualified-v1 — internal milestone
 
 NOT a published release. Highest-priority follow-up to phase-14 audit:

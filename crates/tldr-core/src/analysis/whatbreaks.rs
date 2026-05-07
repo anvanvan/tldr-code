@@ -372,7 +372,20 @@ fn run_impact_analysis(
 
     match impact_analysis_with_ast_fallback(call_graph, target, depth, None, project_path, language)
     {
-        Ok(report) => {
+        Ok(mut report) => {
+            // sibling-resolver-gaps-v1 (P14.AGG14-4): mirror the
+            // user-facing `tldr impact` references-enrichment so
+            // `whatbreaks` finds the same callers. Without this,
+            // `whatbreaks WriteToken` reports `caller_count = 0`
+            // ("Entry point") for csharp/kotlin/java cases that the
+            // call-graph alone misses but `find_references` resolves.
+            crate::analysis::impact::enrich_impact_with_references(
+                &mut report,
+                project_path,
+                target,
+                language,
+            );
+
             // Count direct callers from all targets
             let direct_count: usize = report.targets.values().map(|t| t.caller_count).sum();
 

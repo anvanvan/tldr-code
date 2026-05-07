@@ -265,6 +265,12 @@ pub struct DebtReport {
     pub top_files: Vec<FileDebt>,
     /// Summary statistics
     pub summary: DebtSummary,
+    /// Resolved language for the run (sibling-resolver-gaps-v1
+    /// P14.AGG14-5). Mirrors the top-level `language` field that
+    /// `clones` exposes (P13.AGG13-10) so consumers of `--lang luau`
+    /// can confirm the flag was honoured. `null` when no language was
+    /// pinned and autodetection didn't pick one.
+    pub language: Option<String>,
 }
 
 impl DebtReport {
@@ -2678,5 +2684,9 @@ pub fn analyze_debt(options: DebtOptions) -> TldrResult<DebtReport> {
             by_severity,
             by_severity_count,
         },
+        // sibling-resolver-gaps-v1 (P14.AGG14-5): expose the resolved
+        // language so consumers can confirm `--lang <X>` was honoured
+        // (mirrors the top-level `language` field on `clones`).
+        language: options.language.map(|l| l.as_str().to_string()),
     })
 }

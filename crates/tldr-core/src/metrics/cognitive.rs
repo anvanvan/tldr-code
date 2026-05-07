@@ -228,6 +228,32 @@ pub fn analyze_cognitive(path: &Path, options: &CognitiveOptions) -> TldrResult<
     // Find all functions
     let mut functions = find_all_functions(root, language, &source, &file_path, options)?;
 
+    // sibling-resolver-gaps-v1 (P14.AGG14-19): the AST walker above
+    // recognizes only the canonical JS function nodes
+    // (`function_declaration`, `arrow_function`, `method_definition`,
+    // `function`, `generator_function*`). It misses the CommonJS
+    // pattern `app.X = function name() {}` because the
+    // `assignment_expression` is the immediate parent of the
+    // function expression — the function expression itself is a
+    // `function` node, but its tree-sitter `name` field is empty when
+    // the assigned function is anonymous OR it's the inner name (which
+    // doesn't reflect the outer `app.X` exported binding). For
+    // express's `application.js` cognitive returned only 2 functions
+    // while halstead returned 19. Augment by reusing the AST extractor
+    // (the same source halstead/complexity siblings rely on) to fill
+    // in CommonJS-style assignments. The extractor knows the
+    // `app.X = function ...` shape and emits the qualified name.
+    if matches!(language, Language::JavaScript | Language::TypeScript) {
+        augment_cognitive_with_extractor_functions(
+            path,
+            language,
+            &source,
+            &file_path,
+            options,
+            &mut functions,
+        )?;
+    }
+
     // Apply function filter if specified
     if let Some(ref filter) = options.function_filter {
         functions.retain(|f| f.name.contains(filter) || f.name == *filter);
@@ -401,6 +427,96 @@ fn find_all_functions(
     }
 
     Ok(functions)
+}
+
+/// sibling-resolver-gaps-v1 (P14.AGG14-19): augment the cognitive
+/// function list with any function the AST extractor sees that the
+/// raw tree-sitter walker missed. Targets the JS CommonJS pattern
+/// `app.X = function name(){}` (and module-level
+/// `module.exports.foo = function(){}`), which `extract_file` already
+/// resolves (halstead and complexity siblings rely on this). For each
+/// extractor function whose name is not yet present in `functions`,
+/// locate the matching node via `find_function_node` and run the
+/// same cognitive calculator — preserving exact metric semantics.
+fn augment_cognitive_with_extractor_functions(
+    path: &Path,
+    language: Language,
+    source: &str,
+    file_path: &str,
+    options: &CognitiveOptions,
+    functions: &mut Vec<FunctionCognitive>,
+) -> TldrResult<()> {
+    use crate::ast::function_finder::find_function_node;
+    use crate::extract_file;
+
+    let module = match extract_file(path, None) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+
+    let tree = parse(source, language)?;
+    let root = tree.root_node();
+
+    let existing: std::collections::HashSet<String> =
+        functions.iter().map(|f| f.name.clone()).collect();
+
+    let mut candidates: Vec<(String, u32)> = Vec::new();
+    for f in &module.functions {
+        if !existing.contains(&f.name) {
+            candidates.push((f.name.clone(), f.line_number));
+        }
+    }
+    for class in &module.classes {
+        for m in &class.methods {
+            if !existing.contains(&m.name) {
+                candidates.push((m.name.clone(), m.line_number));
+            }
+        }
+    }
+
+    for (name, line) in candidates {
+        let func_node = match find_function_node(root, &name, language, source) {
+            Some(n) => n,
+            None => continue,
+        };
+        let mut calculator = CognitiveCalculator::new(name.clone(), source, language);
+        if calculator.analyze_function(func_node).is_err() {
+            continue;
+        }
+        let max_nesting = calculator.max_nesting;
+        let cyclomatic_val = calculator.cyclomatic;
+        let info = calculator.into_info();
+        let cognitive = info.score;
+        let nesting_penalty = info.nesting_penalty;
+
+        let threshold_status =
+            ThresholdStatus::from_score(cognitive, options.threshold, options.high_threshold);
+
+        let cyclomatic = if options.include_cyclomatic {
+            Some(cyclomatic_val)
+        } else {
+            None
+        };
+
+        let contributors = if options.show_contributors {
+            info.contributors
+        } else {
+            None
+        };
+
+        functions.push(FunctionCognitive {
+            name,
+            file: file_path.to_string(),
+            line,
+            cognitive,
+            cyclomatic,
+            max_nesting,
+            nesting_penalty,
+            threshold_status,
+            contributors,
+        });
+    }
+    Ok(())
 }
 
 /// Calculate summary statistics

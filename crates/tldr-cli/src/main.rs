@@ -707,7 +707,7 @@ fn run_command(cli: &Cli) -> Result<()> {
         Command::Definition(args) => args.run(cli.format, q, cli.lang),
         Command::Diff(args) => args.run(cli.format),
         // DiffImpact: archived (superseded by change-impact)
-        Command::ApiCheck(args) => args.run(cli.format, q),
+        Command::ApiCheck(args) => args.run(cli.format, q, cli.lang),
         Command::Vuln(args) => args.run(cli.format),
         // Gvn: archived
         // Fix: error diagnosis and auto-fix

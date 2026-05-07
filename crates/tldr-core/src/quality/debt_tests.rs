@@ -619,6 +619,7 @@ mod unit_tests {
                 by_severity: BTreeMap::new(),
                 by_severity_count: BTreeMap::new(),
             },
+            language: None,
         };
 
         let json = serde_json::to_value(&report).unwrap();
@@ -2322,6 +2323,7 @@ mod output_tests {
                 by_severity: BTreeMap::new(),
                 by_severity_count: BTreeMap::new(),
             },
+            language: None,
         };
 
         let text = report.to_text();
@@ -2368,6 +2370,7 @@ mod output_tests {
                 by_severity: BTreeMap::new(),
                 by_severity_count: BTreeMap::new(),
             },
+            language: None,
         };
 
         let text = report.to_text();

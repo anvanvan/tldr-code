@@ -19,7 +19,7 @@
 //! - S7-R56: Path not found error - include tried path in message
 //! - S7-R57: Unsupported language - list supported languages in error
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::Args;
@@ -140,7 +140,24 @@ impl ReferencesArgs {
         ));
 
         // Run analysis
-        let report = find_references(&self.symbol, &self.path, &options)?;
+        let mut report = find_references(&self.symbol, &self.path, &options)?;
+
+        // sibling-resolver-gaps-v1 (P14.AGG14-13): when the user
+        // searches for `m.reset` in a Lua project, the call-graph
+        // resolves the qualified `m.<method>` form but
+        // `find_references` only looks up the dotted form literally.
+        // Cross-module callers that invoke through an alias (e.g.
+        // `local files = require("files"); files.reset()`) write the
+        // call site as `<alias>.<method>(...)` so the literal lookup
+        // misses them. `tldr explain m.open` solved the same gap in
+        // P13.AGG13-12 by also querying the bare method name and
+        // accepting hits whose context is `\.<method>(`. Apply the
+        // same enrichment here so `references` agrees with `explain`.
+        let resolved_lang = cli_lang
+            .or_else(|| Language::from_directory(&self.path));
+        if matches!(resolved_lang, Some(Language::Lua) | Some(Language::Luau)) {
+            enrich_lua_alias_callers(&mut report, &self.symbol, &self.path, resolved_lang);
+        }
 
         // Filter by minimum confidence if specified
         let report = filter_by_min_confidence(report, self.min_confidence);
@@ -171,6 +188,62 @@ impl ReferencesArgs {
         }
 
         Ok(())
+    }
+}
+
+/// sibling-resolver-gaps-v1 (P14.AGG14-13): augment a Lua references
+/// report with cross-module alias callers. When the user searches for
+/// `m.reset`, also query the bare `reset` and append hits whose
+/// surrounding context looks like `<receiver>.reset(...)` (i.e. a
+/// method invocation through some alias) and which weren't already in
+/// the report. Mirrors the P13.AGG13-12 fix in `tldr explain`.
+fn enrich_lua_alias_callers(
+    report: &mut ReferencesReport,
+    symbol: &str,
+    path: &Path,
+    language: Option<Language>,
+) {
+    use std::collections::HashSet;
+    let bare = match symbol.rsplit('.').next() {
+        Some(b) if b != symbol && !b.is_empty() => b.to_string(),
+        _ => return,
+    };
+
+    let mut bare_options = ReferencesOptions::new();
+    bare_options.kinds = Some(vec![ReferenceKind::Call]);
+    bare_options.language = language.map(|l| l.as_str().to_string());
+    bare_options.limit = Some(500);
+
+    let bare_report = match find_references(&bare, path, &bare_options) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    let dot_pat = format!(".{}(", bare);
+    let space_pat = format!(".{} (", bare);
+
+    // Index existing references by (file, line, column) to dedupe.
+    let mut existing: HashSet<(PathBuf, usize, usize)> = HashSet::new();
+    for r in &report.references {
+        existing.insert((r.file.clone(), r.line, r.column));
+    }
+
+    let mut added = 0usize;
+    for r in &bare_report.references {
+        if !r.context.contains(&dot_pat) && !r.context.contains(&space_pat) {
+            continue;
+        }
+        let key = (r.file.clone(), r.line, r.column);
+        if existing.contains(&key) {
+            continue;
+        }
+        existing.insert(key);
+        report.references.push(r.clone());
+        added += 1;
+    }
+    if added > 0 {
+        report.total_references += added;
+        report.shown_references += added;
     }
 }
 

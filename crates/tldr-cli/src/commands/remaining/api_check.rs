@@ -22,6 +22,7 @@ use anyhow::Result;
 use clap::Args;
 use regex::Regex;
 use tldr_core::walker::walk_project;
+use tldr_core::Language;
 
 use super::error::RemainingError;
 use super::types::{
@@ -1301,7 +1302,12 @@ pub struct ApiCheckArgs {
 
 impl ApiCheckArgs {
     /// Run the api-check command
-    pub fn run(&self, format: crate::output::OutputFormat, quiet: bool) -> Result<()> {
+    pub fn run(
+        &self,
+        format: crate::output::OutputFormat,
+        quiet: bool,
+        global_lang: Option<Language>,
+    ) -> Result<()> {
         let writer = OutputWriter::new(format, quiet);
 
         writer.progress(&format!(
@@ -1313,6 +1319,17 @@ impl ApiCheckArgs {
         if !self.path.exists() {
             return Err(RemainingError::file_not_found(&self.path).into());
         }
+
+        // sibling-resolver-gaps-v1 (P14.AGG14-5): the global `-l/--lang`
+        // flag (defined in `Cli` and honoured by 30+ sibling commands)
+        // was silently ignored by `api-check`, so
+        // `tldr api-check --lang luau /tmp/repos/luau-luau` would scan
+        // every `.cpp`/`.h`/`.lua`/`.luau`/`.py` file in the tree (89
+        // findings across hundreds of files). P13.AGG13-10 fixed
+        // `clones` for the same flag; mirror the pattern here. When the
+        // global lang maps to a known `ApiLanguage`, restrict the
+        // `detect_language` dispatch to only that language.
+        let lang_filter: Option<ApiLanguage> = global_lang.and_then(map_language_to_api_language);
 
         let all_rules_count = all_api_languages()
             .iter()
@@ -1331,6 +1348,13 @@ impl ApiCheckArgs {
             let Some(language) = detect_language(file_path) else {
                 continue;
             };
+            // P14.AGG14-5: if user pinned a specific language, skip files
+            // whose extension resolves to a different ApiLanguage.
+            if let Some(want) = lang_filter {
+                if language != want {
+                    continue;
+                }
+            }
             let rules = rules_for_language(language);
             match analyze_file(file_path, &rules, language) {
                 Ok(findings) => {
@@ -1420,6 +1444,35 @@ fn collect_files(path: &Path) -> Result<Vec<PathBuf>> {
 /// Check if a path has a supported extension.
 fn is_supported_file(path: &Path) -> bool {
     detect_language(path).is_some()
+}
+
+/// sibling-resolver-gaps-v1 (P14.AGG14-5): map the global `Language`
+/// enum (used by the top-level `--lang/-l` flag) to the
+/// `ApiLanguage` variant the api-check engine uses internally. Returns
+/// `None` for languages api-check has no rule pack for, in which case
+/// the caller should not apply a filter (preserve current behaviour for
+/// those langs rather than blocking the run).
+fn map_language_to_api_language(lang: Language) -> Option<ApiLanguage> {
+    match lang {
+        Language::Python => Some(ApiLanguage::Python),
+        Language::Rust => Some(ApiLanguage::Rust),
+        Language::Go => Some(ApiLanguage::Go),
+        Language::Java => Some(ApiLanguage::Java),
+        Language::JavaScript => Some(ApiLanguage::JavaScript),
+        Language::TypeScript => Some(ApiLanguage::TypeScript),
+        Language::C => Some(ApiLanguage::C),
+        Language::Cpp => Some(ApiLanguage::Cpp),
+        Language::Ruby => Some(ApiLanguage::Ruby),
+        Language::Php => Some(ApiLanguage::Php),
+        Language::Kotlin => Some(ApiLanguage::Kotlin),
+        Language::Swift => Some(ApiLanguage::Swift),
+        Language::CSharp => Some(ApiLanguage::CSharp),
+        Language::Scala => Some(ApiLanguage::Scala),
+        Language::Elixir => Some(ApiLanguage::Elixir),
+        Language::Lua => Some(ApiLanguage::Lua),
+        Language::Luau => Some(ApiLanguage::Luau),
+        Language::Ocaml => Some(ApiLanguage::Ocaml),
+    }
 }
 
 pub(crate) fn detect_language(path: &Path) -> Option<ApiLanguage> {
