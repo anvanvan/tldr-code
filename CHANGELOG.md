@@ -1,5 +1,71 @@
 # Changelog
 
+## quality-metrics-and-schema-v1 — internal milestone
+
+NOT a published release. Third milestone in P13 cleanup, addressing
+eight quality-metric and schema-shape bugs surfaced by the phase-13
+audit. Six bugs were reproduced live against the release binary on real
+repos under `/tmp/repos/<corpus>` BEFORE any fix; **two were
+already-fixed by earlier milestones (AGG13-8 dice cache race, AGG13-17
+C smells summary)** and are pinned with regression tests rather than
+reimplemented.
+
+### Per-bug pre/post-fix evidence
+
+| Bug ID         | Pre-fix repro                                                                                                                                | Pre-fix result                                                                                                  | Post-fix result                                                                                                |
+|----------------|----------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| P13.AGG13-6    | `tldr coupling spring-petclinic/.../OwnerController.java spring-petclinic/.../Owner.java --format json`                                       | `total_calls: 0, coupling_score: 0.0, verdict: low`                                                              | `total_calls: 5, coupling_score: 0.10`; calls include `Owner.getId@86,114,149`, `Owner.getLastName@98`, `Owner.setId@155` (matches the 5 real `owner.<method>` sites) |
+| P13.AGG13-8    | `tldr dice spring-petclinic/.../OwnerController.java spring-petclinic/.../VisitController.java --format json` ×3                              | `tokens2_count: 4` on first invocation (corrupt; should be ~452)                                                | `tokens2_count: 452` consistently across 3 consecutive runs (pinned by regression test; no code change required — fixed by an earlier milestone) |
+| P13.AGG13-9    | `tldr halstead /tmp/repos/ocaml-dune/vendor/opam/src/core/opamStd.ml --format json`                                                           | 99 of 195 functions hit `difficulty: 1000.0` sentinel (every n2=0 function — 1-line lets, record-pattern lets) | 0 functions hit the sentinel; all 99 n2=0 functions now report difficulty < 50.0 (the operator-only `n1/2` fallback) |
+| P13.AGG13-11   | `tldr diff opamFile.ml opamFile.mli --format json`                                                                                            | 4 changes (only top-level `let` bindings; .mli `val` declarations invisible to the diff extractor)              | 37 changes (13 deletes + 24 moves); .mli `value_specification` nodes now extracted as functions and paired against .ml `let_binding` |
+| P13.AGG13-14   | `tldr references findOwner /tmp/repos/spring-petclinic/src/main/java --format json`                                                            | `definitions: []`, but `references[]` has 2 entries with `kind: definition` (schema invariant violated)        | `definitions: [2 entries]` matching the file+line of the references-with-kind-definition; back-compat preserved (entries stay in `references[]`) |
+| P13.AGG13-15   | `tldr reaching-defs spring-petclinic/.../OwnerController.java findPaginatedForOwnersLastName --format json`                                    | 4 false positives: `PageRequest`, `of`, `owners`, `findByLastNameStartingWith` flagged as `severity: definite` | 0 false positives for imported types / method names. (Remaining `owners` flag is a separate this-field-access category, not in AGG13-15 scope.) |
+| P13.AGG13-17   | `tldr smells /tmp/repos/c-sds --format json`                                                                                                  | `summary: null` (other fields populated)                                                                        | `summary: {total_smells: 9, by_type: {Long Method: 8, Deep Nesting: 1}, avg_smells_per_file: 9.0}` (pinned by regression test; no code change — fixed by an earlier milestone) |
+| P13.AGG13-18   | `tldr patterns /tmp/repos/php-symfony-string --format json \| jq '.naming.violations[] \| select(.name\|startswith("__"))'`                    | 5 dunder false positives: `__construct` ×4, `__invoke` ×1                                                       | 0 dunder false positives; non-magic snake_case violations still flagged (verified on a synthetic majority-snake repo) |
+
+### Multi-language verification (cross-cutting fixes)
+
+- **AGG13-9 (halstead n2=0 fallback):** opamStd.ml (ocaml, 99 n2=0 funcs ⇒ difficulty < 50), sds.c, OwnerController.java, flask app.py, tinyxml2.cpp, dfg/extractor.rs (rust). 0 sentinel-hits across all 6 files.
+- **AGG13-14 (references definitions[] schema):** findOwner (java, 2/2), fatal (ocaml, 2/7), ReadAsync (csharp, 1/5), Flask (python, 1/20 — control), find_definitions (rust, 1/3 — control). All 5 langs honour the `definitions[]` invariant.
+- **AGG13-15 (reaching-defs FP scoped to Java/CSharp):** java findPaginated (4 FP → 0), scala attempt (3 uninits — unchanged, not in scope), python __init__ (38 uninits — unchanged, not in scope). Scope is correctly limited to `Language::Java | Language::CSharp`.
+- **AGG13-17 (smells summary):** c-sds, cpp-tinyxml2, spring-petclinic/src, php-symfony-string, express — `summary` is a populated object on all 5 (pre-fix C alone returned null).
+
+### Mini-audit on touched commands
+
+5 command × 5+ repo grid (cached at `/tmp/p13c_miniaudit_*.txt`):
+
+- `coupling`: java×2 PASS, csharp PASS, python PASS, rust PASS — no regressions on previously-passing pairs; the new param-typed path only fires when the receiver matches a parameter name AND the type is in callee.defined_names, so other languages are unaffected.
+- `halstead`: 0 sentinel-hits across 6 files spanning 6 languages.
+- `references`: definitions[] populated for java/ocaml/csharp; python/rust unaffected (their `find_definitions` was already implemented).
+- `smells`: summary populated for c/cpp/java/php/js.
+- `reaching-defs`: java FPs eliminated; scala/python unaffected (filter is correctly scoped).
+
+### Files changed (source only — no Cargo.lock, no continuum/)
+
+- `crates/tldr-core/src/metrics/types.rs` — AGG13-9: replace `difficulty = 1000.0` sentinel with `n1 / 2.0` fallback; updated unit test.
+- `crates/tldr-core/src/analysis/references.rs` — AGG13-14: promote `kind = Definition` references into `definitions[]` for languages whose `find_definitions` returns `Ok(None)`.
+- `crates/tldr-core/src/dfg/extractor.rs` — AGG13-15: collect `import_declaration` simple names per file and reject Java/CSharp identifiers that are method names or imported-type receivers.
+- `crates/tldr-core/src/patterns/naming.rs` — AGG13-18: `is_magic_dunder` allow-list applied in `find_violations` (PHP/Python magic methods).
+- `crates/tldr-cli/src/commands/remaining/diff.rs` — AGG13-11: extract OCaml `value_specification` nodes (.mli `val` declarations) as functions for diff pairing.
+- `crates/tldr-cli/src/commands/patterns/coupling.rs` — AGG13-6: collect `(param_name, type_name)` per function and `(receiver, method)` per call site for object-typed languages; resolve parameter-typed receivers in `find_cross_calls`.
+- `crates/tldr-cli/tests/quality_metrics_and_schema_v1.rs` — new test file, 10 tests, real-repo gated, all PASS.
+- `CHANGELOG.md` — this entry.
+
+### Test counts
+
+```
+quality_metrics_and_schema_v1: 10 passed; 0 failed; 0 ignored
+language_adapter_fixes_v1:     14 passed; 0 failed; 0 ignored  (P13-B GREEN)
+critical_regressions_v1:       13 passed; 0 failed; 0 ignored  (P13-A GREEN)
+vuln_migration_v1_red:        168 passed; 0 failed; 0 ignored
+language_command_matrix:      926 passed; 0 failed; 28 ignored
+```
+
+### Known pre-existing issues (NOT in scope, NOT fixed)
+
+- `crates/tldr-core/src/ast/extract.rs:7573` calls `parse_file(file.path())` but the symbol in scope is `parse_file_with_lang`; `cargo test -p tldr-core --lib` fails to compile. Pre-existing at HEAD `b3888a1` — verified via `git show HEAD:crates/tldr-core/src/ast/extract.rs | grep parse_file`. Out of scope for this milestone.
+- `crates/tldr-cli/tests/api_check_and_patterns_accuracy_v1.rs::test_patterns_real_repo_cpp_tinyxml2` was reported by P13-B as already-failing (corpus drift, expects 3 .cpp files, only 2 checked out). Not touched here.
+
 ## language-adapter-fixes-v1 — internal milestone
 
 NOT a published release. Second milestone in P13 cleanup, addressing four

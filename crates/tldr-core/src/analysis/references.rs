@@ -3288,7 +3288,37 @@ pub fn find_references(
     // M3 detection-accuracy-v1 BUG-20: collect ALL definitions, not just the
     // first one. `definition` (singular) is preserved for back-compat as the
     // first entry; `definitions` (plural) carries the full set.
-    let definitions = find_definitions(symbol, root, language)?;
+    let mut definitions = find_definitions(symbol, root, language)?;
+
+    // AGG13-14 (quality-metrics-and-schema-v1): `find_definitions` only
+    // implements per-language definition detection for python/ts/js/go/rust.
+    // For java, csharp, ocaml (and other unimplemented languages),
+    // `definitions[]` was always empty even when the AST verifier already
+    // classified one of the verified references as `kind=Definition`.
+    // The schema invariant "every definition appears in `definitions[]`"
+    // was therefore violated for those languages. Promote any
+    // `kind=Definition` reference into `definitions[]` when
+    // `find_definitions` did not already report it (matched by file+line).
+    // We deliberately keep the original `references[]` entry intact for
+    // back-compat with downstream consumers that already iterated the
+    // unified list.
+    for r in &references {
+        if r.kind != ReferenceKind::Definition {
+            continue;
+        }
+        let already = definitions
+            .iter()
+            .any(|d| d.file == r.file && d.line == r.line);
+        if already {
+            continue;
+        }
+        let kind = match r.kind {
+            ReferenceKind::Definition => DefinitionKind::Function,
+            _ => DefinitionKind::Other,
+        };
+        definitions.push(Definition::new(r.file.clone(), r.line, r.column, kind));
+    }
+
     let definition = definitions.first().cloned();
 
     // Apply kind filter if specified (Phase 13)

@@ -689,6 +689,24 @@ fn extract_nodes_recursive(
         return;
     }
 
+    // AGG13-11 (quality-metrics-and-schema-v1): OCaml interface files
+    // (.mli) declare exported functions/values via `val name : type`,
+    // which tree-sitter parses as `value_specification`. Pre-fix the
+    // diff extractor only knew about `value_definition` (the .ml
+    // `let name ... = body` form), so .mli files extracted ZERO
+    // function nodes. That made `tldr diff dag.ml dag.mli` report
+    // `identical: true` (or near-identical) even when the impl was
+    // 102 LOC and the interface was 16 LOC. Treating each `val`
+    // declaration as a function lets the diff pair .ml `let` bindings
+    // against their .mli `val` declarations and surface the body
+    // diff (deleted on the .mli side, present on the .ml side).
+    if lang == Language::Ocaml && kind == "value_specification" {
+        if let Some(extracted) = extract_ocaml_value_spec(node, source) {
+            nodes.push(extracted);
+        }
+        return;
+    }
+
     // Check if this is a function node
     if kinds.func.contains(&kind) {
         if let Some(extracted) = extract_function_node(node, source, in_class, lang) {
@@ -726,6 +744,46 @@ fn ocaml_let_binding_is_function(node: Node) -> bool {
         }
     }
     false
+}
+
+/// Extract an OCaml `value_specification` (the `val name : type` form
+/// found in .mli interface files) as an [`ExtractedNode`]. AGG13-11
+/// (quality-metrics-and-schema-v1): without this, .mli files surface
+/// zero function nodes in the diff extractor and any `tldr diff
+/// foo.ml foo.mli` reports identical=true (or near-identical),
+/// missing the actual implementation/interface delta.
+///
+/// Tree-sitter-ocaml shape:
+/// `value_specification` -> "val" `value_name` ":" `typed` (optional `type_constraint`)
+/// We use `value_name` for the extracted node's `name` so it pairs
+/// against the matching `let_binding` (.ml side).
+fn extract_ocaml_value_spec(node: Node, source: &[u8]) -> Option<ExtractedNode> {
+    // Find the value_name child (the actual function/value name).
+    let mut name = None;
+    for child in node.children(&mut node.walk()) {
+        if child.kind() == "value_name" {
+            name = Some(node_text(child, source).to_string());
+            break;
+        }
+    }
+    let name = name?;
+    if name.is_empty() {
+        return None;
+    }
+
+    let line = node.start_position().row as u32 + 1;
+    let end_line = node.end_position().row as u32 + 1;
+    let column = node.start_position().column as u32;
+    let body = node_text(node, source).to_string();
+
+    Some(ExtractedNode::new(
+        name,
+        NodeKind::Function,
+        line,
+        end_line,
+        column,
+        body,
+    ))
 }
 
 fn extract_function_node(

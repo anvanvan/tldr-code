@@ -125,6 +125,21 @@ pub struct ModuleInfo {
     pub calls: Vec<(String, String, u32)>,
     /// Total function count for normalization
     pub function_count: u32,
+    /// AGG13-6 (quality-metrics-and-schema-v1): parameter-type bindings
+    /// per enclosing function — `caller_func -> [(param_name, type_name)]`.
+    /// Lets `find_cross_calls` resolve method invocations on parameter
+    /// objects (`owner.getId()` where `owner: Owner`) by looking up the
+    /// parameter name in this map and checking whether the callee
+    /// module defines a class with the matching type name. Only
+    /// populated for object-typed languages (Java, C#, PHP, Scala) —
+    /// other languages leave the field empty and behave as before.
+    pub param_types: HashMap<String, Vec<(String, String)>>,
+    /// AGG13-6: receiver-aware call sites — `(caller_func, receiver_name,
+    /// callee_method, line)`. Populated alongside `calls` for the same
+    /// languages as `param_types`. The receiver is the identifier on
+    /// the LHS of `recv.method(...)`; it is `None` (filtered out below)
+    /// for bare `method(...)` and `Static.method(...)` calls.
+    pub method_calls: Vec<(String, String, String, u32)>,
 }
 
 impl ModuleInfo {
@@ -135,6 +150,8 @@ impl ModuleInfo {
             imports: HashMap::new(),
             calls: Vec::new(),
             function_count: 0,
+            param_types: HashMap::new(),
+            method_calls: Vec::new(),
         }
     }
 }
@@ -449,6 +466,29 @@ fn extract_definitions_recursive(
                 info.defined_names.insert(name.clone());
                 info.function_count += 1;
                 extract_calls_generic(&child, source, &name, &mut info.calls, config, lang);
+                // AGG13-6: also collect param-type bindings + receiver-aware
+                // method calls for object-typed languages so cross-call
+                // detection can resolve `param.method()` against the
+                // callee's defined classes.
+                if matches!(
+                    lang,
+                    TldrLanguage::Java
+                        | TldrLanguage::CSharp
+                        | TldrLanguage::Php
+                        | TldrLanguage::Scala
+                ) {
+                    let params = extract_param_types(&child, source, lang);
+                    if !params.is_empty() {
+                        info.param_types.insert(name.clone(), params);
+                    }
+                    extract_method_calls_with_receiver(
+                        &child,
+                        source,
+                        &name,
+                        &mut info.method_calls,
+                        lang,
+                    );
+                }
             }
         }
         // Check for class/type definitions
@@ -1045,6 +1085,203 @@ fn extract_calls_generic(
     }
 }
 
+/// AGG13-6 (quality-metrics-and-schema-v1): extract `(param_name,
+/// type_name)` pairs from a Java / C# / PHP / Scala method definition.
+/// Returns an empty Vec when the function has no typed parameters or
+/// when the language layout is not recognized. This lets
+/// `find_cross_calls` map `owner.getId()` (where the enclosing method
+/// took an `Owner owner` parameter) back to the defining class
+/// `Owner` and count the method invocation as cross-module coupling.
+///
+/// Tree-sitter shapes consulted:
+/// - Java `formal_parameter` -> `type: type_identifier`, `name: identifier`
+/// - C# `parameter`         -> `type: predefined_type|identifier|...`, `name: identifier`
+/// - PHP `simple_parameter` -> `type: named_type` (optional), `name: variable_name`
+/// - Scala `parameters` ->  `parameter` -> `name: identifier`, `type: type_identifier`
+fn extract_param_types(
+    func_node: &Node,
+    source: &str,
+    lang: TldrLanguage,
+) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+
+    // Locate the parameters list
+    let params_field = match lang {
+        TldrLanguage::Java | TldrLanguage::CSharp | TldrLanguage::Scala => func_node
+            .child_by_field_name("parameters")
+            .or_else(|| func_node.child_by_field_name("formal_parameters")),
+        TldrLanguage::Php => func_node.child_by_field_name("parameters"),
+        _ => None,
+    };
+    let Some(params_node) = params_field else {
+        return result;
+    };
+
+    let mut cursor = params_node.walk();
+    for param in params_node.children(&mut cursor) {
+        let pkind = param.kind();
+        // Filter to actual parameter nodes; tree-sitter exposes
+        // punctuation children we don't want to recurse into.
+        if !matches!(
+            pkind,
+            "formal_parameter"
+                | "parameter"
+                | "simple_parameter"
+                | "spread_parameter"
+                | "typed_parameter"
+                | "class_parameter"
+        ) {
+            continue;
+        }
+
+        // Type extraction: most grammars expose a `type` field.
+        let type_node = param.child_by_field_name("type");
+        let type_name = type_node
+            .map(|t| extract_leaf_identifier(&t, source))
+            .unwrap_or_default();
+
+        if type_name.is_empty() {
+            continue;
+        }
+
+        // Name extraction. Java/Scala use `name` field; PHP uses
+        // `variable_name`. Strip the PHP `$` sigil for matching
+        // against call-site receivers.
+        let name_node = param
+            .child_by_field_name("name")
+            .or_else(|| first_named_kind(&param, "variable_name"));
+        let Some(name_node) = name_node else {
+            continue;
+        };
+        let mut param_name = node_text(&name_node, source);
+        if let Some(stripped) = param_name.strip_prefix('$') {
+            param_name = stripped.to_string();
+        }
+        if param_name.is_empty() {
+            continue;
+        }
+
+        result.push((param_name, type_name));
+    }
+
+    result
+}
+
+/// Find the first child of `node` whose kind matches `target_kind`.
+/// Lightweight helper for AGG13-6 PHP variable-name extraction.
+fn first_named_kind<'tree>(node: &Node<'tree>, target_kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == target_kind {
+            return Some(child);
+        }
+    }
+    None
+}
+
+/// AGG13-6: walk a function body and collect every method invocation
+/// of the form `receiver.method(...)`, recording the receiver
+/// identifier text. Used together with `extract_param_types` so
+/// `find_cross_calls` can match parameter-typed receivers against
+/// classes defined in the other module. Bare calls (`method(...)`)
+/// and static-class calls (`Static.method(...)`) are NOT recorded
+/// here — those are already handled by `find_cross_calls` via the
+/// existing `imports` lookup.
+fn extract_method_calls_with_receiver(
+    func_node: &Node,
+    source: &str,
+    caller_name: &str,
+    method_calls: &mut Vec<(String, String, String, u32)>,
+    lang: TldrLanguage,
+) {
+    let mut stack = vec![*func_node];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        let is_method_call = match lang {
+            TldrLanguage::Java => kind == "method_invocation",
+            TldrLanguage::CSharp => kind == "invocation_expression",
+            TldrLanguage::Php => kind == "member_call_expression",
+            TldrLanguage::Scala => kind == "call_expression",
+            _ => false,
+        };
+
+        if is_method_call {
+            if let Some((receiver, method)) = extract_receiver_and_method(&node, source, lang) {
+                let line = node.start_position().row as u32 + 1;
+                method_calls.push((caller_name.to_string(), receiver, method, line));
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+/// Extract `(receiver_name, method_name)` from a method-call node.
+/// Returns `None` for bare calls (no receiver) or when the receiver
+/// is not a simple identifier (e.g. `getOwner().setName()` has a
+/// call-expression receiver — we don't try to unify those because
+/// we lack return-type info).
+fn extract_receiver_and_method(
+    call_node: &Node,
+    source: &str,
+    lang: TldrLanguage,
+) -> Option<(String, String)> {
+    match lang {
+        TldrLanguage::Java => {
+            let object = call_node.child_by_field_name("object")?;
+            // Only handle simple identifier receivers — chained calls
+            // like `getOwner().setName()` need return-type info we
+            // don't have, so we skip them rather than guess.
+            if object.kind() != "identifier" {
+                return None;
+            }
+            let name = call_node.child_by_field_name("name")?;
+            Some((node_text(&object, source), node_text(&name, source)))
+        }
+        TldrLanguage::CSharp => {
+            let func = call_node.child_by_field_name("function")?;
+            if func.kind() != "member_access_expression" {
+                return None;
+            }
+            let object = func.child_by_field_name("expression")?;
+            if object.kind() != "identifier" {
+                return None;
+            }
+            let name = func.child_by_field_name("name")?;
+            Some((node_text(&object, source), node_text(&name, source)))
+        }
+        TldrLanguage::Php => {
+            let object = call_node.child_by_field_name("object")?;
+            if object.kind() != "variable_name" {
+                return None;
+            }
+            // Strip `$` sigil to match the parameter-type table.
+            let mut recv = node_text(&object, source);
+            if let Some(stripped) = recv.strip_prefix('$') {
+                recv = stripped.to_string();
+            }
+            let name = call_node.child_by_field_name("name")?;
+            Some((recv, node_text(&name, source)))
+        }
+        TldrLanguage::Scala => {
+            let func = call_node.child_by_field_name("function")?;
+            if func.kind() != "field_expression" {
+                return None;
+            }
+            let object = func.child_by_field_name("value")?;
+            if object.kind() != "identifier" {
+                return None;
+            }
+            let name = func.child_by_field_name("field")?;
+            Some((node_text(&object, source), node_text(&name, source)))
+        }
+        _ => None,
+    }
+}
+
 /// Extract the callee name from a call node (generic, multi-language).
 ///
 /// Handles:
@@ -1170,6 +1407,53 @@ pub fn find_cross_calls(caller: &ModuleInfo, callee: &ModuleInfo) -> CrossCalls 
                 callee: callee_name.clone(),
                 line: *line,
             });
+        }
+    }
+
+    // AGG13-6 (quality-metrics-and-schema-v1): Java/C#/PHP/Scala
+    // parameter-typed method calls. Pre-fix `OwnerController.coupling
+    // (Owner.java) = 0` even though OwnerController calls
+    // `owner.getId()`, `owner.getLastName()`, `owner.setId()` 5+
+    // times — because the receiver `owner` is a method *parameter*,
+    // not an imported symbol, the simple `imports.contains_key`
+    // check missed every site. Match each receiver-aware call site
+    // against the enclosing function's parameter-type table; if the
+    // receiver's type is a class defined in the callee module, count
+    // the call as a cross-module dependency.
+    for (caller_func, receiver, method, line) in &caller.method_calls {
+        let Some(params) = caller.param_types.get(caller_func) else {
+            continue;
+        };
+        let Some(type_name) = params
+            .iter()
+            .find(|(pname, _)| pname == receiver)
+            .map(|(_, t)| t)
+        else {
+            continue;
+        };
+
+        // The receiver's static type must be a class defined in the
+        // callee module — that's what makes this a cross-module
+        // edge. We deliberately do NOT require the method itself to
+        // be in `defined_names`: defined_names typically holds class
+        // and top-level function names, not member methods, so an
+        // exact-method check would over-filter (e.g. `getId` is a
+        // generated bean accessor on `Owner`, not in
+        // `defined_names`). The presence of the type is sufficient
+        // evidence of coupling.
+        if callee.defined_names.contains(type_name) {
+            // Avoid double-counting the same call site if the simple
+            // imports-based loop above already recorded it.
+            let already = calls
+                .iter()
+                .any(|c: &CrossCall| c.caller == *caller_func && c.line == *line);
+            if !already {
+                calls.push(CrossCall {
+                    caller: caller_func.clone(),
+                    callee: format!("{}.{}", type_name, method),
+                    line: *line,
+                });
+            }
         }
     }
 

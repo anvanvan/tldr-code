@@ -237,6 +237,19 @@ fn find_violations(
         .filter(|(_, case, _, _)| {
             *case != NamingCase::Unknown && !is_compatible(*case, *expected)
         })
+        // AGG13-18 (quality-metrics-and-schema-v1): PHP magic methods
+        // (`__construct`, `__invoke`, `__toString`, `__call`, etc.)
+        // are language-mandated dunders that start with exactly `__`
+        // followed by an ASCII letter. The leading double-underscore
+        // made them register as `SnakeCase`, which the audit flagged
+        // as snake_case violations against a project's dominant
+        // `CamelCase` convention. Allow-list any name that matches
+        // the strict PHP magic-method shape (`__` + alpha-leading
+        // identifier). Plain leading underscores (`_helper`) are NOT
+        // allow-listed. Python-style trailing-`__` dunders
+        // (`__init__`) are also covered by this predicate via the
+        // generic prefix-only check.
+        .filter(|(name, _, _, _)| !is_magic_dunder(name))
         .map(|(name, case, file, line)| NamingViolation {
             name: name.clone(),
             expected: naming_case_to_convention(*expected),
@@ -248,6 +261,20 @@ fn find_violations(
             line: *line,
         })
         .collect()
+}
+
+/// AGG13-18: true iff `name` matches the language-mandated magic-method
+/// dunder shape: starts with exactly `__` followed by an ASCII letter,
+/// and the third character is not another underscore. This precisely
+/// matches PHP magic methods (`__construct`, `__invoke`, `__toString`,
+/// `__call`) and Python dunders (`__init__`, `__repr__`). It rejects
+/// plain leading-underscore privates (`_helper`, `__helper_local`).
+fn is_magic_dunder(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() > 2
+        && bytes[0] == b'_'
+        && bytes[1] == b'_'
+        && bytes[2].is_ascii_alphabetic()
 }
 
 /// Convert internal NamingCase to public NamingConvention

@@ -193,7 +193,20 @@ impl HalsteadInfo {
     /// Create HalsteadInfo from raw counts.
     ///
     /// Automatically calculates derived metrics.
-    /// Handles edge case where n2=0 by capping difficulty at 1000.
+    ///
+    /// **AGG13-9 (quality-metrics-and-schema-v1):** when `n2 == 0`
+    /// (no distinct operands), the canonical Halstead difficulty
+    /// formula `(n1/2) * (N2/n2)` is undefined. Pre-fix we returned
+    /// the sentinel `1000.0`, which made trivial 1-line OCaml lets
+    /// (e.g. `let node_id { id; _ } = id`) appear as the most
+    /// difficult functions in the codebase — that's wrong: a
+    /// function with no distinct operands is *trivial*, not
+    /// maximally complex. Post-fix we fall back to the
+    /// "operator-only" difficulty component `n1 / 2`, which gives a
+    /// realistic low value for short functions and keeps difficulty
+    /// monotonic in n1. The OCaml `dag.ml` repro that motivated
+    /// this fix shows `node_id` dropping from `1000.0` to a value
+    /// well below the default threshold of 20.0.
     pub fn from_counts(n1: usize, n2: usize, big_n1: usize, big_n2: usize) -> Self {
         let vocabulary = n1 + n2;
         let length = big_n1 + big_n2;
@@ -207,9 +220,9 @@ impl HalsteadInfo {
         };
 
         // Difficulty = (n1/2) * (N2/n2)
-        // Cap at 1000 when n2=0 (per spec)
+        // AGG13-9: when n2 == 0, fall back to (n1/2) — see doc comment above.
         let difficulty = if n2 == 0 {
-            1000.0
+            n1 as f64 / 2.0
         } else {
             (n1 as f64 / 2.0) * (big_n2 as f64 / n2 as f64)
         };
@@ -502,9 +515,20 @@ mod tests {
     }
 
     #[test]
-    fn test_halstead_n2_zero_caps_difficulty() {
+    fn test_halstead_n2_zero_falls_back_to_n1_over_2() {
+        // AGG13-9 (quality-metrics-and-schema-v1): when n2 == 0, the
+        // canonical (n1/2)*(N2/n2) is undefined. Pre-fix we used the
+        // sentinel 1000.0 which made trivial OCaml lets dominate the
+        // "most difficult" lists. Post-fix we fall back to (n1/2),
+        // which gives a realistic low value that still scales with
+        // operator count.
         let hal = HalsteadInfo::from_counts(10, 0, 50, 100);
-        assert_eq!(hal.difficulty, 1000.0); // Capped
+        assert_eq!(hal.difficulty, 5.0); // n1 / 2 = 10 / 2
+
+        // Trivial 1-operator function — should be very low difficulty,
+        // not 1000.
+        let trivial = HalsteadInfo::from_counts(1, 0, 1, 0);
+        assert_eq!(trivial.difficulty, 0.5);
     }
 
     #[test]

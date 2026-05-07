@@ -104,7 +104,8 @@ pub(crate) fn extract_dfg_from_tree(
     let func_node = find_function_node(root, function_name, language, source);
 
     match func_node {
-        Some(node) => build_dfg_for_function(node, function_name, source, language),
+        // AGG13-15: pass file root so the builder can collect imports.
+        Some(node) => build_dfg_for_function(node, root, function_name, source, language),
         None => Err(TldrError::function_not_found(function_name)),
     }
 }
@@ -129,6 +130,9 @@ pub(crate) fn extract_dfg_from_tree_with_cfg(
         .ok_or_else(|| TldrError::function_not_found(function_name))?;
 
     let mut builder = DfgBuilder::new(function_name.to_string(), source, language);
+    // AGG13-15: pre-populate import set BEFORE extracting refs so
+    // is_use_context can consult it during traversal.
+    builder.collect_imports(root);
     builder.extract_parameters(func_node)?;
     let body_node = get_function_body(func_node, language);
     if let Some(body) = body_node {
@@ -141,11 +145,16 @@ pub(crate) fn extract_dfg_from_tree_with_cfg(
 /// Build DFG for a function node
 fn build_dfg_for_function(
     func_node: Node,
+    root: Node,
     function_name: &str,
     source: &str,
     language: Language,
 ) -> TldrResult<DfgInfo> {
     let mut builder = DfgBuilder::new(function_name.to_string(), source, language);
+
+    // AGG13-15: collect file-level imports so Java/C# `PageRequest`
+    // / `Sort` style identifiers can be classified as not-a-use.
+    builder.collect_imports(root);
 
     // First, extract function parameters as definitions
     builder.extract_parameters(func_node)?;
@@ -172,6 +181,16 @@ struct DfgBuilder<'a> {
     language: Language,
     refs: Vec<VarRef>,
     variables: HashSet<String>,
+    /// AGG13-15 (quality-metrics-and-schema-v1): file-level imported
+    /// type/class names. For Java / C# the reaching-defs analyzer was
+    /// flagging imported class identifiers (e.g. `PageRequest`,
+    /// `Sort`) as uninitialized variable uses because every static
+    /// method call `PageRequest.of(...)` exposes `PageRequest` as a
+    /// bare `identifier` in the AST. Tracking the set of imported
+    /// simple names lets `is_use_context` reject such identifiers
+    /// when they are the receiver of a `method_invocation` /
+    /// `field_access`. Empty for languages that don't need this filter.
+    imported_type_names: HashSet<String>,
 }
 
 impl<'a> DfgBuilder<'a> {
@@ -182,6 +201,40 @@ impl<'a> DfgBuilder<'a> {
             language,
             refs: Vec::new(),
             variables: HashSet::new(),
+            imported_type_names: HashSet::new(),
+        }
+    }
+
+    /// AGG13-15: populate `imported_type_names` from a Java/C# file root.
+    /// Java `import_declaration` is `import a.b.C;` — the simple name is
+    /// the last dotted segment (`C`). `import static a.b.C.method;`
+    /// imports a static member; we capture the last segment as well.
+    /// For other languages this is a no-op (the field stays empty).
+    fn collect_imports(&mut self, root: Node) {
+        if !matches!(self.language, Language::Java | Language::CSharp) {
+            return;
+        }
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let kind = node.kind();
+            // Java: import_declaration child layout is roughly
+            //   "import" ("static")? scoped_identifier ("." "*")? ";"
+            // The scoped_identifier holds the last identifier we want.
+            // C#: using_directive child layout is
+            //   "using" ("static")? qualified_name ";"
+            if kind == "import_declaration" || kind == "using_directive" {
+                if let Some(name) = last_identifier_text(node, self.source) {
+                    self.imported_type_names.insert(name);
+                }
+                continue;
+            }
+            // Don't descend into class/method bodies — imports are top-level.
+            if matches!(kind, "class_declaration" | "method_declaration") {
+                continue;
+            }
+            for child in node.children(&mut node.walk()) {
+                stack.push(child);
+            }
         }
     }
 
@@ -1950,6 +2003,54 @@ impl<'a> DfgBuilder<'a> {
     /// to determine if this identifier is a target of assignment/declaration
     /// (and therefore NOT a use).
     fn is_use_context(&self, node: Node) -> bool {
+        // AGG13-15 (quality-metrics-and-schema-v1): Java/C# method-name
+        // and imported-type identifiers are NOT variable uses. The
+        // pre-fix output flagged `PageRequest`, `Sort`, `of`,
+        // `findByLastNameStartingWith` (in `PageRequest.of(...)` and
+        // `owners.findByLastNameStartingWith(...)`) as `uninitialized`
+        // variables with `severity: definite`. Classify these out of
+        // the use-context set so they never enter the reaching-defs
+        // analyzer in the first place.
+        if matches!(self.language, Language::Java | Language::CSharp) {
+            if let Some(parent) = node.parent() {
+                let pkind = parent.kind();
+                // Method name: `obj.method()` -> `method` is the `name`
+                // field of `method_invocation` / `invocation_expression`.
+                // It is never a variable reference.
+                if matches!(pkind, "method_invocation" | "invocation_expression") {
+                    if let Some(name_field) = parent.child_by_field_name("name") {
+                        if name_field.id() == node.id() {
+                            return false;
+                        }
+                    }
+                }
+                // Field-access receiver / method-invocation receiver
+                // matching an imported type name: `PageRequest.of(...)`,
+                // `Sort.by(...)`. The text of the identifier matches a
+                // simple name we collected from the file's
+                // `import_declaration` list.
+                if matches!(
+                    pkind,
+                    "method_invocation"
+                        | "invocation_expression"
+                        | "field_access"
+                        | "member_access_expression"
+                ) {
+                    let object_field = parent
+                        .child_by_field_name("object")
+                        .or_else(|| parent.child_by_field_name("expression"));
+                    if let Some(obj) = object_field {
+                        if obj.id() == node.id() {
+                            let text = node.utf8_text(self.source.as_bytes()).unwrap_or("");
+                            if !text.is_empty() && self.imported_type_names.contains(text) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(parent) = node.parent() {
             if let Some(is_use) = self.parent_use_context(parent, node) {
                 return is_use;
@@ -2236,6 +2337,29 @@ fn first_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
         }
     }
     None
+}
+
+/// AGG13-15 (quality-metrics-and-schema-v1): walk a node in source order
+/// (depth-first, children left-to-right) and return the text of the
+/// *last* `identifier` / `type_identifier` / `name` child encountered.
+/// Used by `DfgBuilder::collect_imports` to peel `java.util.List` -> `List`
+/// and `import a.b.C.method` -> `method`.
+///
+/// We deliberately use a recursive walk (not a stack) so the
+/// "last identifier in source order" semantics is unambiguous.
+fn last_identifier_text(node: Node, source: &str) -> Option<String> {
+    fn walk(n: Node, source: &str, last: &mut Option<String>) {
+        let kind = n.kind();
+        if matches!(kind, "identifier" | "type_identifier" | "name") {
+            *last = Some(n.utf8_text(source.as_bytes()).unwrap_or("").to_string());
+        }
+        for child in n.children(&mut n.walk()) {
+            walk(child, source, last);
+        }
+    }
+    let mut last = None;
+    walk(node, source, &mut last);
+    last.filter(|s| !s.is_empty())
 }
 
 /// Check if a name is a language keyword
