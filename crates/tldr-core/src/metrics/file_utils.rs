@@ -363,6 +363,34 @@ pub fn has_binary_extension(path: &Path) -> bool {
 /// assert!(!should_skip_path(Path::new("src/main.rs")));
 /// ```
 pub fn should_skip_path(path: &Path) -> bool {
+    should_skip_path_with_lang(path, None)
+}
+
+/// JS/TS-friendly subset of [`SKIP_DIRS`]: directories that are
+/// build sinks for some languages (Rust `build/`, Java `dist/`) but commonly
+/// hold authored source for JS/TS (`src/build/emitter.ts` in ts-dom-gen,
+/// monorepo `packages/x/dist/index.ts`).
+///
+/// cross-cutting-and-clear-fix-bugs-v1 (P18.X4): mirrors the per-language
+/// gate already in `walker.rs` (`JS_TS_PRESERVED_DIRS`). Without this,
+/// `tldr loc /tmp/repos/ts-dom-gen/src` returned `total_files: 0` because
+/// the only ts source file lives at `src/build/emitter.ts` and `build` is
+/// in `SKIP_DIRS`.
+const JS_TS_PRESERVED_DIRS: &[&str] = &["build", "dist", "out", "bin", "obj"];
+
+/// Like [`should_skip_path`] but with optional language context. When
+/// language is JavaScript or TypeScript, the JS/TS-friendly subset of
+/// SKIP_DIRS is preserved (deferred to `.gitignore`).
+///
+/// cross-cutting-and-clear-fix-bugs-v1 (P18.X4).
+pub fn should_skip_path_with_lang(
+    path: &Path,
+    lang: Option<crate::types::Language>,
+) -> bool {
+    let preserve_js_ts = matches!(
+        lang,
+        Some(crate::types::Language::JavaScript) | Some(crate::types::Language::TypeScript)
+    );
     for component in path.components() {
         if let std::path::Component::Normal(name) = component {
             if let Some(name_str) = name.to_str() {
@@ -376,6 +404,12 @@ pub fn should_skip_path(path: &Path) -> bool {
 
                 // Skip known directories
                 if SKIP_DIRS.contains(&name_str) {
+                    if preserve_js_ts && JS_TS_PRESERVED_DIRS.contains(&name_str) {
+                        // JS/TS hint active and this is a name JS/TS
+                        // callers commonly use for authored source —
+                        // defer to `.gitignore`.
+                        continue;
+                    }
                     return true;
                 }
             }

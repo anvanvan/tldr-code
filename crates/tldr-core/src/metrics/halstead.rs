@@ -340,6 +340,30 @@ pub fn analyze_halstead(
         }
     }
 
+    // cross-cutting-and-clear-fix-bugs-v1 (P18.X1, Pattern A): for
+    // languages whose AST extractor surfaces the same physical method
+    // both under `module.functions` and under `module.classes[].methods`
+    // (notably Java and Elixir), the loop above pushes one
+    // `FunctionHalstead` per surface — emitting every method twice with
+    // identical metrics. Dedup by `(name, file, line)` before sorting so
+    // each function appears once. We keep the FIRST occurrence to
+    // preserve any already-present ordering invariants for non-affected
+    // languages where dedup is a no-op.
+    {
+        use std::collections::HashSet;
+        let mut seen: HashSet<(String, String, u32)> = HashSet::new();
+        functions.retain(|f| seen.insert((f.name.clone(), f.file.clone(), f.line)));
+    }
+    // Mirror the same dedup for violations so threshold-violating
+    // double-emitted methods don't appear twice in the violations list.
+    {
+        use std::collections::HashSet;
+        let mut seen: HashSet<(String, String, String)> = HashSet::new();
+        violations.retain(|v| {
+            seen.insert((v.name.clone(), v.file.clone(), v.metric.clone()))
+        });
+    }
+
     // Sort by volume (descending) for top-N
     functions.sort_by(|a, b| {
         b.metrics

@@ -448,26 +448,24 @@ pub fn detect_smells_with_walker_opts(
     } else if path.is_file() {
         vec![path.to_path_buf()]
     } else {
+        // cross-cutting-and-clear-fix-bugs-v1 (P18.X4): pre-detect the
+        // language BEFORE constructing the walker so we can pass a JS/TS
+        // hint via `lang_hint`, which tells the walker to keep authored
+        // sources under `build/`, `dist/`, etc. (JS/TS conventions place
+        // generated *.d.ts files under `build/` or `dist/`, but TS source
+        // sometimes lives there too — ts-dom-gen has `src/build/emitter.ts`
+        // as its sole source file). Without the hint, the walker skips
+        // `build/` and smells reports 0 results.
+        let lang_filter = walker_opts
+            .lang
+            .or_else(|| Language::from_directory(path));
         let mut walker = crate::walker::ProjectWalker::new(path);
         if walker_opts.no_default_ignore {
             walker = walker.no_default_ignore();
         }
-        // analysis-precision-v1, BUG-12: when no `--lang` was supplied AND
-        // we are scanning a *directory*, auto-detect the project's dominant
-        // language via `Language::from_directory` — same heuristic used by
-        // `tldr structure`. This makes `tldr smells` and `tldr structure`
-        // report the same `files_scanned` / `files | length` on a real
-        // project (e.g. ripgrep's 100-file Rust tree was previously reported
-        // as 101 by smells because a single `pkg/brew/ripgrep-bin.rb`
-        // Homebrew formula was scanned as Ruby; structure correctly skipped
-        // it under the dominant-language filter).
-        //
-        // When the caller explicitly passes `--lang`, that wins. When the
-        // walker target is a single file (above branch) or the caller
-        // supplied an explicit `--files` list, no auto-detection happens.
-        let lang_filter = walker_opts
-            .lang
-            .or_else(|| Language::from_directory(path));
+        if let Some(l) = lang_filter {
+            walker = walker.lang_hint(l);
+        }
         // language-coverage-fixes-v1 (P4.BUG-N1, P4.BUG-N5): when a
         // language is selected, use `matches_for_scan` so the C/C++
         // header ambiguity (`.h`) and the JS/TS sibling family

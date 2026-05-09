@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::metrics::file_utils::{
     check_file_size, has_binary_extension, is_binary_file, should_exclude, should_skip_path,
+    should_skip_path_with_lang,
     DEFAULT_MAX_FILE_SIZE_MB,
 };
 use crate::metrics::types::LocInfo;
@@ -602,6 +603,32 @@ pub fn analyze_directory(path: &Path, options: &LocOptions) -> Result<LocReport,
     let mut warnings: Vec<String> = Vec::new();
     let mut files_processed = 0;
 
+    // cross-cutting-and-clear-fix-bugs-v1 (P18.X4): when no language filter
+    // is supplied, detect the dominant language by scanning extensions
+    // directly (NOT through `Language::from_directory`, which honours
+    // SKIP_DIRS and so misses `src/build/emitter.ts` style layouts where
+    // the ONLY source file lives under a "build" directory). The hint is
+    // passed to `should_skip_path_with_lang` so JS/TS projects opt out of
+    // skipping `build/`, `dist/`, etc.
+    let lang_hint: Option<Language> = options.lang.or_else(|| {
+        let mut counts: HashMap<Language, usize> = HashMap::new();
+        let mut detect = ignore::WalkBuilder::new(path);
+        detect.follow_links(false).hidden(true);
+        for entry in detect.build().flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            if let Some(lang) = Language::from_path(p) {
+                *counts.entry(lang).or_insert(0) += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by_key(|(_, n)| *n)
+            .map(|(l, _)| l)
+    });
+
     // Build walker with options
     let mut builder = ignore::WalkBuilder::new(path);
     builder.follow_links(false); // CM-1: Don't follow symlinks
@@ -647,7 +674,7 @@ pub fn analyze_directory(path: &Path, options: &LocOptions) -> Result<LocReport,
 
         // Skip paths matching patterns (using relative path to avoid skipping
         // hidden temp directories in absolute path)
-        if should_skip_path(relative_path) {
+        if should_skip_path_with_lang(relative_path, lang_hint) {
             continue;
         }
         if should_exclude(relative_path, &options.exclude) {

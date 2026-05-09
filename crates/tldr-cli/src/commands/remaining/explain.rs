@@ -1153,9 +1153,23 @@ fn find_callees_recursive(
                 "<external>".to_string()
             };
 
-            // Avoid duplicates
-            if !callees.iter().any(|c| c.name == name) {
-                callees.push(CallInfo::new(name, file, get_line_number(node)));
+            // Avoid duplicates.
+            // cross-cutting-and-clear-fix-bugs-v1 (P18.Pattern-B): the
+            // same call site can yield two emissions in some languages —
+            // a bare-name (`trickleDownMin`) AND a qualified-name
+            // (`Heap.trickleDownMin`) — when the call expression is
+            // disambiguated by an outer enclosing-class scope. Dedup by
+            // (line, last_segment) so the call is reported once. Falls
+            // back to the legacy exact-name check when line numbers
+            // cannot be resolved.
+            let line = get_line_number(node);
+            let last_seg = name.rsplit('.').next().unwrap_or(&name).to_string();
+            if !callees.iter().any(|c| {
+                c.name == name
+                    || (c.line == line
+                        && c.name.rsplit('.').next().unwrap_or(&c.name) == last_seg)
+            }) {
+                callees.push(CallInfo::new(name, file, line));
             }
         }
     }
@@ -1826,6 +1840,28 @@ fn enrich_with_project_graph(
         // The caller here is `function` itself (the function we are
         // explaining); its file is `file`.
         let line = locate_call_in_caller_file(file, function, &dst_name).unwrap_or(0);
+        // cross-cutting-and-clear-fix-bugs-v1 (P18.Pattern-B): line-aware
+        // dedup. When `find_callees` already emitted a bare-name entry
+        // for this call site (e.g. `trickleDownMin` at line 382),
+        // adding the call-graph's qualified-name version
+        // (`Heap.trickleDownMin` at the same line, possibly with a
+        // relative-vs-absolute path mismatch the `paths_equivalent`
+        // check missed) would re-introduce the Pattern-B bare+qualified
+        // duplicate. Skip when an entry sharing the same line and the
+        // same last-segment already exists.
+        if line > 0 {
+            let last_seg = dst_name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&dst_name)
+                .to_string();
+            if report.callees.iter().any(|c| {
+                c.line == line
+                    && c.name.rsplit('.').next().unwrap_or(&c.name) == last_seg
+            }) {
+                continue;
+            }
+        }
         report
             .callees
             .push(CallInfo::new(dst_name, dst_file, line));

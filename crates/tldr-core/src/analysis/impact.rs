@@ -245,6 +245,13 @@ pub fn impact_analysis_with_ast_fallback(
                     .values()
                     .map(|t| normalize(&t.file, project_root))
                     .collect();
+                let ast_files: std::collections::HashSet<PathBuf> = locations
+                    .iter()
+                    .map(|(_, f)| normalize(f, project_root))
+                    .collect();
+                // First add AST-discovered target rows (so they exist as
+                // a merge destination for the swift fabrication-fix
+                // logic below).
                 for (func_name, func_file) in &locations {
                     // Match by canonical file path; AST may emit qualified
                     // names (Class.method) — only enrich for definitions
@@ -265,6 +272,77 @@ pub fn impact_analysis_with_ast_fallback(
                         confidence: None,
                         receiver_type: None,
                     });
+                }
+                // cross-cutting-and-clear-fix-bugs-v1 (P18.R2): Swift's
+                // call graph mis-attributes class-method dst_files when a
+                // class is extended in multiple files (e.g. `extension Heap`
+                // in Tests/HeapTests/HeapTests.swift AND in
+                // Sources/HeapModule/Heap.swift). The FuncIndex picks one
+                // file as the "owner" of `Heap.<method>`, and that file may
+                // not actually contain a definition of the queried method.
+                // AST has authoritative knowledge of where a function is
+                // ACTUALLY defined — for swift, MERGE callers attached to
+                // mis-attributed targets into the AST-correct target row,
+                // then drop the fabricated rows. This preserves the true
+                // caller set (e.g. `Heap.heapify` calling `Heap._heapify`
+                // inside `Heap+UnsafeHandle.swift`) while removing the
+                // wrong-file fabrication. Swift only, gated to avoid
+                // disturbing other languages where the call graph's
+                // qualified-name dst_file is correct.
+                if matches!(language, Language::Swift) && !ast_files.is_empty() {
+                    // Pick the canonical AST file as the merge target.
+                    // Prefer the one already present in `report.targets`.
+                    let canonical_ast_file = ast_files
+                        .iter()
+                        .find(|f| {
+                            report
+                                .targets
+                                .values()
+                                .any(|t| normalize(&t.file, project_root) == **f)
+                        })
+                        .cloned()
+                        .or_else(|| ast_files.iter().next().cloned());
+
+                    let mut to_merge: Vec<CallerTree> = Vec::new();
+                    let drop_keys: Vec<String> = report
+                        .targets
+                        .iter()
+                        .filter_map(|(k, t)| {
+                            if !ast_files.contains(&normalize(&t.file, project_root)) {
+                                Some(k.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for k in &drop_keys {
+                        if let Some(removed) = report.targets.remove(k) {
+                            to_merge.extend(removed.callers);
+                        }
+                    }
+                    if !to_merge.is_empty() {
+                        if let Some(canon) = canonical_ast_file {
+                            for tree in report.targets.values_mut() {
+                                if normalize(&tree.file, project_root) != canon {
+                                    continue;
+                                }
+                                for caller in to_merge.drain(..) {
+                                    let already = tree.callers.iter().any(|existing| {
+                                        existing.function == caller.function
+                                            && existing.file == caller.file
+                                    });
+                                    if !already {
+                                        tree.callers.push(caller);
+                                    }
+                                }
+                                tree.caller_count = tree.callers.len();
+                                if tree.caller_count > 0 {
+                                    tree.note = None;
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
                 report.total_targets = report.targets.len();
             }
@@ -385,7 +463,45 @@ pub fn enrich_impact_with_references(
     let mut file_funcs_cache: HashMap<PathBuf, Vec<(String, u32, u32)>> = HashMap::new();
 
     let mut additions: Vec<(String, PathBuf, u32)> = Vec::new();
-    for r in &refs_report.references {
+    // cross-cutting-and-clear-fix-bugs-v1 (P18.X3): collect references from
+    // both the primary lookup and (for Lua/Luau qualified names like
+    // `m.open`) a secondary bare-name lookup with a context filter — same
+    // shape as the explain.rs P13.AGG13-12 enrichment. The lua call graph
+    // does not always resolve `<alias>.<method>(...)` to `function m.<method>`
+    // definitions through references' qualified path, so impact's caller
+    // list comes back empty even though explain reports the same callers
+    // via this exact mechanism.
+    let mut all_refs: Vec<crate::analysis::references::Reference> =
+        refs_report.references.clone();
+    if matches!(language, Language::Lua | Language::Luau) {
+        if let Some(bare) = target_func.split('.').next_back() {
+            if bare != target_func && !bare.is_empty() {
+                let mut bare_options = ReferencesOptions::new();
+                bare_options.kinds = Some(vec![ReferenceKind::Call]);
+                bare_options.language = Some(language.as_str().to_string());
+                bare_options.limit = Some(500);
+                if let Ok(bare_refs) = find_references(bare, project_root, &bare_options) {
+                    let dot_pat = format!(".{}(", bare);
+                    let space_pat = format!(".{} (", bare);
+                    for r in &bare_refs.references {
+                        if !r.context.contains(&dot_pat) && !r.context.contains(&space_pat) {
+                            continue;
+                        }
+                        // Avoid duplicating refs already present in primary
+                        // lookup (matched on (file, line) pair).
+                        if all_refs
+                            .iter()
+                            .any(|p| p.file == r.file && p.line == r.line)
+                        {
+                            continue;
+                        }
+                        all_refs.push(r.clone());
+                    }
+                }
+            }
+        }
+    }
+    for r in &all_refs {
         let caller_file = r.file.clone();
         let funcs = file_funcs_cache
             .entry(caller_file.clone())

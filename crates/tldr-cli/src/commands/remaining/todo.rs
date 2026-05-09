@@ -231,6 +231,20 @@ impl TodoArgs {
             }
         }
 
+        // cross-cutting-and-clear-fix-bugs-v1 (P18.Pattern-B): when the
+        // sub-analyzers (e.g. csharp complexity) emit the same finding
+        // twice — once with a bare function name and once with a
+        // class-qualified name — at the same source line, dedup by
+        // (category, file, line) so the user sees one item per real
+        // problem.
+        {
+            use std::collections::HashSet;
+            let mut seen: HashSet<(String, String, u32)> = HashSet::new();
+            all_items.retain(|item| {
+                seen.insert((item.category.clone(), item.file.clone(), item.line))
+            });
+        }
+
         // Sort items by priority
         all_items.sort_by_key(|item| item.priority);
 

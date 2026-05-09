@@ -1762,8 +1762,16 @@ fn collect_definitions(
     }
 
     // Constants: detect const/static/UPPER_CASE assignments across languages.
+    // cross-cutting-and-clear-fix-bugs-v1 (P18.Pattern-B): track whether
+    // this node was already emitted as a constant. If so, suppress the
+    // field emission below — Java's `private static final String FOO = ...;`
+    // is BOTH a constant (by `static final` + UPPER_CASE) AND a field
+    // (by structural class-scope position), and the previous code emitted
+    // it twice with different `kind` values.
+    let mut emitted_as_constant = false;
     if let Some(const_def) = try_constant_definition(node, source, language) {
         definitions.push(const_def);
+        emitted_as_constant = true;
     }
 
     let (is_func, is_class) = classify_definition_node(kind, language);
@@ -1822,8 +1830,13 @@ fn collect_definitions(
     }
 
     // VAL-004: Class-scope field/property declarations emit with kind="field".
-    if let Some(field_defs) = try_field_definition(node, source, language) {
-        definitions.extend(field_defs);
+    // cross-cutting-and-clear-fix-bugs-v1 (P18.Pattern-B): skip if the
+    // same node was already emitted as a constant (Java
+    // `private static final FOO = ...`).
+    if !emitted_as_constant {
+        if let Some(field_defs) = try_field_definition(node, source, language) {
+            definitions.extend(field_defs);
+        }
     }
 
     // Recurse into children

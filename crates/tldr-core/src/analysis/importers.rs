@@ -251,6 +251,62 @@ fn find_import_line(
                 {
                     return (i as u32 + 1, trimmed.to_string());
                 }
+                // cross-cutting-and-clear-fix-bugs-v1 (P18.B8): Scala
+                // brace-list imports look like
+                //   `import cats.effect.tracing.{Tracing, TracingEvent}`
+                // — the literal `module` string ("cats.effect.tracing.Tracing")
+                // is NOT a substring. The pre-fix code fell through to
+                // the (1, "import {module}") synthetic fallback, so all
+                // brace-imported symbols pinned to line 1. Recognise the
+                // pattern: when the trimmed line is an `import` statement
+                // whose prefix matches the module's qualifier and whose
+                // brace-list contains the module's last segment, return
+                // the actual line number.
+                if matches!(language, Language::Scala)
+                    && (trimmed.starts_with("import ") || trimmed.starts_with("import\t"))
+                {
+                    if let Some(last_dot) = module.rfind('.') {
+                        let prefix = &module[..last_dot];
+                        let last_seg = &module[last_dot + 1..];
+                        // Single-line brace: `import a.b.{X, Y}`
+                        if trimmed.contains(prefix) && trimmed.contains('{') {
+                            // Multi-line brace: line ends with `{` but no `}` —
+                            // accumulate until matching `}`.
+                            let has_close = trimmed.contains('}');
+                            let inside_text: String = if has_close {
+                                let brace_open = trimmed.find('{').unwrap_or(0);
+                                let after = &trimmed[brace_open + 1..];
+                                let inside_end = after.find('}').unwrap_or(after.len());
+                                after[..inside_end].to_string()
+                            } else {
+                                let mut acc = String::new();
+                                let brace_open = trimmed.find('{').unwrap_or(0);
+                                acc.push_str(&trimmed[brace_open + 1..]);
+                                acc.push(' ');
+                                let mut k = i + 1;
+                                while k < lines.len() {
+                                    let l = lines[k].trim();
+                                    if let Some(close) = l.find('}') {
+                                        acc.push_str(&l[..close]);
+                                        break;
+                                    }
+                                    acc.push_str(l);
+                                    acc.push(' ');
+                                    k += 1;
+                                }
+                                acc
+                            };
+                            for raw_sym in inside_text.split(',') {
+                                let raw = raw_sym.trim();
+                                // Handle rename: `X => Y` — keep lhs.
+                                let lhs = raw.split("=>").next().unwrap_or(raw).trim();
+                                if lhs == last_seg {
+                                    return (i as u32 + 1, trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Language::Rust => {
                 if (trimmed.starts_with("use ") || trimmed.starts_with("pub use "))

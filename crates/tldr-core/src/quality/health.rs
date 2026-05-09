@@ -950,7 +950,10 @@ fn count_source_files(path: &Path, language: Language) -> usize {
     }
 
     let mut count = 0usize;
-    for entry in ProjectWalker::new(path).iter() {
+    // cross-cutting-and-clear-fix-bugs-v1 (P18.X4): pass the language hint
+    // so JS/TS projects with sources under `src/build/` are not silently
+    // skipped before extension filtering.
+    for entry in ProjectWalker::new(path).lang_hint(language).iter() {
         let file_path = entry.path();
         if file_path.is_file() {
             if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
@@ -974,7 +977,9 @@ fn collect_module_infos(path: &Path, language: Language) -> Vec<(PathBuf, Module
             module_infos.push((path.to_path_buf(), info));
         }
     } else {
-        for entry in ProjectWalker::new(path).iter() {
+        // cross-cutting-and-clear-fix-bugs-v1 (P18.X4): JS/TS hint so
+        // `src/build/*.ts` is included.
+        for entry in ProjectWalker::new(path).lang_hint(language).iter() {
             let file_path = entry.path();
             if file_path.is_file() {
                 if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {

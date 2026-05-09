@@ -1,5 +1,172 @@
 # Changelog
 
+## cross-cutting-and-clear-fix-bugs-v1 — internal milestone
+
+NOT a published release. Closes 7 of the 8 distinct non-judgment-call
+bugs flagged by the phase-18 final-review aggregate
+(`/tmp/audit_phase18/AGGREGATE_REPORT.md`). Bug 7 (kotlin specs
+`functions[].name=null`) was already fixed at HEAD; the milestone
+test pins its schema so a future regression cannot reintroduce the
+empty per-function emitter.
+
+### Bugs addressed
+
+1. **P18.X3 (HIGH) — lua FuncIndex resolver: `impact`/`whatbreaks`
+   miss `function m.foo`-style table-assignment aliases.**
+   `tldr impact m.open /tmp/repos/lua-lsp` returned `caller_count: 0`
+   even though `tldr explain script/files.lua m.open` reported 18
+   cross-module callers via the P13.AGG13-12 references-enrichment
+   path. Fix: mirror the same Lua bare-name retry inside
+   `enrich_impact_with_references` so impact / whatbreaks pick up the
+   same call sites explain finds.
+
+2. **P18.B1 (HIGH) — scala reaching-defs flags fn params, `this`,
+   companion objects.** `tldr reaching-defs IO.scala flatMap` flagged
+   `f`, `this`, `IO`, `FlatMap`, `Tracing` as `severity: definite`
+   uninitialized. Fix: (a) add Scala parameter extraction via a new
+   `extract_scala_param` arm and a `kind == "parameters"` lookup that
+   bypasses the type-parameters field-name collision; (b) add a Scala
+   arm to `is_keyword` so `this` is filtered; (c) suppress
+   uppercase-leading identifiers and `field_expression`'s `field`
+   member name at the use-context gate.
+
+3. **P18.R2 (HIGH) — swift `impact` fabricates test-file location.**
+   `tldr impact _heapify /tmp/repos/swift-collections` emitted a target
+   row with `file: Tests/HeapTests/HeapTests.swift` even though the
+   test file does not define `_heapify`. Fix: in
+   `impact_analysis_with_ast_fallback`, for Swift, MERGE callers from
+   call-graph-derived rows whose `file` is not in the AST-discovered
+   set into the AST-correct target row, then drop the fabricated rows.
+   Preserves the cross-file caller chain (e.g. `Heap.heapify` →
+   `Heap._heapify`) while removing the wrong-file fabrication.
+
+4. **P18.X4 (MED) — TypeScript dir-walker fails on `src/` when single
+   subdir + empty siblings.** `tldr loc /tmp/repos/ts-dom-gen/src`
+   returned `total_files: 0` because `src/` only contains `build/`
+   (in the default-skip list before the JS/TS hint can be derived).
+   Fix: (a) `Language::from_directory` retries with
+   `no_default_ignore` when the first pass yields zero files; (b)
+   `ProjectWalker::iter` auto-detects JS/TS-dominant layouts and
+   opts into the same preserve set the explicit `lang_hint`
+   activates; (c) a new `should_skip_path_with_lang` helper threads
+   the JS/TS hint through `loc`'s direct `WalkBuilder` path.
+
+5. **P18.X1 (MED) — halstead duplicate emission for java + elixir.**
+   The Java AST extractor reports class methods as BOTH
+   `module.functions` AND `module.classes[].methods`; halstead walked
+   both surfaces. Java OwnerController.java went 11 → 22 entries;
+   elixir conn.ex went 152 → 299 entries. Fix: `analyze_halstead`
+   dedups by `(name, file, line)` after the loops complete, plus a
+   parallel dedup for violations.
+
+6. **P18.Pattern-B (LOW) — bare+qualified duplicate emission across
+   three surfaces.** (a) swift `explain` callees emitted both
+   `trickleDownMin` (from `find_callees`) and `Heap.trickleDownMin`
+   (from `enrich_with_project_graph`) for the same call site;
+   (b) csharp `todo` emitted both shapes for the same complexity
+   finding; (c) java `structure` emitted
+   `private static final String FOO = ...` twice — once as
+   `kind: constant`, once as `kind: field`. Fix: line-aware
+   `(line, last_segment)` dedup in `find_callees_recursive` and
+   `enrich_with_project_graph`; `(category, file, line)` dedup in
+   the todo emitter; `collect_definitions` skips the field-detection
+   path when the same node was already emitted as a constant.
+
+7. **P18.KOT-3 (LOW) — kotlin specs --from-tests emitter.** Already
+   fixed at HEAD `3bcd65e`: the canonical schema uses `function_name`
+   (not `name`) and split `input_output_specs` / `exception_specs` /
+   `property_specs` arrays. The audit referred to stale field names.
+   Test pins the schema so a future regression cannot reintroduce
+   the empty emitter.
+
+8. **P18.B8 (LOW) — scala importers brace-list line accuracy.**
+   `tldr importers cats.effect.tracing.Tracing` reported the
+   brace-list import in `IO.scala` at line 1 (synthetic fallback)
+   instead of the actual line 52. The substring check
+   (`trimmed.contains(module)`) cannot match the literal module
+   string against the brace-list shape
+   (`cats.effect.tracing.{Tracing, TracingEvent}`). Fix: a Scala-
+   specific brace-list parser that splits on `,` (and handles the
+   rename arrow `X => Y`) for both single-line and multi-line braces.
+
+### Pre-fix evidence (HEAD `3bcd65e`)
+
+```text
+$ tldr impact m.open /tmp/repos/lua-lsp --format json | jq '[.targets|to_entries|.[].value.callers|length]|add'
+0
+$ tldr reaching-defs IO.scala flatMap --format json | jq '[.uninitialized[]|select(.severity=="definite")|.var]|unique'
+["FlatMap","IO","Tracing","calculateTracingEvent","f","this"]
+$ tldr impact _heapify swift-collections --format json | jq '[.targets|to_entries|.[].value.file]'
+["Tests/HeapTests/HeapTests.swift","/tmp/repos/.../Heap+UnsafeHandle.swift"]
+$ tldr loc /tmp/repos/ts-dom-gen/src --format json | jq '.total_files'
+0
+$ tldr halstead OwnerController.java --format json | jq '.functions | length'   # ground truth 11
+22
+$ tldr halstead conn.ex --format json | jq '.functions | length'                  # ground truth ~152
+299
+$ tldr explain Heap+UnsafeHandle.swift _heapify | jq '...|select(length>1)|length'
+2
+$ tldr todo DateTimeParser.cs | jq '.items | group_by(...) | map(select(length>1)) | length'
+4
+$ tldr structure OwnerController.java | jq '[..VIEWS_OWNER_CREATE_OR_UPDATE_FORM..]|length'
+2
+$ tldr importers cats.effect.tracing.Tracing scala-cats-effect | jq '.importers[]|select(IO.scala)|.line'
+1
+```
+
+### Post-fix evidence
+
+```text
+$ tldr impact m.open /tmp/repos/lua-lsp --format json | jq '[.targets|to_entries|.[].value.callers|length]|add'
+36
+$ tldr reaching-defs IO.scala flatMap --format json | jq '[.uninitialized[]|select(.severity=="definite")]|length'
+0
+$ tldr impact _heapify swift-collections --format json | jq '[.targets|to_entries|.[].value.file]'
+["/tmp/repos/swift-collections/Sources/HeapModule/Heap+UnsafeHandle.swift"]
+$ tldr loc /tmp/repos/ts-dom-gen/src --format json | jq '.total_files'
+1
+$ tldr halstead OwnerController.java --format json | jq '.functions | length'
+11
+$ tldr halstead conn.ex --format json | jq '.functions | length'
+152
+$ tldr explain Heap+UnsafeHandle.swift _heapify | jq '...|select(length>1)|length'
+0
+$ tldr todo DateTimeParser.cs | jq '.items | group_by(...) | map(select(length>1)) | length'
+0
+$ tldr structure OwnerController.java | jq '[..VIEWS_OWNER_CREATE_OR_UPDATE_FORM..]|length'
+1
+$ tldr importers cats.effect.tracing.Tracing scala-cats-effect | jq '.importers[]|select(IO.scala)|.line'
+52
+```
+
+### Multi-language non-regression
+
+- **Bug 1 control:** `tldr explain script/files.lua m.open` still
+  returns 18 callers (P13.AGG13-12 baseline preserved).
+- **Bug 2 control:** `tldr reaching-defs OwnerController.java
+  processFindForm` still has 0 definite-uninit violations
+  (P14.AGG14-12 baseline preserved).
+- **Bug 3 control:** `tldr explain Heap+UnsafeHandle.swift
+  Heap._heapify` still surfaces the in-file caller `Heap.heapify`
+  via the merge path (AGG13-2 control test passes).
+- **Bug 4 control:** rust loc on ripgrep/crates → 88 files;
+  flask/src → 3 .py files; express/lib → 6 .js files; node_modules
+  remains excluded.
+- **Bug 5 control:** rust halstead surfaces ≥1 function per top-
+  level entry (no over-dedup); go/c halstead unchanged.
+- **Bug 6 control:** `OwnerController` class + constructor (legitimate
+  same-name class+method) still emitted (different `kind`).
+- **Bug 7 control:** go specs --from-tests on tree_test.go still
+  populates `function_name` and surfaces ≥1 spec entry.
+- **Bug 8 control:** java importers `Owner` returns total ≥1
+  (P15.AGG15-3 baseline preserved); kotlin importers still works.
+
+### Tests
+
+New: `crates/tldr-cli/tests/cross_cutting_and_clear_fix_bugs_v1.rs`
+(19 tests; 12 fix assertions + 7 non-regression). Master regression
+suite (1247 tests across 13 milestone test files) all pass.
+
 ## resources-ast-gate-v1 — internal milestone
 
 NOT a published release. Closes the 7th and final phase-17 final-review

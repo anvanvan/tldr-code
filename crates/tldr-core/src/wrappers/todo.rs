@@ -490,6 +490,21 @@ fn build_todo_items(report: &TodoReport) -> Vec<TodoItem> {
         }
     }
 
+    // cross-cutting-and-clear-fix-bugs-v1 (P18.Pattern-B): when a sub-
+    // analyzer (notably csharp complexity) emits the same finding under
+    // both a bare and a qualified name (e.g. `ParseTime` AND
+    // `DateTimeParser.ParseTime`) at the same source line, dedup by
+    // `(category, file, line)` so the user sees one item per real
+    // problem. The first occurrence wins so any (bare-name) priority
+    // ordering decided earlier is preserved.
+    {
+        use std::collections::HashSet;
+        let mut seen: HashSet<(String, String, usize)> = HashSet::new();
+        items.retain(|item| {
+            seen.insert((item.category.clone(), item.file.clone(), item.line))
+        });
+    }
+
     // Sort by priority
     items.sort_by_key(|item| item.priority);
     items

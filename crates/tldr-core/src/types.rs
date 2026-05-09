@@ -419,12 +419,43 @@ impl Language {
             }
         }
 
-        // Empty / unrecognised directory -> None. We deliberately do NOT
-        // fall back to a manifest here: a project with no recognised source
-        // files should not be silently labelled — that was the silent
-        // wrong-lang bug we are fixing.
+        // cross-cutting-and-clear-fix-bugs-v1 (P18.X4): when the default
+        // walker pass returned no recognised files, retry with the default
+        // skip list disabled. This handles JS/TS projects whose only
+        // sources live under `src/build/`, `src/dist/`, etc — names that
+        // are otherwise pre-emptively skipped before the JS/TS hint can
+        // be derived. If retry still yields no files, we honour the
+        // original "unrecognised directory" None behaviour.
         if counts.is_empty() {
-            return None;
+            for entry in crate::walker::ProjectWalker::new(path)
+                .no_default_ignore()
+                .iter()
+            {
+                let p = entry.path();
+                if !p.is_file() {
+                    continue;
+                }
+                if let Ok(rel) = p.strip_prefix(path) {
+                    if rel
+                        .components()
+                        .any(|c| match c {
+                            std::path::Component::Normal(s) => s
+                                .to_str()
+                                .map(|n| NOISE_DIRS.contains(&n))
+                                .unwrap_or(false),
+                            _ => false,
+                        })
+                    {
+                        continue;
+                    }
+                }
+                if let Some(lang) = Self::from_path(p) {
+                    *counts.entry(lang).or_insert(0) += 1;
+                }
+            }
+            if counts.is_empty() {
+                return None;
+            }
         }
 
         // --- Stage 2: rank languages by file count -------------------------

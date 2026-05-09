@@ -213,10 +213,21 @@ impl ProjectWalker {
         // default exclude list is treated as opt-in (deferred to
         // `.gitignore`). Captured into a single bool so the closure
         // below stays cheap.
-        let preserve_js_ts_dirs = matches!(
-            self.lang_hint,
-            Some(crate::types::Language::JavaScript) | Some(crate::types::Language::TypeScript)
-        );
+        //
+        // cross-cutting-and-clear-fix-bugs-v1 (P18.X4): when no lang_hint
+        // was supplied AND the root dir is dominated by JS/TS extensions
+        // (counted permissively, ignoring the default skip list so the
+        // count reflects actual content), opt into the same preservation
+        // automatically. This fixes commands that don't explicitly set
+        // `lang_hint` (patterns, deps, search, etc.) on JS/TS layouts
+        // like `src/build/emitter.ts` where the only source is under a
+        // name that's normally a build sink.
+        let auto_js_ts = self.lang_hint.is_none() && root_is_js_ts_dominated(&self.root);
+        let preserve_js_ts_dirs = auto_js_ts
+            || matches!(
+                self.lang_hint,
+                Some(crate::types::Language::JavaScript) | Some(crate::types::Language::TypeScript)
+            );
 
         let mut builder = WalkBuilder::new(&self.root);
         builder
@@ -313,6 +324,61 @@ fn dir_has_generated_sentinel(dir: &Path) -> bool {
         }
     }
     false
+}
+
+/// cross-cutting-and-clear-fix-bugs-v1 (P18.X4): permissive JS/TS
+/// dominance check. Walks `dir` ignoring the default skip list (so the
+/// count reflects what's REALLY there, not what's left after stripping
+/// `build/`, `dist/`, etc.) and reports whether `.ts`/`.tsx`/`.js`/`.jsx`/
+/// `.mjs`/`.cjs` files outnumber any other recognised language. Used to
+/// opt ProjectWalker into JS/TS-preservation when the caller did not set
+/// an explicit `lang_hint`.
+///
+/// To keep the cost bounded, the walk caps at 256 inspected files —
+/// enough to disambiguate even small libraries without scanning a giant
+/// monorepo every time.
+fn root_is_js_ts_dominated(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let mut js_ts_count = 0usize;
+    let mut other_count = 0usize;
+    let mut inspected = 0usize;
+    const CAP: usize = 256;
+    let mut walker = WalkBuilder::new(dir);
+    walker
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(true)
+        .follow_links(false);
+    for entry in walker.build().flatten() {
+        if inspected >= CAP {
+            break;
+        }
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let p = entry.path();
+        let Some(ext) = p.extension().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        match ext {
+            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => {
+                js_ts_count += 1;
+                inspected += 1;
+            }
+            "py" | "rs" | "go" | "java" | "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "kt"
+            | "swift" | "rb" | "php" | "scala" | "lua" | "luau" | "ex" | "exs" | "ml" | "mli"
+            | "cs" => {
+                other_count += 1;
+                inspected += 1;
+            }
+            _ => {}
+        }
+    }
+    js_ts_count > other_count && js_ts_count > 0
 }
 
 /// Convenience free function: walk project with all defaults on.

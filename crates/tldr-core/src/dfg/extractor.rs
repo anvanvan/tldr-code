@@ -318,7 +318,15 @@ impl<'a> DfgBuilder<'a> {
                         .find(|child| child.kind() == "function_value_parameters")
                 })
             }
-            Language::Scala => func_node.child_by_field_name("parameters"),
+            // cross-cutting-and-clear-fix-bugs-v1 (P18.B1): Scala's
+            // tree-sitter grammar names BOTH `[B]` (type_parameters) and
+            // `(f: A => IO[B])` (parameters) with field name "parameters".
+            // `child_by_field_name("parameters")` returns the FIRST match
+            // (the type params), so the value-parameter node was never
+            // walked. Find by kind == "parameters" explicitly.
+            Language::Scala => (0..func_node.child_count())
+                .filter_map(|i| func_node.child(i))
+                .find(|child| child.kind() == "parameters"),
             Language::Lua | Language::Luau => func_node.child_by_field_name("parameters"),
             Language::Swift => None, // Swift parameters are direct children (handled below)
             _ => None,
@@ -366,6 +374,7 @@ impl<'a> DfgBuilder<'a> {
             Language::Go => self.extract_go_param(child),
             Language::Rust => self.extract_rust_param(child),
             Language::Java | Language::CSharp => self.extract_java_csharp_param(child),
+            Language::Scala => self.extract_scala_param(child),
             Language::Kotlin => self.extract_kotlin_param(child),
             Language::C | Language::Cpp => self.extract_c_cpp_param(child),
             Language::Ruby => self.extract_ruby_param(child),
@@ -443,6 +452,27 @@ impl<'a> DfgBuilder<'a> {
 
     fn extract_kotlin_param(&mut self, child: Node) {
         if child.kind() != "parameter" {
+            return;
+        }
+        if let Some(name) = child.child_by_field_name("name") {
+            if name.kind() == "identifier" {
+                self.add_ref_from_node(name, RefType::Definition);
+                return;
+            }
+        }
+        if let Some(identifier) = first_child_of_kind(child, "identifier") {
+            self.add_ref_from_node(identifier, RefType::Definition);
+        }
+    }
+
+    /// cross-cutting-and-clear-fix-bugs-v1 (P18.B1): Scala parameter
+    /// extraction. The grammar shape is `parameters -> ( ... parameter ... )`
+    /// where each `parameter` node has an `identifier` child for the param
+    /// name (e.g. `f` in `def flatMap[B](f: A => IO[B])`). Without this
+    /// dispatch, scala function parameters are NEVER added as Definitions
+    /// and reaching-defs flags every parameter use as definite-uninitialized.
+    fn extract_scala_param(&mut self, child: Node) {
+        if child.kind() != "parameter" && child.kind() != "class_parameter" {
             return;
         }
         if let Some(name) = child.child_by_field_name("name") {
@@ -784,6 +814,27 @@ impl<'a> DfgBuilder<'a> {
                 let name = node.utf8_text(self.source.as_bytes()).unwrap_or("");
                 if !name.is_empty() && !is_keyword(name, self.language) && self.is_use_context(node)
                 {
+                    // cross-cutting-and-clear-fix-bugs-v1 (P18.B1): in Scala,
+                    // identifiers whose first letter is uppercase are
+                    // overwhelmingly type names, class names, or companion
+                    // objects (Scala convention is strict: types/objects
+                    // start uppercase, vars/methods start lowercase). They
+                    // resolve at compile time to top-level singletons that
+                    // are always available — flagging them as
+                    // definite-uninitialized in reaching-defs is a false
+                    // positive (e.g. `IO`, `FlatMap`, `Tracing` in
+                    // `IO(FlatMap(this, f, Tracing.calculateTracingEvent(f)))`).
+                    if matches!(self.language, Language::Scala) {
+                        if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                            // Recurse into children so any nested identifiers
+                            // (rare for an identifier node) are not lost.
+                            let mut cursor = node.walk();
+                            for child in node.children(&mut cursor) {
+                                self.extract_refs_from_node(child, depth + 1)?;
+                            }
+                            return Ok(());
+                        }
+                    }
                     self.add_ref_from_node(node, RefType::Use);
                 }
             }
@@ -2059,6 +2110,37 @@ impl<'a> DfgBuilder<'a> {
     /// to determine if this identifier is a target of assignment/declaration
     /// (and therefore NOT a use).
     fn is_use_context(&self, node: Node) -> bool {
+        // cross-cutting-and-clear-fix-bugs-v1 (P18.B1): Scala method/field
+        // names on the rhs of `field_expression` (`Tracing.calculateTracingEvent`
+        // -> `calculateTracingEvent`) are member references, not local
+        // variable uses. They have no defining write in the function body
+        // and would otherwise be flagged as definite-uninitialized.
+        if matches!(self.language, Language::Scala) {
+            if let Some(parent) = node.parent() {
+                if parent.kind() == "field_expression" {
+                    if let Some(field) = parent.child_by_field_name("field") {
+                        if field.id() == node.id() {
+                            return false;
+                        }
+                    }
+                }
+                // Method name in `obj.method(args)` / `method(args)` —
+                // call_expression's `function` field is the callee. When
+                // that callee is a bare identifier (no dot), it's a
+                // free-function or local-method invocation; treat the
+                // callee identifier as not-a-variable-use to avoid
+                // flagging compile-time-resolved methods like
+                // `calculateTracingEvent` (or local DSL helpers) as
+                // uninitialized.
+                if parent.kind() == "call_expression" {
+                    if let Some(func_field) = parent.child_by_field_name("function") {
+                        if func_field.id() == node.id() {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
         // AGG13-15 (quality-metrics-and-schema-v1): Java/C# method-name
         // and imported-type identifiers are NOT variable uses. The
         // pre-fix output flagged `PageRequest`, `Sort`, `of`,
@@ -2988,6 +3070,57 @@ fn is_keyword(name: &str, language: Language) -> bool {
                 | "Double"
                 | "Float"
                 | "Array"
+        ),
+        // cross-cutting-and-clear-fix-bugs-v1 (P18.B1): Scala keyword set so
+        // `this` (and other reserved identifiers) are not flagged as
+        // uninitialized variable uses by reaching-defs. Without this arm,
+        // `_ => false` falls through and `this` slips through as an
+        // identifier use with no defining write — definite false positive.
+        Language::Scala => matches!(
+            name,
+            "abstract"
+                | "case"
+                | "catch"
+                | "class"
+                | "def"
+                | "do"
+                | "else"
+                | "enum"
+                | "export"
+                | "extends"
+                | "false"
+                | "final"
+                | "finally"
+                | "for"
+                | "forSome"
+                | "given"
+                | "if"
+                | "implicit"
+                | "import"
+                | "lazy"
+                | "match"
+                | "new"
+                | "null"
+                | "object"
+                | "override"
+                | "package"
+                | "private"
+                | "protected"
+                | "return"
+                | "sealed"
+                | "super"
+                | "then"
+                | "this"
+                | "throw"
+                | "trait"
+                | "true"
+                | "try"
+                | "type"
+                | "val"
+                | "var"
+                | "while"
+                | "with"
+                | "yield"
         ),
         _ => false,
     }
