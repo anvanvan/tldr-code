@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.4.0 — 2026-05-10
+
+First published release after 202 internal milestones since v0.3.0. ~58 bugs
+closed across phase-13 through phase-18 audit-fix loops covering 18 languages.
+Architecture shifted mid-cycle to no-synthetic-fixtures-v1: every milestone
+test gates on real-repo presence under `/tmp/repos/<repo>` rather than synthetic
+`TempDir` fixtures.
+
+### Highlights
+
+- **Cross-lang correctness**: 18-language audit corpus exercised against every
+  command category (L1 AST, L2 call graph, L3-L4 data flow, L5 PDG, security,
+  quality, patterns, contracts, search, aggregated).
+- **Context `file:fn`** colon-form parser works absolute + relative across all
+  18 langs; handles C++ `Class::Method` namespace separator.
+- **Explain callers** restored across js/ruby/swift after oscillating
+  regression; project-root inference no longer collapses on relative paths.
+- **Sibling-resolver gaps closed**: `whatbreaks` propagates impact's
+  references-enrichment; `references` follows lua cross-module aliases;
+  `cognitive` recognises CommonJS function shapes; `--lang` flag honoured by
+  api-check/debt/clones consistently.
+- **Halstead dedup** for java + elixir multi-clause function emission.
+- **Resources AST-gate** for TS/JS ambiguous resource names (event/request/
+  response/data require cleanup-method evidence).
+- **Cpp `.h` extract** auto-detects language=cpp when class/template/namespace
+  tokens present.
+
+### Known judgment-call issues (deferred to next minor)
+
+- Luau `api-check` LU001 rule has ~37.5% false-positive rate on metatable
+  operator overloads, closure upvalue capture, and same-scope local
+  reassignment. Rule heuristic decision pending.
+- Scala column convention (col=0 vs col=1) inconsistent across `definition`,
+  `api-check`, and `references` on the same backend.
+- Scala path convention (`./X`, `X/`, `/tmp/X`, `/private/tmp/X`) drifts
+  across cells in one run; cross-cmd schema unification pending.
+
+### Test coverage
+
+- 1266 tests passing across 14 milestone test files + master regression
+  (`vuln_migration_v1_red` 168/168 + `language_command_matrix` 926/0/28).
+
 ## cross-cutting-and-clear-fix-bugs-v1 — internal milestone
 
 NOT a published release. Closes 7 of the 8 distinct non-judgment-call
