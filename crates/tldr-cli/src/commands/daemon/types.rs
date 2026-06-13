@@ -26,6 +26,35 @@ pub const DEFAULT_REINDEX_THRESHOLD: usize = 20;
 /// Default flush interval for hook stats (every N invocations)
 pub const HOOK_FLUSH_THRESHOLD: usize = 5;
 
+/// Default RSS self-restart watermark in MiB (mirrors Python's
+/// `_DEFAULT_RSS_WATERMARK_MB = 4096.0`). Env: `TLDR_DAEMON_RSS_WATERMARK_MB`.
+pub const DEFAULT_RSS_WATERMARK_MB: u64 = 4096;
+
+/// Default debounce window (ms) coalescing a notify burst into one reindex.
+/// Mirrors Python's `notify_debounce_secs 2.0`. Env: `TLDR_DAEMON_NOTIFY_DEBOUNCE_MS`.
+pub const DEFAULT_NOTIFY_DEBOUNCE_MS: u64 = 2000;
+
+/// Default minimum spread (ms) between two reindex fires. Mirrors Python's
+/// `reindex_cooldown_secs 30.0`. Env: `TLDR_DAEMON_REINDEX_COOLDOWN_MS`.
+pub const DEFAULT_REINDEX_COOLDOWN_MS: u64 = 30000;
+
+// ---------------------------------------------------------------------------
+// serde defaults for additive `DaemonConfig` fields (keep deserialization of
+// older config JSON that omits these fields working).
+// ---------------------------------------------------------------------------
+
+fn default_rss_watermark_mb() -> u64 {
+    DEFAULT_RSS_WATERMARK_MB
+}
+
+fn default_notify_debounce_ms() -> u64 {
+    DEFAULT_NOTIFY_DEBOUNCE_MS
+}
+
+fn default_reindex_cooldown_ms() -> u64 {
+    DEFAULT_REINDEX_COOLDOWN_MS
+}
+
 // =============================================================================
 // Configuration Types
 // =============================================================================
@@ -44,6 +73,31 @@ pub struct DaemonConfig {
 
     /// Idle timeout in seconds (default: 1800 = 30 min)
     pub idle_timeout_secs: u64,
+
+    /// RSS self-restart watermark in MiB. When the long-lived daemon's CURRENT
+    /// resident set breaches this AND no work is in flight, it drains and
+    /// self-exits to cap memory (the `19bac28` jetsam class). Env:
+    /// `TLDR_DAEMON_RSS_WATERMARK_MB`. Additive — older config JSON omitting
+    /// this field deserializes to the default.
+    #[serde(default = "default_rss_watermark_mb")]
+    pub rss_watermark_mb: u64,
+
+    /// PID of the process that spawned this daemon, for the parent-death
+    /// watchdog. `None` means "no watchdog" — a setsid-detached daemon with
+    /// `ppid == 1` legitimately has no watchdog. Set by the spawner via
+    /// `TLDR_DAEMON_PARENT_PID`. NEVER keyed on `getppid()`.
+    #[serde(default)]
+    pub parent_pid: Option<u32>,
+
+    /// Debounce window (ms): a burst of `Notify` within this window coalesces
+    /// into a single reindex. Env: `TLDR_DAEMON_NOTIFY_DEBOUNCE_MS`.
+    #[serde(default = "default_notify_debounce_ms")]
+    pub notify_debounce_ms: u64,
+
+    /// Minimum spread (ms) between two reindex fires. Env:
+    /// `TLDR_DAEMON_REINDEX_COOLDOWN_MS`.
+    #[serde(default = "default_reindex_cooldown_ms")]
+    pub reindex_cooldown_ms: u64,
 }
 
 impl Default for DaemonConfig {
@@ -53,8 +107,55 @@ impl Default for DaemonConfig {
             auto_reindex_threshold: DEFAULT_REINDEX_THRESHOLD,
             semantic_model: "bge-large-en-v1.5".to_string(),
             idle_timeout_secs: IDLE_TIMEOUT_SECS,
+            rss_watermark_mb: DEFAULT_RSS_WATERMARK_MB,
+            parent_pid: None,
+            notify_debounce_ms: DEFAULT_NOTIFY_DEBOUNCE_MS,
+            reindex_cooldown_ms: DEFAULT_REINDEX_COOLDOWN_MS,
         }
     }
+}
+
+impl DaemonConfig {
+    /// Overlay the hardening knobs from environment variables onto an existing
+    /// config. Each var is optional; an unset or unparseable value leaves the
+    /// current value untouched. Mirrors Python's env-driven config resolution.
+    ///
+    /// - `TLDR_DAEMON_RSS_WATERMARK_MB` → `rss_watermark_mb` (0 ⇒ keep default)
+    /// - `TLDR_DAEMON_PARENT_PID`        → `parent_pid`
+    /// - `TLDR_DAEMON_NOTIFY_DEBOUNCE_MS`→ `notify_debounce_ms`
+    /// - `TLDR_DAEMON_REINDEX_COOLDOWN_MS`→ `reindex_cooldown_ms`
+    pub fn apply_env(&mut self) {
+        if let Some(mb) = parse_env_u64("TLDR_DAEMON_RSS_WATERMARK_MB") {
+            if mb > 0 {
+                self.rss_watermark_mb = mb;
+            }
+        }
+        if let Some(pid) = parse_env_u64("TLDR_DAEMON_PARENT_PID") {
+            // pid 0 is never a real parent; treat as "unset".
+            if pid > 0 {
+                self.parent_pid = Some(pid as u32);
+            }
+        }
+        if let Some(ms) = parse_env_u64("TLDR_DAEMON_NOTIFY_DEBOUNCE_MS") {
+            self.notify_debounce_ms = ms;
+        }
+        if let Some(ms) = parse_env_u64("TLDR_DAEMON_REINDEX_COOLDOWN_MS") {
+            self.reindex_cooldown_ms = ms;
+        }
+    }
+
+    /// Build a default config then overlay any hardening env vars.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        cfg.apply_env();
+        cfg
+    }
+}
+
+/// Parse an environment variable as a `u64`, returning `None` when unset,
+/// empty, or unparseable.
+fn parse_env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok()?.trim().parse::<u64>().ok()
 }
 
 // =============================================================================
@@ -531,6 +632,20 @@ pub enum DaemonResponse {
 mod tests {
     use super::*;
 
+    // Env is process-global; serialize env-mutating cases.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clear_hardening_env() {
+        for k in [
+            "TLDR_DAEMON_RSS_WATERMARK_MB",
+            "TLDR_DAEMON_PARENT_PID",
+            "TLDR_DAEMON_NOTIFY_DEBOUNCE_MS",
+            "TLDR_DAEMON_REINDEX_COOLDOWN_MS",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
     #[test]
     fn test_daemon_config_default() {
         let config = DaemonConfig::default();
@@ -539,6 +654,14 @@ mod tests {
         assert_eq!(config.auto_reindex_threshold, DEFAULT_REINDEX_THRESHOLD);
         assert_eq!(config.semantic_model, "bge-large-en-v1.5");
         assert_eq!(config.idle_timeout_secs, IDLE_TIMEOUT_SECS);
+        // Hardening knob defaults mirror the Python oracle.
+        assert_eq!(config.rss_watermark_mb, DEFAULT_RSS_WATERMARK_MB);
+        assert_eq!(config.rss_watermark_mb, 4096);
+        assert_eq!(config.parent_pid, None);
+        assert_eq!(config.notify_debounce_ms, DEFAULT_NOTIFY_DEBOUNCE_MS);
+        assert_eq!(config.notify_debounce_ms, 2000);
+        assert_eq!(config.reindex_cooldown_ms, DEFAULT_REINDEX_COOLDOWN_MS);
+        assert_eq!(config.reindex_cooldown_ms, 30000);
     }
 
     #[test]
@@ -553,6 +676,60 @@ mod tests {
         // Deserialize back
         let parsed: DaemonConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn test_daemon_config_additive_old_json_deserializes() {
+        // Older config JSON that predates the hardening knobs must still
+        // deserialize, falling back to the serde defaults (additive contract).
+        let old_json = r#"{
+            "semantic_enabled": true,
+            "auto_reindex_threshold": 20,
+            "semantic_model": "bge-large-en-v1.5",
+            "idle_timeout_secs": 1800
+        }"#;
+        let parsed: DaemonConfig = serde_json::from_str(old_json).unwrap();
+        assert_eq!(parsed.rss_watermark_mb, DEFAULT_RSS_WATERMARK_MB);
+        assert_eq!(parsed.parent_pid, None);
+        assert_eq!(parsed.notify_debounce_ms, DEFAULT_NOTIFY_DEBOUNCE_MS);
+        assert_eq!(parsed.reindex_cooldown_ms, DEFAULT_REINDEX_COOLDOWN_MS);
+        // Equivalent to a freshly defaulted config.
+        assert_eq!(parsed, DaemonConfig::default());
+    }
+
+    #[test]
+    fn test_daemon_config_apply_env_overlay() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_hardening_env();
+        std::env::set_var("TLDR_DAEMON_RSS_WATERMARK_MB", "512");
+        std::env::set_var("TLDR_DAEMON_PARENT_PID", "4242");
+        std::env::set_var("TLDR_DAEMON_NOTIFY_DEBOUNCE_MS", "100");
+        std::env::set_var("TLDR_DAEMON_REINDEX_COOLDOWN_MS", "5000");
+
+        let cfg = DaemonConfig::from_env();
+        assert_eq!(cfg.rss_watermark_mb, 512);
+        assert_eq!(cfg.parent_pid, Some(4242));
+        assert_eq!(cfg.notify_debounce_ms, 100);
+        assert_eq!(cfg.reindex_cooldown_ms, 5000);
+
+        clear_hardening_env();
+    }
+
+    #[test]
+    fn test_daemon_config_apply_env_ignores_zero_and_unparseable() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_hardening_env();
+        // Zero watermark keeps the default; pid 0 means "unset"; garbage is ignored.
+        std::env::set_var("TLDR_DAEMON_RSS_WATERMARK_MB", "0");
+        std::env::set_var("TLDR_DAEMON_PARENT_PID", "0");
+        std::env::set_var("TLDR_DAEMON_NOTIFY_DEBOUNCE_MS", "notanumber");
+
+        let cfg = DaemonConfig::from_env();
+        assert_eq!(cfg.rss_watermark_mb, DEFAULT_RSS_WATERMARK_MB);
+        assert_eq!(cfg.parent_pid, None);
+        assert_eq!(cfg.notify_debounce_ms, DEFAULT_NOTIFY_DEBOUNCE_MS);
+
+        clear_hardening_env();
     }
 
     #[test]

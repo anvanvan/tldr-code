@@ -865,6 +865,202 @@ fn test_change_impact_help() {
         stdout.contains("--base"),
         "Help should mention --base option"
     );
+    // Area 6 migration: new Python-parity flags.
+    assert!(stdout.contains("--git"), "Help should mention --git");
+    assert!(
+        stdout.contains("--git-base"),
+        "Help should mention --git-base"
+    );
+    assert!(stdout.contains("--session"), "Help should mention --session");
+    assert!(stdout.contains("--run"), "Help should mention --run");
+}
+
+// =============================================================================
+// Area 6 migration: --git call-edge affected_tests + --run execution
+// =============================================================================
+
+/// Build a tiny Python project where tests CALL the source, git-committed so a
+/// HEAD~1 diff isolates the source change. Returns the TempDir (keep it alive).
+fn create_calc_git_project() -> TempDir {
+    let temp_dir = TempDir::new().unwrap();
+    let p = temp_dir.path();
+    fs::create_dir_all(p.join("pkg")).unwrap();
+    fs::create_dir_all(p.join("tests")).unwrap();
+    fs::write(
+        p.join("pkg/calc.py"),
+        "def add(a, b):\n    return a + b\n\ndef multiply(a, b):\n    return a * b\n\ndef unused_helper(x):\n    return x\n",
+    )
+    .unwrap();
+    fs::write(
+        p.join("tests/test_calc.py"),
+        "from pkg.calc import add, multiply\n\ndef test_add():\n    assert add(1, 2) == 3\n\ndef test_multiply():\n    assert multiply(2, 3) == 6\n",
+    )
+    .unwrap();
+    fs::write(
+        p.join("tests/test_importonly.py"),
+        "from pkg.calc import unused_helper\n\ndef test_nothing():\n    assert True\n",
+    )
+    .unwrap();
+    fs::write(
+        p.join("conftest.py"),
+        "import sys, os\nsys.path.insert(0, os.path.dirname(__file__))\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let _ = Command::new("git")
+            .args(args)
+            .current_dir(p)
+            .output()
+            .expect("git should be available in the test environment");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    // Commit the infra + tests first so the HEAD~1 diff isolates the source.
+    git(&["add", "conftest.py", "tests"]);
+    git(&["commit", "-q", "-m", "init"]);
+    // Now change the source and commit it.
+    fs::write(
+        p.join("pkg/calc.py"),
+        "def add(a, b):\n    return a + b + 0\n\ndef multiply(a, b):\n    return a * b\n\ndef unused_helper(x):\n    return x\n",
+    )
+    .unwrap();
+    git(&["add", "pkg/calc.py"]);
+    git(&["commit", "-q", "-m", "change add"]);
+
+    temp_dir
+}
+
+/// HEADLINE: `--git` surfaces the call-edge-affected test file (regression for
+/// the empty-`affected_tests` bug). Also asserts the new JSON parity keys.
+#[test]
+fn test_change_impact_git_populates_affected_tests() {
+    let temp_dir = create_calc_git_project();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
+        .args(["change-impact", "--git", temp_dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to execute tldr change-impact --git");
+
+    assert!(
+        output.status.success(),
+        "change-impact --git should succeed; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output should be JSON");
+
+    let affected: Vec<String> = json["affected_tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        affected.iter().any(|t| t.ends_with("tests/test_calc.py")),
+        "call-edge-affected test must be selected; got {:?}",
+        affected
+    );
+    // New parity keys present.
+    assert!(json.get("skipped_count").is_some(), "skipped_count present");
+    assert!(json.get("total_tests").is_some(), "total_tests present");
+    assert!(
+        json.get("degraded_analysis").is_some(),
+        "degraded_analysis present"
+    );
+    assert!(json.get("test_command").is_some(), "test_command present");
+    // test_command is pytest + affected files.
+    let cmd: Vec<String> = json["test_command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(cmd.first().map(String::as_str), Some("pytest"));
+}
+
+/// `--run` prints `Running: <cmd>` to stderr, suppresses JSON on stdout,
+/// inherits the pytest session output, and propagates the (success) exit code.
+/// Skips if pytest is not installed.
+#[test]
+fn test_change_impact_run_executes_and_propagates_exit() {
+    if which::which("pytest").is_err() {
+        eprintln!("skipping: pytest not installed");
+        return;
+    }
+    let temp_dir = create_calc_git_project();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
+        .args([
+            "change-impact",
+            "--git",
+            "--run",
+            temp_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute tldr change-impact --git --run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // stderr carries the Running: notice.
+    assert!(
+        stderr.contains("Running: pytest"),
+        "stderr should contain the Running: notice; got {}",
+        stderr
+    );
+    // JSON is suppressed when --run executes.
+    assert!(
+        !stdout.contains("\"affected_tests\""),
+        "JSON should be suppressed under --run; got stdout {}",
+        stdout
+    );
+    // pytest output is inherited on stdout.
+    assert!(
+        stdout.contains("test session starts") || stdout.contains("passed"),
+        "pytest session output should be inherited; got {}",
+        stdout
+    );
+    // The fixture tests pass -> exit code 0 (propagated).
+    assert!(
+        output.status.success(),
+        "passing tests -> tldr exits 0; got {:?}",
+        output.status.code()
+    );
+}
+
+/// `--run` propagates a NON-zero exit code when the affected tests fail
+/// (parity-PLUS: Python v1.5.2 always returns 0). Skips if pytest is missing.
+#[test]
+fn test_change_impact_run_propagates_failure_exit() {
+    if which::which("pytest").is_err() {
+        eprintln!("skipping: pytest not installed");
+        return;
+    }
+    let temp_dir = create_calc_git_project();
+    // Break a test in the working tree (uncommitted) so pytest fails.
+    fs::write(
+        temp_dir.path().join("tests/test_calc.py"),
+        "from pkg.calc import add, multiply\n\ndef test_add():\n    assert add(1, 2) == 999\n\ndef test_multiply():\n    assert multiply(2, 3) == 6\n",
+    )
+    .unwrap();
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("tldr"))
+        .args([
+            "change-impact",
+            "--git",
+            "--run",
+            temp_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute tldr change-impact --git --run");
+
+    assert!(
+        !output.status.success(),
+        "failing tests -> tldr exits non-zero (parity-PLUS); got {:?}",
+        output.status.code()
+    );
 }
 
 // =============================================================================

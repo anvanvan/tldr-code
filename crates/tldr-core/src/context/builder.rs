@@ -478,6 +478,50 @@ fn find_function_in_graph(
         return Ok(location);
     }
 
+    // context-batch: qualified-name strip-and-retry hop (NARROWED).
+    //
+    // Ported from Python `_strip_namespace_qualifier` + the
+    // `resolve_func_name` fallback (`api.py:1049-1075`). When the dotted /
+    // path-qualified / `::` form did not resolve through any of the paths
+    // above, strip the rightmost namespace qualifier and retry resolution
+    // with the bare trailing segment. This covers the forms the e2e
+    // verification flagged as Rust MISSes while Python hits:
+    //   - `module.func` / `pkg.mod.func` (e.g. `calc.compute`, `mod.deepfn`,
+    //     `sub.mod.deepfn`)
+    //   - cross-convention `Struct.method` dot form (e.g. `Engine.run` where
+    //     the Rust call graph stores `Engine::run`).
+    //
+    // It does NOT alter the already-working `Class.method` / `Class::method` /
+    // bare-suffix forms: those resolve through the edge matcher or
+    // `scan_project_for_function` ABOVE and return early, so they never reach
+    // this hop. The retry is single-shot (we look up the bare segment, which
+    // by construction has no namespace separator to strip again) so there is
+    // no risk of unbounded recursion.
+    if let Some(bare) = crate::context::resolve::strip_namespace_qualifier(func_name) {
+        if bare != func_name {
+            // Retry the call-graph edge scan and the project scan with the
+            // bare name (mirrors the early-return paths, minus the file_filter
+            // shorthand which is already exhausted at this point).
+            for edge in call_graph.edges() {
+                if (edge.src_func == bare
+                    || edge.src_func.ends_with(&format!(".{}", bare)))
+                    && file_matches(&edge.src_file)
+                {
+                    return Ok((edge.src_file.clone(), edge.src_func.clone()));
+                }
+                if (edge.dst_func == bare
+                    || edge.dst_func.ends_with(&format!(".{}", bare)))
+                    && file_matches(&edge.dst_file)
+                {
+                    return Ok((edge.dst_file.clone(), edge.dst_func.clone()));
+                }
+            }
+            if let Some(location) = scan_project_for_function(project, &bare, file_filter)? {
+                return Ok(location);
+            }
+        }
+    }
+
     // Not found - collect suggestions
     let suggestions = collect_similar_function_names(call_graph, func_name);
 
@@ -581,28 +625,32 @@ fn scan_project_for_function(
     Ok(None)
 }
 
-/// Collect similar function names for error suggestions
+/// Collect similar function names for error suggestions.
+///
+/// context-batch: ported to difflib-equivalent edit-distance ranking (Python
+/// `_fuzzy_suggest` → `difflib.get_close_matches(n=3, cutoff=0.6)`). The
+/// previous substring-only matcher missed transposition / missing-char typos
+/// (`compyte`→`compute`, `helpr`→`helper`) that difflib still suggests.
+///
+/// Candidates are the distinct function names appearing in the call graph.
+/// We try the bare trailing segment of `target` first (so a qualified miss
+/// like `Foo.compyte` still suggests `compute`), then the original name —
+/// the first non-empty match list wins, exactly as Python does.
 fn collect_similar_function_names(call_graph: &ProjectCallGraph, target: &str) -> Vec<String> {
     let mut seen = HashSet::new();
-    let mut suggestions = Vec::new();
-    let target_lower = target.to_lowercase();
-
+    let mut candidates: Vec<String> = Vec::new();
     for edge in call_graph.edges() {
         for func in [&edge.src_func, &edge.dst_func] {
-            if !seen.contains(func) {
-                seen.insert(func.clone());
-                let func_lower = func.to_lowercase();
-                // Simple similarity: contains or edit distance would be better
-                if func_lower.contains(&target_lower) || target_lower.contains(&func_lower) {
-                    suggestions.push(func.clone());
-                }
+            if seen.insert(func.clone()) {
+                candidates.push(func.clone());
             }
         }
     }
+    // Deterministic candidate ordering so tie-broken suggestions are stable.
+    candidates.sort();
 
-    suggestions.sort();
-    suggestions.truncate(5);
-    suggestions
+    let bare = crate::context::resolve::strip_namespace_qualifier(target);
+    crate::context::resolve::fuzzy_suggest(target, bare.as_deref(), &candidates)
 }
 
 /// BFS collect all functions from entry point up to depth

@@ -173,8 +173,10 @@ impl DaemonStartArgs {
             }
         }
 
-        // Create and run daemon
-        let config = DaemonConfig::default();
+        // Create and run daemon. Read the hardening knobs from the environment
+        // (RSS watermark, parent pid for the watchdog, notify debounce/cooldown)
+        // so a background-spawned daemon picks up TLDR_DAEMON_PARENT_PID etc.
+        let config = DaemonConfig::from_env();
         let daemon = Arc::new(TLDRDaemon::new(project.to_path_buf(), config));
         daemon.run(listener).await?;
 

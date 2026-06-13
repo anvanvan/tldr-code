@@ -230,6 +230,14 @@ impl OutputWriter {
         eprintln!("{}", message.dimmed());
     }
 
+    /// Whether `--quiet` was requested.
+    ///
+    /// Used by callers (e.g. `extract`'s bare-extract advisory) that emit
+    /// their own stderr diagnostics and must honor `--quiet`.
+    pub fn quiet(&self) -> bool {
+        self.quiet
+    }
+
     /// Check if we should use text format
     pub fn is_text(&self) -> bool {
         matches!(self.format, OutputFormat::Text)
@@ -2730,6 +2738,184 @@ fn format_function_line(output: &mut String, func: &tldr_core::types::FunctionIn
         };
         output.push_str(&format!("{}  \"{}\"\n", indent, truncated.dimmed()));
     }
+}
+
+// =============================================================================
+// Filtered extract (Area 2 — extract-filters)
+//
+// Compact, code-first output shape emitted by `tldr extract` when any of
+// `--function` / `--method` / `--class` is set. Ports
+// `api.py:extract_file_with_code`'s compact dict (`api.py:2012-2022`):
+// `{file_path, language, classes?, functions?}` with `imports` and
+// `call_graph` intentionally dropped, and a `code` (source-span) field
+// injected on each matched function / method / class.
+//
+// These wrap the canonical `FunctionInfo` / `ClassInfo` so their existing
+// custom Serialize impls (which emit `line`/`line_end`, the tldr-code
+// canonical naming) stay authoritative; this layer only appends `code`
+// (and, on a class, swaps in the code-bearing methods). Per the area-2
+// verification, reconciling Rust's `line`/`line_end` vs Python's
+// `line_number`/`end_line` is out of scope.
+// =============================================================================
+
+/// A matched top-level function or method, carrying its canonical
+/// `FunctionInfo` fields plus an injected `code` source span.
+pub struct FilteredFn {
+    /// The canonical function/method info.
+    pub inner: tldr_core::types::FunctionInfo,
+    /// Source span for the symbol body, when its end line is known and the
+    /// slice is in range (otherwise omitted, matching `api.py:_span`).
+    pub code: Option<String>,
+}
+
+impl Serialize for FilteredFn {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Serialize the canonical FunctionInfo to a JSON object, then append
+        // `code` so the canonical key order is preserved with `code` last —
+        // mirroring api.py which mutates the dict in place.
+        let mut value = serde_json::to_value(&self.inner).map_err(serde::ser::Error::custom)?;
+        if let (Some(obj), Some(code)) = (value.as_object_mut(), &self.code) {
+            obj.insert("code".to_string(), serde_json::Value::String(code.clone()));
+        }
+        value.serialize(serializer)
+    }
+}
+
+/// A matched class, carrying its canonical `ClassInfo` fields, the
+/// (already narrowed) code-bearing methods, and an optional class-level
+/// `code` span (present only on a `--class` filter).
+pub struct FilteredClass {
+    /// The canonical class info (used for every field except `methods`).
+    pub inner: tldr_core::types::ClassInfo,
+    /// The narrowed, code-bearing methods to emit in place of `inner.methods`.
+    pub methods: Vec<FilteredFn>,
+    /// Source span for the whole class body (`--class` only).
+    pub code: Option<String>,
+}
+
+impl Serialize for FilteredClass {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Serialize the canonical ClassInfo to a JSON object, then overwrite
+        // `methods` with the code-bearing ones and append the class `code`.
+        let mut value = serde_json::to_value(&self.inner).map_err(serde::ser::Error::custom)?;
+        if let Some(obj) = value.as_object_mut() {
+            let methods = serde_json::to_value(&self.methods).map_err(serde::ser::Error::custom)?;
+            obj.insert("methods".to_string(), methods);
+            if let Some(code) = &self.code {
+                obj.insert("code".to_string(), serde_json::Value::String(code.clone()));
+            }
+        }
+        value.serialize(serializer)
+    }
+}
+
+/// Compact, code-first filtered extract result.
+///
+/// Ports `api.py:extract_file_with_code`'s compact return dict: only
+/// `file_path` + `language` plus whichever of `classes` / `functions`
+/// is non-empty. `imports` and `call_graph` are dropped.
+pub struct FilteredExtract {
+    /// File path (string form, matching the canonical `ModuleInfo.file_path`).
+    pub file_path: String,
+    /// Language name.
+    pub language: String,
+    /// Matched classes (omitted when empty, like the Python compact dict).
+    pub classes: Vec<FilteredClass>,
+    /// Matched top-level functions (omitted when empty).
+    pub functions: Vec<FilteredFn>,
+}
+
+impl Serialize for FilteredExtract {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut count = 2;
+        if !self.classes.is_empty() {
+            count += 1;
+        }
+        if !self.functions.is_empty() {
+            count += 1;
+        }
+        let mut map = serializer.serialize_map(Some(count))?;
+        map.serialize_entry("file_path", &self.file_path)?;
+        map.serialize_entry("language", &self.language)?;
+        // Match api.py:2016-2021 — classes before functions, each only when
+        // non-empty.
+        if !self.classes.is_empty() {
+            map.serialize_entry("classes", &self.classes)?;
+        }
+        if !self.functions.is_empty() {
+            map.serialize_entry("functions", &self.functions)?;
+        }
+        map.end()
+    }
+}
+
+/// Minimal text rendering of a filtered extract.
+///
+/// Python emits JSON only for filtered extracts; this is a tldr-code-only
+/// human-readable view kept intentionally small: a signature line per
+/// matched symbol (reusing `format_function_line`) followed by its `code`
+/// body when present.
+pub fn format_filtered_extract_text(result: &FilteredExtract) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "{} ({})\n",
+        result.file_path.bold(),
+        result.language.cyan()
+    ));
+
+    if !result.functions.is_empty() {
+        output.push('\n');
+        output.push_str(&format!(
+            "{} ({})\n",
+            "Functions".bold(),
+            result.functions.len()
+        ));
+        for f in &result.functions {
+            format_function_line(&mut output, &f.inner, "  ");
+            if let Some(code) = &f.code {
+                for line in code.lines() {
+                    output.push_str(&format!("    {}\n", line));
+                }
+            }
+        }
+    }
+
+    if !result.classes.is_empty() {
+        output.push('\n');
+        output.push_str(&format!("{} ({})\n", "Classes".bold(), result.classes.len()));
+        for c in &result.classes {
+            output.push_str(&format!(
+                "  {}  L{}\n",
+                c.inner.name.green(),
+                c.inner.line_number
+            ));
+            if let Some(code) = &c.code {
+                for line in code.lines() {
+                    output.push_str(&format!("    {}\n", line));
+                }
+            }
+            for m in &c.methods {
+                format_function_line(&mut output, &m.inner, "    ");
+                if let Some(code) = &m.code {
+                    for line in code.lines() {
+                        output.push_str(&format!("      {}\n", line));
+                    }
+                }
+            }
+        }
+    }
+
+    output
 }
 
 /// Format ClonesReport as SARIF JSON

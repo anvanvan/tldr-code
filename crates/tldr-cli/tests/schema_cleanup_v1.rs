@@ -429,11 +429,16 @@ fn bug22_interface_all_exports_populated() {
 }
 
 // =============================================================================
-// BUG-23: extract methods carry line_end, not line_number
+// BUG-23 + fastedit-compat: extract methods carry `line` + `line_end`, and
+// re-emit `line_number` as a value-identical alias of `line`. BUG-23 had
+// dropped `line_number` as a redundant alias; it is restored because the
+// downstream fastedit CLI reads `classes[].methods[].line_number` from
+// `extract --format json` (inference/ast_utils.py). `line` stays canonical.
+// See tldr-core src/types.rs FunctionInfo/ClassInfo Serialize impls.
 // =============================================================================
 
 #[test]
-fn bug23_extract_methods_have_line_end_not_line_number() {
+fn bug23_extract_methods_have_line_end_and_fastedit_compat_line_number() {
     let path = flask_app_py();
     let v = run_json(&["extract", path.to_str().unwrap()]);
     // Find any class with a non-empty methods array.
@@ -461,8 +466,18 @@ fn bug23_extract_methods_have_line_end_not_line_number() {
         keys.contains(&"line_end"),
         "BUG-23 regression: extract method missing 'line_end': {keys:?}"
     );
-    assert!(
-        !keys.contains(&"line_number"),
-        "BUG-23 regression: extract method still emits 'line_number' (duplicate of 'line'); should be dropped from JSON. keys: {keys:?}"
+    // fastedit-compat (reverses BUG-23's removal): `line_number` is re-emitted
+    // as a value-identical alias of `line` for the downstream fastedit consumer.
+    let line = first
+        .get("line")
+        .and_then(|x| x.as_u64())
+        .expect("method 'line' is u64");
+    let line_number = first
+        .get("line_number")
+        .and_then(|x| x.as_u64())
+        .expect("fastedit-compat: extract method must emit 'line_number' alias of 'line'");
+    assert_eq!(
+        line_number, line,
+        "fastedit-compat: line_number must equal line (alias). keys: {keys:?}"
     );
 }

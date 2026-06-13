@@ -9,7 +9,8 @@ use anyhow::Result;
 use clap::Args;
 
 use tldr_core::semantic::{
-    BuildOptions, CacheConfig, ChunkGranularity, EmbeddingModel, IndexSearchOptions, SemanticIndex,
+    BuildOptions, CacheConfig, ChunkGranularity, Device, EmbeddingModel, IndexSearchOptions,
+    SemanticIndex,
 };
 
 use crate::output::{OutputFormat, OutputWriter};
@@ -20,13 +21,37 @@ pub struct SemanticArgs {
     /// Natural language query
     pub query: String,
 
-    /// Path to search (default: current directory)
+    /// Project root (positional; overrides `--path`). Default: current directory.
     #[arg(default_value = ".")]
     pub path: PathBuf,
+
+    /// Project root (Python-parity alias of the positional PATH). The
+    /// positional PATH overrides this when both are given.
+    #[arg(long = "path", value_name = "PATH")]
+    pub path_flag: Option<PathBuf>,
 
     /// Maximum number of results
     #[arg(short = 'n', long, default_value = "10")]
     pub top: usize,
+
+    /// Number of results (Python-parity alias of `-n`/`--top`). When set,
+    /// `--k` takes precedence over `--top` (`effective_k = k.unwrap_or(top)`).
+    #[arg(long = "k", value_name = "N")]
+    pub k: Option<usize>,
+
+    /// Include call-graph expansion (`calls`/`called_by`/`related`) per result.
+    #[arg(long)]
+    pub expand: bool,
+
+    /// Compute device: `cpu` or `gpu`. Omitted => `TLDR_DEVICE` env, else `gpu`.
+    ///
+    /// DEVIATION from Python (which defaults to `cpu` and labels the GPU path
+    /// `metal`): the default here is `gpu` (per explicit user override), which
+    /// resolves to CoreML on Apple Silicon when built with the `coreml` feature
+    /// and transparently falls back to CPU otherwise. `metal` is accepted as an
+    /// alias of `gpu` for Python back-compat.
+    #[arg(long, value_name = "DEVICE")]
+    pub device: Option<String>,
 
     /// Minimum similarity threshold (0.0 to 1.0)
     #[arg(short = 't', long, default_value = "0.5")]
@@ -56,6 +81,28 @@ pub struct SemanticArgs {
 }
 
 impl SemanticArgs {
+    /// Resolve the project root: positional PATH wins over `--path`.
+    ///
+    /// The positional `path` has a clap default of `.`; when the user passed
+    /// neither a positional path nor `--path`, this is `.`. When only `--path`
+    /// is given (positional left at default `.`), `--path` is used.
+    pub fn resolved_path(&self) -> PathBuf {
+        // The positional default is ".". If the positional is the default and a
+        // --path flag was supplied, prefer the flag; otherwise the positional
+        // (which the user may have set explicitly) wins.
+        if self.path == PathBuf::from(".") {
+            if let Some(ref p) = self.path_flag {
+                return p.clone();
+            }
+        }
+        self.path.clone()
+    }
+
+    /// Effective result count: `--k` overrides `-n`/`--top` when present.
+    pub fn effective_k(&self) -> usize {
+        self.k.unwrap_or(self.top)
+    }
+
     /// Run the semantic search command
     pub fn run(&self, format: OutputFormat, quiet: bool) -> Result<()> {
         let writer = OutputWriter::new(format, quiet);
@@ -63,10 +110,16 @@ impl SemanticArgs {
         // Parse model
         let model = parse_model(&self.model)?;
 
+        // Resolve compute device: flag > TLDR_DEVICE env > Gpu default.
+        let device = Device::resolve(self.device.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+
+        let root = self.resolved_path();
+
         writer.progress(&format!(
-            "Building semantic index for {} ({} model)...",
-            self.path.display(),
-            self.model
+            "Building semantic index for {} ({} model, device={})...",
+            root.display(),
+            self.model,
+            device.as_str(),
         ));
 
         // Build options
@@ -76,6 +129,7 @@ impl SemanticArgs {
             languages: self.langs.clone(),
             show_progress: !quiet,
             use_cache: !self.no_cache,
+            device,
         };
 
         // Cache config
@@ -86,7 +140,7 @@ impl SemanticArgs {
         };
 
         // Build index
-        let mut index = SemanticIndex::build(&self.path, build_opts, cache_config)?;
+        let mut index = SemanticIndex::build(&root, build_opts, cache_config)?;
 
         writer.progress(&format!(
             "Searching {} chunks for '{}'...",
@@ -96,10 +150,11 @@ impl SemanticArgs {
 
         // Search options
         let search_opts = IndexSearchOptions {
-            top_k: self.top,
+            top_k: self.effective_k(),
             threshold: self.threshold,
             include_snippet: true,
             snippet_lines: 5,
+            expand: self.expand,
         };
 
         // Perform search

@@ -123,11 +123,12 @@ pub use pdg::{get_pdg_context, get_slice, get_slice_rich, RichSlice, SliceEdge, 
 
 // Re-export Layer 6 (Search) functions for convenience
 pub use search::{
-    enriched_search, enriched_search_with_callgraph_cache, enriched_search_with_index,
-    enriched_search_with_structure_cache, hybrid_search, read_callgraph_cache,
-    read_structure_cache, search, search_with_inner, write_structure_cache, Bm25Index, Bm25Result,
-    CallGraphLookup, EmbeddingClient, EnrichedResult, EnrichedSearchOptions, EnrichedSearchReport,
-    HybridResult, HybridSearchReport, SearchMatch, SearchMode, StructureLookup, Tokenizer,
+    compile_grep_pattern, enriched_search, enriched_search_with_callgraph_cache,
+    enriched_search_with_index, enriched_search_with_structure_cache, grep_search, hybrid_search,
+    normalize_grep_pattern, read_callgraph_cache, read_structure_cache, search, search_with_inner,
+    write_structure_cache, Bm25Index, Bm25Result, CallGraphLookup, EmbeddingClient, EnrichedResult,
+    EnrichedSearchOptions, EnrichedSearchReport, HybridResult, HybridSearchReport, SearchMatch,
+    SearchMode, StructureLookup, Tokenizer, GREP_SKIP_DIRS,
 };
 
 /// Result type alias for all TLDR operations

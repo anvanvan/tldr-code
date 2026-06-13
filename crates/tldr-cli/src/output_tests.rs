@@ -1968,3 +1968,99 @@ fn test_module_info_text_compression() {
         json.len()
     );
 }
+
+// =============================================================================
+// FilteredExtract (Area 2 — extract-filters) output-layer tests
+// =============================================================================
+
+use crate::output::{
+    format_filtered_extract_text, FilteredClass, FilteredExtract, FilteredFn,
+};
+
+fn filtered_fn(name: &str, line: u32, end: u32, code: Option<&str>) -> FilteredFn {
+    FilteredFn {
+        inner: FunctionInfo {
+            name: name.to_string(),
+            params: vec![],
+            return_type: None,
+            docstring: None,
+            is_method: false,
+            is_async: false,
+            decorators: vec![],
+            line_number: line,
+            line_end: end,
+        },
+        code: code.map(str::to_string),
+    }
+}
+
+/// FilteredExtract JSON drops imports/call_graph and omits empty arrays, with
+/// `code` surfacing within the first lines (not buried under imports).
+#[test]
+fn filtered_extract_serializes_compact_with_code() {
+    let fe = FilteredExtract {
+        file_path: "/src/example.py".to_string(),
+        language: "python".to_string(),
+        classes: vec![],
+        functions: vec![filtered_fn("alpha", 1, 2, Some("def alpha():\n    return 1"))],
+    };
+    let json = serde_json::to_string_pretty(&fe).unwrap();
+    assert!(!json.contains("imports"), "imports must be absent");
+    assert!(!json.contains("call_graph"), "call_graph must be absent");
+    assert!(!json.contains("\"classes\""), "empty classes omitted");
+    assert!(json.contains("\"code\""), "code field present");
+
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["functions"][0]["code"], "def alpha():\n    return 1");
+    // code surfaces early — within the first ~30 lines of pretty JSON.
+    let code_line = json.lines().position(|l| l.contains("\"code\"")).unwrap();
+    assert!(code_line < 30, "code at line {code_line}, expected < 30");
+}
+
+/// A class filter serializes class-level code + code-bearing methods, classes
+/// emitted before functions.
+#[test]
+fn filtered_extract_class_shape() {
+    let fe = FilteredExtract {
+        file_path: "/src/example.py".to_string(),
+        language: "python".to_string(),
+        classes: vec![FilteredClass {
+            inner: ClassInfo {
+                name: "Widget".to_string(),
+                bases: vec![],
+                docstring: None,
+                methods: vec![],
+                fields: vec![],
+                decorators: vec![],
+                line_number: 1,
+                line_end: 4,
+            },
+            methods: vec![filtered_fn("render", 2, 3, Some("    def render(self): ..."))],
+            code: Some("class Widget:\n    def render(self): ...".to_string()),
+        }],
+        functions: vec![],
+    };
+    let v: serde_json::Value = serde_json::to_value(&fe).unwrap();
+    let obj = v.as_object().unwrap();
+    assert!(obj.contains_key("classes"));
+    assert!(!obj.contains_key("functions"), "empty functions omitted");
+    let c = &v["classes"][0];
+    assert_eq!(c["name"], "Widget");
+    assert!(c["code"].as_str().unwrap().starts_with("class Widget:"));
+    assert_eq!(c["methods"][0]["name"], "render");
+    assert!(c["methods"][0]["code"].as_str().is_some());
+}
+
+/// The text formatter renders matched bodies.
+#[test]
+fn filtered_extract_text_renders_body() {
+    let fe = FilteredExtract {
+        file_path: "/src/example.py".to_string(),
+        language: "python".to_string(),
+        classes: vec![],
+        functions: vec![filtered_fn("alpha", 1, 2, Some("def alpha():\n    return 1"))],
+    };
+    let text = format_filtered_extract_text(&fe);
+    assert!(text.contains("alpha"));
+    assert!(text.contains("return 1"));
+}

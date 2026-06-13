@@ -178,6 +178,31 @@ pub fn chunk_file<P: AsRef<Path>>(path: P, options: &ChunkOptions) -> TldrResult
         return Ok(ChunkResult { chunks, skipped });
     }
 
+    // Non-code files (.md/.toml/.sh/.yaml/.json/... + Makefile/Dockerfile/...)
+    // are indexed as a single whole-file chunk BEFORE the `Language::from_path`
+    // skip-gate below — those have no tree-sitter language and would otherwise
+    // be dropped as "Unknown language". Parity with Python's
+    // `_build_non_code_file_entry` (api.py:2435, semantic.py:1398). The chunk
+    // carries `doc_kind=Some(..)` so downstream call-graph / enrichment passes
+    // skip it.
+    //
+    // Honour the language filter: a non-code file's `doc_kind` is its
+    // pseudo-language tag (`markdown`/`toml`/...). When `--langs` is set with
+    // real code extensions, `from_extension` returns None for these tags, so a
+    // doc_kind-only filter never matches; we therefore only emit non-code
+    // chunks when no language filter is active (filters target code).
+    if let Some(_kind) = crate::semantic::noncode::noncode_kind(path) {
+        if options.languages.is_none() {
+            if let Some(chunk) = crate::semantic::noncode::build_noncode_chunk(path) {
+                chunks.push(chunk);
+                return Ok(ChunkResult { chunks, skipped });
+            }
+        }
+        // Filter active or unreadable: fall through to be reported as skipped
+        // below (the `Language::from_path` gate will record an Unknown-language
+        // skip, matching prior behaviour).
+    }
+
     // Detect language from extension
     let language = match Language::from_path(path) {
         Some(lang) => lang,
@@ -360,6 +385,7 @@ fn create_file_chunk(
         content: final_content,
         content_hash: compute_hash(content),
         language,
+        doc_kind: None,
     }
 }
 
@@ -441,6 +467,7 @@ fn extract_function_chunks(
                 content: final_content,
                 content_hash: compute_hash(&func.content),
                 language,
+                doc_kind: None,
             }
         })
         .collect()

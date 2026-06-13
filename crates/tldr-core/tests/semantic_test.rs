@@ -70,6 +70,7 @@ mod types_tests {
             content: content.clone(),
             content_hash: "abc123".to_string(),
             language: Language::Rust,
+            doc_kind: None,
         };
 
         // THEN: Fields should be set correctly
@@ -92,6 +93,7 @@ mod types_tests {
             content: "def foo(): pass".to_string(),
             content_hash: "hash123".to_string(),
             language: Language::Python,
+            doc_kind: None,
         };
 
         // WHEN: We serialize and deserialize
@@ -174,6 +176,9 @@ mod types_tests {
                 line_start: 1,
                 line_end: 10,
                 snippet: "fn a()".to_string(),
+                calls: None,
+                called_by: None,
+                related: None,
             },
             SemanticSearchResult {
                 file_path: PathBuf::from("b.rs"),
@@ -183,6 +188,9 @@ mod types_tests {
                 line_start: 1,
                 line_end: 10,
                 snippet: "fn b()".to_string(),
+                calls: None,
+                called_by: None,
+                related: None,
             },
             SemanticSearchResult {
                 file_path: PathBuf::from("c.rs"),
@@ -192,6 +200,9 @@ mod types_tests {
                 line_start: 1,
                 line_end: 10,
                 snippet: "fn c()".to_string(),
+                calls: None,
+                called_by: None,
+                related: None,
             },
         ];
 

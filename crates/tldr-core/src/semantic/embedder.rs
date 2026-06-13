@@ -36,12 +36,64 @@
 //! - **1.3**: Shows progress message before model download
 //! - **4.1**: Model integrity validation after load (dimension check)
 
-use fastembed::{EmbeddingModel as FastEmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{
+    EmbeddingModel as FastEmbeddingModel, ExecutionProviderDispatch, InitOptions, TextEmbedding,
+};
 
 use crate::error::TldrError;
 use crate::semantic::similarity::normalize;
-use crate::semantic::types::EmbeddingModel;
+use crate::semantic::types::{Device, EmbeddingModel};
 use crate::TldrResult;
+
+/// Build the ONNX execution-provider list for a requested [`Device`].
+///
+/// The `coreml_available` parameter models whether a CoreML execution provider
+/// is reachable in this build/platform (true only when the `coreml` cargo
+/// feature is enabled). This is a pure, testable function so the device→EP
+/// mapping can be unit-tested without loading a model.
+///
+/// Mapping:
+/// - `(Gpu, true)`  -> `[CoreML, CPU]` — GPU best-effort with CPU fallback.
+/// - `(Gpu, false)` -> `[CPU]`         — GPU requested but unreachable; CPU.
+/// - `(Cpu, _)`     -> `[CPU]`         — explicit CPU.
+///
+/// fastembed/ort register providers in order and skip any that aren't
+/// supported by the platform, so a leading CoreML EP transparently falls back
+/// to CPU when CoreML can't be used at runtime (never hard-fails).
+pub fn providers_for(device: Device, coreml_available: bool) -> Vec<ExecutionProviderDispatch> {
+    let mut providers: Vec<ExecutionProviderDispatch> = Vec::new();
+
+    #[cfg(feature = "coreml")]
+    {
+        if device == Device::Gpu && coreml_available {
+            providers.push(ort::ep::CoreML::default().build());
+        }
+    }
+    #[cfg(not(feature = "coreml"))]
+    {
+        // `coreml_available` is only meaningful under the `coreml` feature;
+        // without it there is no CoreML EP to add. Silence the unused warning.
+        let _ = (device, coreml_available);
+    }
+
+    // CPU is always the final (fallback) provider.
+    #[cfg(feature = "coreml")]
+    {
+        providers.push(ort::ep::CPU::default().build());
+    }
+
+    providers
+}
+
+/// Whether a CoreML execution provider is reachable in this build.
+///
+/// `true` only when compiled with the `coreml` cargo feature (which pulls the
+/// `coreml`-gated `ort` dependency). On non-Apple platforms the CoreML EP will
+/// still be skipped at runtime by ort's platform check, so this is a
+/// build-time capability flag, not a runtime guarantee.
+pub const fn coreml_available() -> bool {
+    cfg!(feature = "coreml")
+}
 
 /// Options for embedding operations
 ///
@@ -107,8 +159,38 @@ impl Embedder {
     /// let embedder = Embedder::new(EmbeddingModel::ArcticM)?;
     /// ```
     pub fn new(model: EmbeddingModel) -> TldrResult<Self> {
+        // Default device is GPU (deliberate deviation from Python's CPU
+        // default); resolves to CoreML when built with `coreml` on Apple
+        // Silicon, transparent CPU fallback otherwise.
+        Self::with_device(model, Device::default())
+    }
+
+    /// Create a new embedder with an explicit compute [`Device`].
+    ///
+    /// Like [`Embedder::new`] but lets the caller request `gpu` (CoreML
+    /// best-effort) or `cpu`. GPU is best-effort: when CoreML is unreachable
+    /// (no `coreml` feature, or non-Apple platform) it transparently falls
+    /// back to CPU and prints one diagnostic line (unless `TLDR_QUIET`).
+    ///
+    /// Also sets `with_show_download_progress(false)` to suppress fastembed's
+    /// HF cold-load progress noise (parity with Python `_suppress_hf_noise`).
+    pub fn with_device(model: EmbeddingModel, device: Device) -> TldrResult<Self> {
         // Convert our model enum to fastembed's
         let fast_model = Self::to_fastembed_model(model);
+
+        // Best-effort GPU diagnostic: when GPU was requested but CoreML is not
+        // reachable in this build, emit one line (unless quiet) so the user
+        // knows the embedder fell back to CPU. Never hard-fail.
+        if device == Device::Gpu
+            && !coreml_available()
+            && std::env::var_os("TLDR_QUIET").is_none()
+        {
+            eprintln!(
+                "Note: GPU (CoreML) requested but not available in this build; using CPU."
+            );
+        }
+
+        let providers = providers_for(device, coreml_available());
 
         // P0 Mitigation 1.3: Progress message before download.
         //
@@ -148,12 +230,28 @@ impl Embedder {
         // Best-effort create; fastembed will surface a precise error if the
         // directory cannot be created or is not writable.
         let _ = std::fs::create_dir_all(&cache_dir);
-        let mut embedding =
-            TextEmbedding::try_new(InitOptions::new(fast_model).with_cache_dir(cache_dir))
-                .map_err(|e| TldrError::ModelLoadError {
-                    model: model.model_name().to_string(),
-                    detail: e.to_string(),
-                })?;
+
+        // Build init options:
+        // - `with_show_download_progress(false)` suppresses fastembed's HF
+        //   cold-load progress noise (parity with Python `_suppress_hf_noise`,
+        //   9fa72c2); the embedder's own load banner is gated separately by
+        //   `TLDR_QUIET` above.
+        // - `with_execution_providers(providers)` wires the CoreML+CPU (or
+        //   CPU-only) EP list. ort registers them in order, skipping any not
+        //   supported on the current platform -> transparent CPU fallback.
+        let mut init_options = InitOptions::new(fast_model)
+            .with_cache_dir(cache_dir)
+            .with_show_download_progress(false);
+        if !providers.is_empty() {
+            init_options = init_options.with_execution_providers(providers);
+        }
+
+        let mut embedding = TextEmbedding::try_new(init_options).map_err(|e| {
+            TldrError::ModelLoadError {
+                model: model.model_name().to_string(),
+                detail: e.to_string(),
+            }
+        })?;
 
         // P0 Mitigation 4.1: Model integrity check
         // Embed a known input and verify dimensions

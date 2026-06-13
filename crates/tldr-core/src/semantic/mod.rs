@@ -71,6 +71,8 @@ pub use types::{
     ChunkOptions,
     // Core types
     CodeChunk,
+    // Device selector
+    Device,
     // Option types
     EmbedOptions,
     EmbedReport,
@@ -92,11 +94,15 @@ pub use similarity::{cosine_similarity, is_normalized, normalize, top_k_similar}
 
 // Phase 3: Embedder
 pub mod embedder;
-pub use embedder::Embedder;
+pub use embedder::{coreml_available, providers_for, Embedder};
 
 // Phase 4: Chunker
 pub mod chunker;
 pub use chunker::{chunk_code, chunk_file, ChunkResult, SkippedFile};
+
+// Non-code file indexing (whole-file doc/config/build units)
+pub mod noncode;
+pub use noncode::{build_noncode_chunk, noncode_kind, NON_CODE_EXTENSIONS};
 
 // Phase 5: Cache
 pub mod cache;

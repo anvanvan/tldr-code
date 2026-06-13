@@ -12,6 +12,7 @@
 pub mod bm25;
 pub mod embedding_client;
 pub mod enriched;
+pub mod grep;
 pub mod hybrid;
 pub mod text;
 pub mod tokenizer;
@@ -25,6 +26,7 @@ pub use enriched::{
     search_with_inner, write_structure_cache, CallGraphLookup, EnrichedResult,
     EnrichedSearchOptions, EnrichedSearchReport, SearchMode, StructureLookup,
 };
+pub use grep::{compile_grep_pattern, grep_search, normalize_grep_pattern, GREP_SKIP_DIRS};
 pub use hybrid::{hybrid_search, HybridResult, HybridSearchReport};
 pub use text::{search, SearchMatch};
 pub use tokenizer::Tokenizer;

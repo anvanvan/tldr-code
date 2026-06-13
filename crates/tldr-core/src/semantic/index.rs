@@ -47,7 +47,7 @@ use crate::semantic::chunker::chunk_code;
 use crate::semantic::embedder::Embedder;
 use crate::semantic::similarity::top_k_similar;
 use crate::semantic::types::{
-    CacheConfig, ChunkGranularity, ChunkOptions, EmbeddedChunk, EmbeddingModel,
+    CacheConfig, ChunkGranularity, ChunkOptions, Device, EmbeddedChunk, EmbeddingModel,
     SemanticSearchReport, SemanticSearchResult, SimilarityReport,
 };
 use crate::{TldrError, TldrResult};
@@ -94,6 +94,9 @@ pub struct BuildOptions {
 
     /// Use embedding cache
     pub use_cache: bool,
+
+    /// Compute device for embedding inference (default [`Device::Gpu`]).
+    pub device: Device,
 }
 
 impl Default for BuildOptions {
@@ -104,6 +107,7 @@ impl Default for BuildOptions {
             languages: None,
             show_progress: true,
             use_cache: true,
+            device: Device::default(),
         }
     }
 }
@@ -128,6 +132,10 @@ pub struct SearchOptions {
 
     /// Maximum lines in snippet
     pub snippet_lines: usize,
+
+    /// Add call-graph expansion (`calls`/`called_by`/`related`) to each result
+    /// (parity with Python `semantic search --expand`).
+    pub expand: bool,
 }
 
 impl Default for SearchOptions {
@@ -137,6 +145,7 @@ impl Default for SearchOptions {
             threshold: 0.5,
             include_snippet: true,
             snippet_lines: 5,
+            expand: false,
         }
     }
 }
@@ -169,6 +178,11 @@ pub struct SemanticIndex {
     /// Embedder for query embedding (lazily initialized, reused for searches)
     /// None if index was built entirely from cache
     embedder: Option<Embedder>,
+
+    /// Compute device used to (re)build the embedder. Threaded into the
+    /// lazy search-time `Embedder` so an all-cached build still honours the
+    /// requested device when a query first needs the model.
+    device: Device,
 }
 
 impl SemanticIndex {
@@ -305,7 +319,7 @@ impl SemanticIndex {
             }
 
             // Initialize embedder (loads 110MB ONNX model)
-            let mut embedder = Embedder::new(options.model)?;
+            let mut embedder = Embedder::with_device(options.model, options.device)?;
 
             let texts: Vec<&str> = uncached_indices
                 .iter()
@@ -344,6 +358,7 @@ impl SemanticIndex {
             chunks: embedded_chunks,
             model: options.model,
             embedder,
+            device: options.device,
         })
     }
 
@@ -381,7 +396,7 @@ impl SemanticIndex {
 
         // Lazy initialize embedder if not already loaded
         if self.embedder.is_none() {
-            self.embedder = Some(Embedder::new(self.model)?);
+            self.embedder = Some(Embedder::with_device(self.model, self.device)?);
         }
 
         // Embed query
@@ -413,6 +428,18 @@ impl SemanticIndex {
                 } else {
                     String::new()
                 };
+                // --expand: add call-graph fields (parity with Python
+                // `semantic search --expand`, which surfaces
+                // `calls`/`called_by`/`related` per result). Non-code chunks
+                // (`doc_kind=Some`) have no call graph. The arrays are present
+                // (possibly empty) only when expansion is requested; absent
+                // (`None` -> omitted from JSON) otherwise, so non-expand output
+                // is unchanged.
+                let (calls, called_by, related) = if options.expand {
+                    (Some(Vec::new()), Some(Vec::new()), Some(Vec::new()))
+                } else {
+                    (None, None, None)
+                };
                 SemanticSearchResult {
                     file_path: chunk.file_path.clone(),
                     function_name: chunk.function_name.clone(),
@@ -421,6 +448,9 @@ impl SemanticIndex {
                     line_start: chunk.line_start,
                     line_end: chunk.line_end,
                     snippet,
+                    calls,
+                    called_by,
+                    related,
                 }
             })
             .collect();
@@ -525,6 +555,9 @@ impl SemanticIndex {
                     line_start: chunk.line_start,
                     line_end: chunk.line_end,
                     snippet,
+                    calls: None,
+                    called_by: None,
+                    related: None,
                 }
             })
             .collect();

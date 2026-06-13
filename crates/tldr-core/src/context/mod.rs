@@ -29,5 +29,10 @@
 //! ```
 
 pub mod builder;
+pub mod resolve;
 
 pub use builder::{get_relevant_context, FunctionContext, RelevantContext};
+pub use resolve::{
+    fuzzy_suggest, get_relevant_context_multi, resolve_context_languages, strip_namespace_qualifier,
+    MultiContextOutcome, SUPPORTED_CONTEXT_LANGUAGES,
+};

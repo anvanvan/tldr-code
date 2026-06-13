@@ -421,6 +421,33 @@ fn resolve_intra_call(
     let func_index = context.resolution_context.func_index;
     let language = context.resolution_context.language;
 
+    // Area 7 item 2: PHP bare `ClassName::method()` whose class is defined in
+    // the SAME file is emitted by php.rs as CallType::Intra with a
+    // `ClassName::method` target (because the class name is in
+    // `defined_classes`). The generic intra/by-name lookups below cannot
+    // resolve a `::`-qualified target, so handle it here by routing the
+    // literal class name through the standard class/base method resolver.
+    // (Relative scopes parent/self/static are never `defined_classes`, so
+    // they stay CallType::Static and never reach this branch.)
+    if language == "php" {
+        if let Some((class_name, method)) = call_site.target.split_once("::") {
+            if let Some(target) =
+                resolve_method_in_class(class_name, method, class_index, func_index, language)
+                    .or_else(|| {
+                        resolve_method_in_bases(
+                            class_name,
+                            method,
+                            class_index,
+                            func_index,
+                            language,
+                        )
+                    })
+            {
+                return Some(target);
+            }
+        }
+    }
+
     if let Some(func) = file_ir
         .funcs
         .iter()
@@ -502,6 +529,16 @@ fn resolve_static_call(
                     return Some(target);
                 }
             }
+        }
+        // Area 7 item 1: PHP `parent::m()` (and base/super aliases) must
+        // resolve ONLY through the enclosing class's real base. When no base
+        // is resolvable (e.g. an implements-only class, or a class with no
+        // parent at all), drop the edge rather than letting the generic
+        // resolver fuzzy-match an arbitrary global method also named `m`.
+        // Gated on PHP + the relative-scope keyword so other languages'
+        // genuine static calls are untouched.
+        if language == "php" {
+            return None;
         }
     }
 
@@ -1429,6 +1466,181 @@ def run():
         assert!(
             !resolved_calls.resolved.is_empty() || !resolved_calls.unresolved.is_empty(),
             "Should have processed some calls"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Area 7 (lang-callgraph-diffs): PHP static-call correctness items.
+    //
+    // These two items come from the e2e verification oracle
+    // (thoughts/verification/lang-callgraph-diffs.md), NOT the static spec:
+    //   1. `parent::m()` over-resolution: when a PHP class uses `parent::`
+    //      but has NO resolvable base class, the edge MUST be dropped rather
+    //      than falling back to an arbitrary global same-named method.
+    //   2. Bare `ClassName::method()` static calls (e.g. `User::find()`)
+    //      defined in the same file MUST resolve to the named class's method.
+    // ---------------------------------------------------------------------
+
+    /// Build a PHP project call graph (with type resolution on, matching the
+    /// real `tldr calls` path) and return the resolved cross-file edges as
+    /// `(src_func, dst_func)` pairs.
+    #[cfg(test)]
+    fn php_edges(dir: &std::path::Path) -> Vec<(String, String)> {
+        let config = BuildConfig {
+            language: "php".to_string(),
+            use_type_resolution: true,
+            ..Default::default()
+        };
+        let ir = build_project_call_graph_v2(dir, config).unwrap();
+        ir.edges
+            .iter()
+            .map(|e| (e.src_func.clone(), e.dst_func.clone()))
+            .collect()
+    }
+
+    /// Item 1: a PHP class that uses `parent::m()` but has NO base class must
+    /// NOT resolve the call to an arbitrary global method named `m` defined in
+    /// some unrelated class. The edge is dropped.
+    #[test]
+    fn test_php_parent_no_base_drops_edge() {
+        let dir = TempDir::new().unwrap();
+        let code = r#"<?php
+class Base { public function m() { return 1; } }
+class Other { public function m() { return 99; } }
+class Child extends Base {
+    public function f() { parent::m(); }
+}
+class NoParent {
+    public function f() { parent::m(); }
+}
+"#;
+        std::fs::write(dir.path().join("code.php"), code).unwrap();
+
+        let edges = php_edges(dir.path());
+
+        // Child extends Base -> parent::m() resolves to Base.m (correct).
+        assert!(
+            edges
+                .iter()
+                .any(|(s, d)| s == "Child.f" && d == "Base.m"),
+            "Child.f should resolve parent::m() to Base.m; edges: {edges:?}"
+        );
+
+        // NoParent has no base -> parent::m() must NOT resolve to any method
+        // (no fallback to the arbitrary global Other.m / Base.m).
+        assert!(
+            !edges.iter().any(|(s, _)| s == "NoParent.f"),
+            "NoParent.f has no base; parent::m() must be dropped, not \
+             over-resolved to a global same-named method; edges: {edges:?}"
+        );
+    }
+
+    /// Item 1 regression guard: the over-resolution fix must NOT break the
+    /// working `parent::`/`self::`/`static::` resolution when a base class
+    /// (and same-named interface) IS present. (B1/B2/B4 from the oracle.)
+    #[test]
+    fn test_php_relative_scopes_still_resolve() {
+        let dir = TempDir::new().unwrap();
+        let code = r#"<?php
+interface I { public function ifaceMethod(); }
+class Base { public function m() { return 1; } }
+class Child extends Base implements I {
+    public function f() { parent::m(); self::g(); static::h(); }
+    public function g() { return 2; }
+    public function h() { return 3; }
+    public function ifaceMethod() { return 4; }
+}
+"#;
+        std::fs::write(dir.path().join("code.php"), code).unwrap();
+
+        let edges = php_edges(dir.path());
+
+        assert!(
+            edges.iter().any(|(s, d)| s == "Child.f" && d == "Base.m"),
+            "parent::m() should resolve to Base.m (extends, not the interface); edges: {edges:?}"
+        );
+        assert!(
+            edges.iter().any(|(s, d)| s == "Child.f" && d == "Child.g"),
+            "self::g() should resolve to Child.g; edges: {edges:?}"
+        );
+        assert!(
+            edges.iter().any(|(s, d)| s == "Child.f" && d == "Child.h"),
+            "static::h() should resolve to Child.h; edges: {edges:?}"
+        );
+    }
+
+    /// Item 1 cross-file regression guard from the oracle Fixture A/D:
+    /// an implements-only class that uses `parent::m()` must drop the edge
+    /// even when a global method named `m` exists in another file.
+    #[test]
+    fn test_php_implements_only_parent_drops_edge() {
+        let dir = TempDir::new().unwrap();
+        let base = r#"<?php
+class Base { public function m() { return 1; } }
+"#;
+        let only = r#"<?php
+interface IFace { public function f(); }
+class OnlyImpl implements IFace {
+    public function f() { parent::m(); }
+}
+"#;
+        std::fs::write(dir.path().join("base.php"), base).unwrap();
+        std::fs::write(dir.path().join("only.php"), only).unwrap();
+
+        let edges = php_edges(dir.path());
+
+        assert!(
+            !edges.iter().any(|(s, _)| s == "OnlyImpl.f"),
+            "OnlyImpl implements-only -> parent::m() must drop, not resolve to \
+             the global Base.m; edges: {edges:?}"
+        );
+    }
+
+    /// Item 2: a bare `ClassName::method()` static call where the class is
+    /// defined in the SAME file (so php.rs emits it as CallType::Intra with a
+    /// `ClassName::method` target) must resolve to that class's method.
+    /// Python resolves `Repo::load -> User::find`; Rust must match.
+    #[test]
+    fn test_php_bare_static_same_file_resolves() {
+        let dir = TempDir::new().unwrap();
+        let code = r#"<?php
+class User { public static function find($id){ return $id; } }
+class Repo { public function load(){ User::find(1); } }
+"#;
+        std::fs::write(dir.path().join("bare.php"), code).unwrap();
+
+        let edges = php_edges(dir.path());
+
+        assert!(
+            edges
+                .iter()
+                .any(|(s, d)| s == "Repo.load" && d == "User.find"),
+            "Repo.load should resolve bare User::find() to User.find; edges: {edges:?}"
+        );
+    }
+
+    /// Item 2 regression guard: bare `ClassName::method()` where the class is
+    /// in a DIFFERENT file already worked (CallType::Static path) and must
+    /// keep working.
+    #[test]
+    fn test_php_bare_static_cross_file_still_resolves() {
+        let dir = TempDir::new().unwrap();
+        let user = r#"<?php
+class User { public static function find($id){ return $id; } }
+"#;
+        let repo = r#"<?php
+class Repo { public function load(){ User::find(1); } }
+"#;
+        std::fs::write(dir.path().join("user.php"), user).unwrap();
+        std::fs::write(dir.path().join("repo.php"), repo).unwrap();
+
+        let edges = php_edges(dir.path());
+
+        assert!(
+            edges
+                .iter()
+                .any(|(s, d)| s == "Repo.load" && d == "User.find"),
+            "cross-file bare User::find() must still resolve to User.find; edges: {edges:?}"
         );
     }
 }

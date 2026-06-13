@@ -422,6 +422,7 @@ mod change_impact_tests {
             detection_method: "explicit".to_string(),
             metadata: None,
             status: tldr_core::analysis::ChangeImpactStatus::Completed,
+            ..Default::default()
         };
 
         // THEN: It should have the expected structure

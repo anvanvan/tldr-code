@@ -460,6 +460,7 @@ mod cache_tests {
             content: content.to_string(),
             content_hash: format!("{:x}", md5::compute(content)),
             language: Language::Rust,
+            doc_kind: None,
         }
     }
 
@@ -672,6 +673,7 @@ mod cache_tests {
             content: content.to_string(),
             content_hash: format!("{:x}", md5::compute(content)),
             language: Language::Rust,
+            doc_kind: None,
         };
         let chunk2 = CodeChunk {
             file_path: PathBuf::from("test/bar.rs"),
@@ -682,6 +684,7 @@ mod cache_tests {
             content: content.to_string(),
             content_hash: format!("{:x}", md5::compute(content)), // Same hash!
             language: Language::Rust,
+            doc_kind: None,
         };
 
         let embedding1 = vec![0.1, 0.2, 0.3];

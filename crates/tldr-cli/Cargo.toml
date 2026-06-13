@@ -25,6 +25,8 @@ path = "src/bin/tldr_mcp.rs"
 [features]
 default = []
 semantic = ["tldr-core/semantic"]
+# CoreML (GPU) execution provider on Apple Silicon. Implies `semantic`.
+coreml = ["semantic", "tldr-core/coreml"]
 experimental_callgraph = ["tldr-core/experimental_callgraph"]
 
 [dependencies]

@@ -65,6 +65,7 @@ fn create_test_chunk() -> CodeChunk {
         content: "fn process_data() { println!(\"hello\"); }".to_string(),
         content_hash: "abc123".to_string(),
         language: Language::Rust,
+        doc_kind: None,
     }
 }
 
@@ -185,6 +186,7 @@ fn test_code_chunk_file_level() {
         content: "// Entire file content".to_string(),
         content_hash: "file_hash".to_string(),
         language: Language::Rust,
+        doc_kind: None,
     };
 
     assert!(chunk.function_name.is_none());
@@ -574,6 +576,9 @@ fn test_semantic_search_result_ordering() {
             line_start: 1,
             line_end: 10,
             snippet: "fn a()".to_string(),
+            calls: None,
+            called_by: None,
+            related: None,
         },
         SemanticSearchResult {
             file_path: PathBuf::from("b.rs"),
@@ -583,6 +588,9 @@ fn test_semantic_search_result_ordering() {
             line_start: 1,
             line_end: 10,
             snippet: "fn b()".to_string(),
+            calls: None,
+            called_by: None,
+            related: None,
         },
     ];
 
@@ -608,6 +616,7 @@ fn test_semantic_workflow_simulation() {
         content: "def process_data(data):\n    return data".to_string(),
         content_hash: "hash1".to_string(),
         language: Language::Python,
+        doc_kind: None,
     };
 
     let _chunk2 = CodeChunk {
@@ -619,6 +628,7 @@ fn test_semantic_workflow_simulation() {
         content: "def analyze_data(data):\n    return data * 2".to_string(),
         content_hash: "hash2".to_string(),
         language: Language::Python,
+        doc_kind: None,
     };
 
     // Create normalized embeddings (simulated)

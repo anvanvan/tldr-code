@@ -16,6 +16,91 @@ use serde::{Deserialize, Serialize};
 
 use crate::Language;
 
+/// Compute device for embedding inference.
+///
+/// Mirrors the Python `tldr semantic --device {cpu,metal}` selector with the
+/// deliberate user-mandated label deviation: the Rust port exposes
+/// `--device {cpu,gpu}` where `gpu` is the Apple-Silicon CoreML/metal path.
+///
+/// # Precedence
+///
+/// [`Device::resolve`] applies: explicit flag > `TLDR_DEVICE` env > default
+/// ([`Device::Gpu`]). This is a deliberate deviation from Python's CPU default
+/// (per explicit user override).
+///
+/// # Reachability
+///
+/// `Gpu` resolves to CoreML at runtime only when the crate is built with the
+/// `coreml` cargo feature AND the platform supports CoreML (Apple Silicon).
+/// Otherwise it transparently falls back to CPU (best-effort, never hard-fails).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Device {
+    /// CPU-only inference (ONNX CPU execution provider).
+    Cpu,
+    /// GPU inference — CoreML on Apple Silicon when reachable, else CPU
+    /// fallback. This is the default (deliberate deviation from Python's CPU
+    /// default).
+    #[default]
+    Gpu,
+}
+
+impl Device {
+    /// Resolve the effective device from an optional explicit flag value.
+    ///
+    /// Precedence: explicit `flag` > `TLDR_DEVICE` env var > [`Device::Gpu`]
+    /// default. The accepted string spellings are `cpu` and `gpu`. For Python
+    /// back-compat the alias `metal` maps to [`Device::Gpu`]. An unrecognized
+    /// value (from flag or env) returns `Err` with a human-readable message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tldr_core::semantic::Device;
+    ///
+    /// // Explicit flag wins.
+    /// assert_eq!(Device::resolve(Some("cpu")).unwrap(), Device::Cpu);
+    /// // metal is an accepted alias of gpu (Python parity).
+    /// assert_eq!(Device::resolve(Some("metal")).unwrap(), Device::Gpu);
+    /// ```
+    pub fn resolve(flag: Option<&str>) -> Result<Self, String> {
+        // 1. Explicit flag.
+        if let Some(f) = flag {
+            return Self::parse(f);
+        }
+        // 2. TLDR_DEVICE env.
+        if let Ok(env) = std::env::var("TLDR_DEVICE") {
+            let trimmed = env.trim();
+            if !trimmed.is_empty() {
+                return Self::parse(trimmed);
+            }
+        }
+        // 3. Default.
+        Ok(Device::default())
+    }
+
+    /// Parse a single device spelling (case-insensitive). `metal` is accepted
+    /// as a Python-parity alias of `gpu`.
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cpu" => Ok(Device::Cpu),
+            "gpu" | "metal" => Ok(Device::Gpu),
+            other => Err(format!(
+                "Invalid device '{}'. Options: cpu, gpu",
+                other
+            )),
+        }
+    }
+
+    /// Canonical lowercase string for this device (`"cpu"` / `"gpu"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Device::Cpu => "cpu",
+            Device::Gpu => "gpu",
+        }
+    }
+}
+
 /// A chunk of code that can be embedded
 ///
 /// Represents a discrete unit of code extracted from a source file,
@@ -37,6 +122,7 @@ use crate::Language;
 ///     content: "fn process_data() { ... }".to_string(),
 ///     content_hash: "abc123".to_string(),
 ///     language: Language::Rust,
+///     doc_kind: None,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +150,22 @@ pub struct CodeChunk {
 
     /// Language of the code
     pub language: Language,
+
+    /// Non-code document type, when this chunk was produced from a non-code
+    /// file (`markdown`/`toml`/`yaml`/`json`/`shell`/`rst`/`text`/...).
+    ///
+    /// `None` for ordinary code chunks. When `Some(..)`, the chunk is a
+    /// whole-file non-code unit (parity with Python's `unit_type="file"`
+    /// non-code entries): the call-graph / enrichment passes MUST skip it and
+    /// the `language` field is a placeholder only.
+    ///
+    /// `#[serde(default)]` keeps old cache/index JSON (which lack this field)
+    /// deserializable as `None` — additive, no cache migration. The
+    /// [`super::cache::EmbeddingCache`] key is `content_hash + path + fn +
+    /// model`, disjoint from `doc_kind`, so this field never affects cache
+    /// identity.
+    #[serde(default)]
+    pub doc_kind: Option<String>,
 }
 
 /// A CodeChunk with its embedding vector
@@ -208,6 +310,24 @@ pub struct SemanticSearchResult {
 
     /// Code snippet (truncated for display)
     pub snippet: String,
+
+    /// Callees of this symbol (populated only when `--expand` is requested).
+    ///
+    /// Mirrors Python `semantic search --expand` which adds `calls` /
+    /// `called_by` / `related` arrays per result. Absent (skipped in JSON)
+    /// when expansion was not requested, so non-expand output is byte-identical
+    /// to the pre-expand schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls: Option<Vec<String>>,
+
+    /// Callers of this symbol (populated only when `--expand` is requested).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub called_by: Option<Vec<String>>,
+
+    /// Related symbols of this symbol (populated only when `--expand` is
+    /// requested).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related: Option<Vec<String>>,
 }
 
 /// Report from semantic search
@@ -309,6 +429,10 @@ pub struct EmbedOptions {
 
     /// Batch size for embedding (default: 32)
     pub batch_size: usize,
+
+    /// Compute device (default: [`Device::Gpu`], deliberate deviation from
+    /// Python's CPU default).
+    pub device: Device,
 }
 
 impl Default for EmbedOptions {
@@ -317,6 +441,7 @@ impl Default for EmbedOptions {
             model: EmbeddingModel::default(),
             show_progress: false,
             batch_size: 32,
+            device: Device::default(),
         }
     }
 }
@@ -351,6 +476,10 @@ pub struct SearchOptions {
 
     /// Exclude exact matches (for similarity search)
     pub exclude_self: bool,
+
+    /// Add call-graph expansion (`calls`/`called_by`/`related`) to each result
+    /// (parity with Python `semantic search --expand`).
+    pub expand: bool,
 }
 
 impl Default for SearchOptions {
@@ -360,6 +489,7 @@ impl Default for SearchOptions {
             threshold: 0.5,
             model: EmbeddingModel::default(),
             exclude_self: false,
+            expand: false,
         }
     }
 }
@@ -423,6 +553,7 @@ mod tests {
             content: content.clone(),
             content_hash: "abc123".to_string(),
             language: Language::Rust,
+            doc_kind: None,
         };
 
         // THEN: Fields should be set correctly
@@ -445,6 +576,7 @@ mod tests {
             content: "def foo(): pass".to_string(),
             content_hash: "hash123".to_string(),
             language: Language::Python,
+            doc_kind: None,
         };
 
         // WHEN: We serialize and deserialize
@@ -515,6 +647,9 @@ mod tests {
                 line_start: 1,
                 line_end: 10,
                 snippet: "fn a()".to_string(),
+                calls: None,
+                called_by: None,
+                related: None,
             },
             SemanticSearchResult {
                 file_path: PathBuf::from("b.rs"),
@@ -524,6 +659,9 @@ mod tests {
                 line_start: 1,
                 line_end: 10,
                 snippet: "fn b()".to_string(),
+                calls: None,
+                called_by: None,
+                related: None,
             },
             SemanticSearchResult {
                 file_path: PathBuf::from("c.rs"),
@@ -533,6 +671,9 @@ mod tests {
                 line_start: 1,
                 line_end: 10,
                 snippet: "fn c()".to_string(),
+                calls: None,
+                called_by: None,
+                related: None,
             },
         ];
 
@@ -552,6 +693,7 @@ mod tests {
         assert_eq!(options.threshold, 0.5);
         assert_eq!(options.model, EmbeddingModel::ArcticM);
         assert!(!options.exclude_self);
+        assert!(!options.expand);
     }
 
     #[test]

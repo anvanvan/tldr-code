@@ -92,6 +92,15 @@ dirs = "5.0"
 # PINNED per premortem P0 - do not use ^5.8 or 5
 fastembed = { workspace = true, optional = true }
 
+# Optional direct `ort` dep for the `coreml` feature ONLY. Pinned to the EXACT
+# version fastembed 5.8.1 resolves (`=2.0.0-rc.11`) so cargo dedups to a SINGLE
+# ort/ort-sys node — no second ORT runtime, no second binary download (verified
+# via `cargo tree`). The `coreml` ort feature is purely additive: it gates only
+# the CoreML execution-provider register call; it does NOT change which prebuilt
+# binary downloads (the macOS dist already ships the CoreML provider). Off by
+# default so Linux/CI stays CPU-only.
+ort = { version = "=2.0.0-rc.11", optional = true, features = ["coreml"] }
+
 # Phase 4: Content hashing for cache keys
 md5 = { workspace = true }
 
@@ -101,9 +110,17 @@ fs2 = { workspace = true }
 # M11 VAL-010: PATH lookup for git binary in change-impact resolver
 which = { workspace = true }
 
+# context-batch: difflib-equivalent fuzzy "Did you mean" suggestion ranking
+# (normalized Levenshtein, cutoff 0.6) for `tldr context` symbol misses.
+strsim = { workspace = true }
+
 [features]
 default = []
 semantic = ["dep:fastembed"]
+# CoreML (GPU) execution provider for the semantic embedder on Apple Silicon.
+# Pulls the `coreml`-gated `ort` at fastembed's exact pin (single runtime). OFF
+# by default so non-Apple/CI builds stay CPU-only. Implies `semantic`.
+coreml = ["semantic", "dep:ort"]
 # Experimental V2 call graph builder with parallel processing (Phase 14)
 experimental_callgraph = []
 

@@ -161,6 +161,108 @@ pub fn is_process_running(pid: u32) -> bool {
 }
 
 // =============================================================================
+// Current RSS (memory-watermark self-restart support)
+// =============================================================================
+
+/// Return this process's CURRENT resident-set size in bytes, or `None` if it
+/// cannot be read on this platform.
+///
+/// This MUST be the live RSS, NEVER a lifetime peak (`ru_maxrss` on macOS is
+/// the peak — keying a watermark on the peak would wedge a daemon in a restart
+/// loop after a single transient spike). Mirrors Python's `_current_rss_mb`
+/// in `tldr/model_server/server.py`, which reads the live value and returns a
+/// safe sentinel on failure so an unreadable RSS can never trigger a spurious
+/// self-exit.
+///
+/// # Platform-specific behavior
+/// - Linux: parses `/proc/self/statm` field 2 (resident pages) × page size.
+/// - macOS: `proc_pidinfo(PROC_PIDTASKINFO)` → `pti_resident_size`.
+/// - Windows / other: `None` (watermark becomes a no-op).
+#[cfg(target_os = "linux")]
+pub fn current_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    // Fields: size resident shared text lib data dt (in pages)
+    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // SC_PAGESIZE is the bytes-per-page; on Linux this is the resident
+    // accounting unit for statm.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    Some(resident_pages.saturating_mul(page_size as u64))
+}
+
+#[cfg(target_os = "macos")]
+pub fn current_rss_bytes() -> Option<u64> {
+    // proc_pidinfo(pid, PROC_PIDTASKINFO, ...) fills a `proc_taskinfo` whose
+    // `pti_resident_size` is the CURRENT resident set (not a lifetime peak).
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let pid = std::process::id() as libc::c_int;
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    // proc_pidinfo returns the number of bytes written; it must equal the
+    // struct size for the read to be valid.
+    if ret == size {
+        Some(info.pti_resident_size)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn current_rss_bytes() -> Option<u64> {
+    // Windows / other: degrade to None — the RSS watermark becomes a no-op.
+    None
+}
+
+// =============================================================================
+// Ephemeral-root detection (cold-index skip support)
+// =============================================================================
+
+/// Bases that count as ephemeral roots. On macOS `/tmp` is a symlink to
+/// `/private/tmp`, so both are listed (and paths are canonicalized before the
+/// self-or-ancestor test) to match Python's `_EPHEMERAL_BASES`.
+const EPHEMERAL_BASES: &[&str] = &["/private/tmp", "/tmp"];
+
+/// True when `path` resolves under (or equals) `/tmp` or `/private/tmp`.
+///
+/// Mirrors Python's `tldr/daemon/ensure.py::_is_ephemeral_root`:
+/// - A truthy `TLDR_INDEX_EPHEMERAL` env var (`1`/`true`/`yes`/`on`, any case,
+///   trimmed) is an escape hatch that forces `false` so intentional /tmp
+///   indexing (and tests) can still build an index.
+/// - Otherwise the path is canonicalized (resolving the macOS `/tmp` →
+///   `/private/tmp` symlink) before the self-or-ancestor membership test.
+pub fn is_ephemeral_root(path: &Path) -> bool {
+    let raw = std::env::var("TLDR_INDEX_EPHEMERAL").unwrap_or_default();
+    if matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    ) {
+        return false;
+    }
+
+    // Resolve symlinks where possible; fall back to the raw path if the target
+    // does not yet exist (still want the prefix test to fire on /tmp paths).
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    for base in EPHEMERAL_BASES {
+        let base_path = Path::new(base);
+        if resolved == base_path || resolved.starts_with(base_path) {
+            return true;
+        }
+    }
+    false
+}
+
+// =============================================================================
 // Lock Acquisition
 // =============================================================================
 
@@ -522,6 +624,93 @@ mod tests {
         let cleaned = cleanup_stale_pid(&pid_path).unwrap();
         assert!(!cleaned);
         assert!(pid_path.exists());
+    }
+
+    // =========================================================================
+    // current_rss_bytes — CURRENT (not peak) RSS
+    // =========================================================================
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_current_rss_bytes_is_some_and_nonzero() {
+        let rss = current_rss_bytes();
+        assert!(rss.is_some(), "RSS should be readable on this platform");
+        assert!(rss.unwrap() > 0, "RSS should be > 0 for a live process");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_current_rss_bytes_reflects_current_not_peak() {
+        // Allocate a large buffer and touch every page so it is genuinely
+        // resident, then verify RSS climbs. (We do NOT assert it drops after
+        // free — that is allocator/OS dependent — only that the reading is the
+        // *current* live value, not a frozen lifetime peak.)
+        let before = current_rss_bytes().unwrap();
+        let mut buf: Vec<u8> = vec![0u8; 64 * 1024 * 1024]; // 64 MiB
+        for i in (0..buf.len()).step_by(4096) {
+            buf[i] = 1;
+        }
+        let during = current_rss_bytes().unwrap();
+        // Keep buf alive across the second reading.
+        std::hint::black_box(&buf);
+        assert!(
+            during >= before,
+            "current RSS should not decrease after a large live allocation \
+             (before={before}, during={during})"
+        );
+        // The allocation should be at least partially reflected.
+        assert!(
+            during > before,
+            "current RSS should rise after touching 64 MiB \
+             (before={before}, during={during})"
+        );
+    }
+
+    // =========================================================================
+    // is_ephemeral_root
+    // =========================================================================
+
+    // Env is process-global; serialize the env-mutating cases.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_is_ephemeral_root_tmp_subpath() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("TLDR_INDEX_EPHEMERAL");
+        assert!(is_ephemeral_root(Path::new("/tmp/some-project")));
+        assert!(is_ephemeral_root(Path::new("/private/tmp/some-project")));
+        // Exact base also counts.
+        assert!(is_ephemeral_root(Path::new("/private/tmp")));
+    }
+
+    #[test]
+    fn test_is_ephemeral_root_non_tmp_is_false() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("TLDR_INDEX_EPHEMERAL");
+        assert!(!is_ephemeral_root(Path::new("/home/user/project")));
+        assert!(!is_ephemeral_root(Path::new("/Users/someone/dev/x")));
+        assert!(!is_ephemeral_root(Path::new("/opt/app")));
+    }
+
+    #[test]
+    fn test_is_ephemeral_root_escape_hatch_forces_false() {
+        let _g = ENV_LOCK.lock().unwrap();
+        for truthy in ["1", "true", "yes", "on", "TRUE", " On "] {
+            std::env::set_var("TLDR_INDEX_EPHEMERAL", truthy);
+            assert!(
+                !is_ephemeral_root(Path::new("/tmp/some-project")),
+                "escape hatch '{truthy}' should force false"
+            );
+        }
+        // Falsy / empty values do NOT bypass.
+        for falsy in ["", "0", "false", "no"] {
+            std::env::set_var("TLDR_INDEX_EPHEMERAL", falsy);
+            assert!(
+                is_ephemeral_root(Path::new("/tmp/some-project")),
+                "value '{falsy}' must not bypass the guard"
+            );
+        }
+        std::env::remove_var("TLDR_INDEX_EPHEMERAL");
     }
 
     #[cfg(windows)]

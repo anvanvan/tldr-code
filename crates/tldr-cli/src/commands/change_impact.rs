@@ -46,6 +46,14 @@ pub struct ChangeImpactArgs {
     #[arg(long, short = 'b')]
     pub base: Option<String>,
 
+    /// Use git diff to find changed files (default base: HEAD~1, Python parity)
+    #[arg(long)]
+    pub git: bool,
+
+    /// Git ref to diff against when using --git (default: HEAD~1)
+    #[arg(long)]
+    pub git_base: Option<String>,
+
     /// Only consider staged files (pre-commit workflow)
     #[arg(long)]
     pub staged: bool,
@@ -53,6 +61,10 @@ pub struct ChangeImpactArgs {
     /// Consider all uncommitted changes (staged + unstaged)
     #[arg(long)]
     pub uncommitted: bool,
+
+    /// Use session-modified files (placeholder: empty until session tracking lands)
+    #[arg(long)]
+    pub session: bool,
 
     // === Analysis Options ===
     /// Maximum call graph traversal depth
@@ -75,6 +87,11 @@ pub struct ChangeImpactArgs {
     /// Output format for test runner integration
     #[arg(long, value_enum)]
     pub runner: Option<RunnerFormat>,
+
+    /// Actually run the affected-test command (suppresses JSON; prints
+    /// `Running: <cmd>` to stderr; propagates the child exit code)
+    #[arg(long)]
+    pub run: bool,
 }
 
 /// Test runner output formats
@@ -93,17 +110,35 @@ pub enum RunnerFormat {
 }
 
 impl ChangeImpactArgs {
-    /// Determine detection method based on CLI flags
+    /// Determine detection method based on CLI flags.
+    ///
+    /// Priority (preserves the pre-existing chain, slots --git/--session in):
+    ///   explicit files > --base > --git/--git-base > --staged > --uncommitted
+    ///   > --session > HEAD
+    ///
+    /// `--git` is Python-parity sugar for `GitBase { HEAD~1 }`. `--git-base
+    /// <ref>` overrides that base (and implies git mode even without bare
+    /// `--git`). Explicit `--base` still wins so the existing PR workflow is
+    /// unchanged.
     fn determine_detection_method(&self) -> DetectionMethod {
-        // Priority: explicit files > --base > --staged > --uncommitted > HEAD
         if !self.files.is_empty() {
             DetectionMethod::Explicit
         } else if let Some(base) = &self.base {
             DetectionMethod::GitBase { base: base.clone() }
+        } else if self.git || self.git_base.is_some() {
+            // Bare --git defaults to HEAD~1 (Python parity); --git-base
+            // overrides the ref.
+            let base = self
+                .git_base
+                .clone()
+                .unwrap_or_else(|| "HEAD~1".to_string());
+            DetectionMethod::GitBase { base }
         } else if self.staged {
             DetectionMethod::GitStaged
         } else if self.uncommitted {
             DetectionMethod::GitUncommitted
+        } else if self.session {
+            DetectionMethod::Session
         } else {
             DetectionMethod::GitHead
         }
@@ -151,6 +186,26 @@ impl ChangeImpactArgs {
             explicit_files,
         )?;
 
+        // --run: actually execute the affected-test command. Suppresses JSON
+        // (Python parity), prints `Running: <cmd>` to STDERR, runs the argv
+        // with no shell (injection-safe), inheriting stdout/stderr. Unlike
+        // Python v1.5.2 (which discards the status), we PROPAGATE the child
+        // exit code so `&&` chains and CI gates see real test failures
+        // (intentional parity-PLUS).
+        if self.run {
+            if let Some(cmd) = &report.test_command {
+                // The affected-test paths in `cmd` are project-relative
+                // (e.g. `tests/test_x.py`), so the child must run WITH its
+                // cwd set to the project root — otherwise pytest, spawned
+                // from tldr's own cwd, cannot find the files.
+                run_affected_tests(cmd, &self.path);
+                // run_affected_tests never returns (it process::exit's).
+            }
+            // No test_command (unsupported language / failure state): fall
+            // through to normal JSON/error handling below so the user still
+            // sees why nothing ran.
+        }
+
         // Output based on format/runner — always emit the report (including
         // failure states) so JSON consumers see the new `status` field.
         if let Some(runner) = self.runner {
@@ -179,6 +234,67 @@ impl ChangeImpactArgs {
                 );
                 std::process::exit(3);
             }
+        }
+    }
+}
+
+/// Format an argv as a shell-display string for the `Running:` notice.
+///
+/// Mirrors Python's `shlex.join`: quote any token containing whitespace or a
+/// shell metacharacter. Used ONLY for the human-facing stderr line — the
+/// actual spawn uses the argv list directly (no shell), so this is purely
+/// cosmetic and never feeds back into execution.
+fn shell_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if a.is_empty()
+                || a.chars()
+                    .any(|c| c.is_whitespace() || "\"'\\$`&|;<>()*?[]{}!#~".contains(c))
+            {
+                format!("'{}'", a.replace('\'', r"'\''"))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Execute the affected-test command and propagate its exit code.
+///
+/// Python parity (cli.py:1237-1245): print `Running: <cmd>` to STDERR, then
+/// spawn the argv with NO shell, inheriting stdout/stderr. The child runs WITH
+/// its cwd set to `project` so the project-relative test paths resolve.
+/// Parity-PLUS: we also propagate the child's exit code (Python v1.5.2
+/// discards it). Never returns — always `process::exit`s with the child status
+/// (or 127 if the command could not be spawned).
+fn run_affected_tests(cmd: &[String], project: &std::path::Path) -> ! {
+    eprintln!("Running: {}", shell_join(cmd));
+
+    if cmd.is_empty() {
+        eprintln!("ERROR: change-impact --run: empty test command");
+        std::process::exit(127);
+    }
+
+    let status = std::process::Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .current_dir(project)
+        // stdout/stderr/stdin are inherited by default — the child's pytest
+        // session output streams straight through to the user's terminal.
+        .status();
+
+    match status {
+        Ok(status) => {
+            // Propagate the exit code (parity-PLUS). On Unix a signal-killed
+            // child has no code(); map that to 128 + signal-ish 1.
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Err(e) => {
+            eprintln!(
+                "ERROR: change-impact --run: failed to spawn '{}': {}",
+                cmd[0], e
+            );
+            std::process::exit(127);
         }
     }
 }
@@ -281,13 +397,17 @@ mod tests {
             lang: None,
             files,
             base,
+            git: false,
+            git_base: None,
             staged,
             uncommitted,
+            session: false,
             depth: 10,
             include_imports: true,
             test_patterns: vec![],
             output_format: None,
             runner: None,
+            run: false,
         }
     }
 
@@ -355,6 +475,108 @@ mod tests {
         assert_eq!(args.determine_detection_method(), DetectionMethod::GitHead);
     }
 
+    // === Area 6 migration: --git / --git-base / --session detection ===
+
+    /// Bare `--git` maps to GitBase { HEAD~1 } (Python parity).
+    #[test]
+    fn test_detection_method_git_defaults_to_head_tilde_1() {
+        let mut args = make_args(None, false, false, vec![]);
+        args.git = true;
+        match args.determine_detection_method() {
+            DetectionMethod::GitBase { base } => assert_eq!(base, "HEAD~1"),
+            other => panic!("expected GitBase HEAD~1, got {:?}", other),
+        }
+    }
+
+    /// `--git --git-base origin/main` overrides the base ref.
+    #[test]
+    fn test_detection_method_git_base_override() {
+        let mut args = make_args(None, false, false, vec![]);
+        args.git = true;
+        args.git_base = Some("origin/main".to_string());
+        match args.determine_detection_method() {
+            DetectionMethod::GitBase { base } => assert_eq!(base, "origin/main"),
+            other => panic!("expected GitBase origin/main, got {:?}", other),
+        }
+    }
+
+    /// `--git-base <ref>` alone (without bare --git) still implies git mode.
+    #[test]
+    fn test_detection_method_git_base_implies_git_mode() {
+        let mut args = make_args(None, false, false, vec![]);
+        args.git_base = Some("v1.0.0".to_string());
+        match args.determine_detection_method() {
+            DetectionMethod::GitBase { base } => assert_eq!(base, "v1.0.0"),
+            other => panic!("expected GitBase v1.0.0, got {:?}", other),
+        }
+    }
+
+    /// `--session` maps to DetectionMethod::Session (lower priority than git).
+    #[test]
+    fn test_detection_method_session() {
+        let mut args = make_args(None, false, false, vec![]);
+        args.session = true;
+        assert_eq!(args.determine_detection_method(), DetectionMethod::Session);
+    }
+
+    /// Explicit `--base` still wins over `--git` (priority preserved).
+    #[test]
+    fn test_detection_method_base_wins_over_git() {
+        let mut args = make_args(Some("develop".to_string()), false, false, vec![]);
+        args.git = true;
+        args.git_base = Some("HEAD~5".to_string());
+        match args.determine_detection_method() {
+            DetectionMethod::GitBase { base } => assert_eq!(base, "develop"),
+            other => panic!("expected explicit --base develop to win, got {:?}", other),
+        }
+    }
+
+    /// Full priority chain: files > base > git > staged > uncommitted >
+    /// session > head.
+    #[test]
+    fn test_detection_method_full_priority_chain() {
+        // git beats staged/uncommitted/session
+        let mut args = make_args(None, true, true, vec![]);
+        args.git = true;
+        args.session = true;
+        match args.determine_detection_method() {
+            DetectionMethod::GitBase { base } => assert_eq!(base, "HEAD~1"),
+            other => panic!("git should beat staged/uncommitted/session, got {:?}", other),
+        }
+
+        // uncommitted beats session
+        let mut args = make_args(None, false, true, vec![]);
+        args.session = true;
+        assert_eq!(
+            args.determine_detection_method(),
+            DetectionMethod::GitUncommitted
+        );
+
+        // session beats head
+        let mut args = make_args(None, false, false, vec![]);
+        args.session = true;
+        assert_eq!(args.determine_detection_method(), DetectionMethod::Session);
+    }
+
+    /// shell_join quotes tokens with whitespace/metacharacters (cosmetic
+    /// `Running:` line only; the actual spawn uses the argv list).
+    #[test]
+    fn test_shell_join_quoting() {
+        assert_eq!(
+            shell_join(&["pytest".to_string(), "tests/test_a.py".to_string()]),
+            "pytest tests/test_a.py"
+        );
+        assert_eq!(
+            shell_join(&["pytest".to_string(), "a b.py".to_string()]),
+            "pytest 'a b.py'"
+        );
+        // Embedded single quote is escaped.
+        assert_eq!(
+            shell_join(&["echo".to_string(), "it's".to_string()]),
+            r#"echo 'it'\''s'"#
+        );
+    }
+
     #[test]
     fn test_format_pytest() {
         let report = ChangeImpactReport {
@@ -368,6 +590,7 @@ mod tests {
             detection_method: "explicit".to_string(),
             metadata: None,
             status: tldr_core::ChangeImpactStatus::Completed,
+            ..Default::default()
         };
 
         let output = format_for_runner(&report, RunnerFormat::Pytest);
@@ -384,6 +607,7 @@ mod tests {
             detection_method: "explicit".to_string(),
             metadata: None,
             status: tldr_core::ChangeImpactStatus::Completed,
+            ..Default::default()
         };
 
         let output = format_for_runner(&report, RunnerFormat::Jest);
@@ -415,6 +639,7 @@ mod tests {
             detection_method: "explicit".to_string(),
             metadata: None,
             status: tldr_core::ChangeImpactStatus::Completed,
+            ..Default::default()
         };
 
         let output = format_for_runner(&report, RunnerFormat::PytestK);

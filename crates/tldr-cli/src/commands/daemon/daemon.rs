@@ -15,12 +15,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::DashMap;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 
 use super::error::{DaemonError, DaemonResult};
 use super::ipc::{read_command, send_response, IpcListener, IpcStream};
@@ -78,6 +78,96 @@ fn count_tree_files(tree: &FileTree) -> usize {
     }
 }
 
+/// Minimum spacing between two RSS reads (the watermark check). RSS moves per
+/// embed/index batch, not per accept tick, so once a second is plenty and the
+/// per-OS read (a syscall) stays cheap. Mirrors Python's `_RSS_CHECK_INTERVAL`.
+const RSS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Parent-death watchdog poll interval. Mirrors Python's `_WATCHDOG_POLL_SECS`.
+const WATCHDOG_POLL_SECS: u64 = 1;
+
+/// Test/production seam for reading the current process RSS in bytes. Defaults
+/// to `pid::current_rss_bytes`; unit tests inject a fake probe so the watermark
+/// behavior is a pure unit test with no real allocation.
+pub type RssProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// Test/production seam for the reindex fold side effect. Receives the folded
+/// dirty-file snapshot. The production default invalidates the in-process
+/// semantic index so it rebuilds lazily on the next query; tests inject a probe
+/// that records what was folded.
+pub type FoldCallback = Arc<dyn Fn(Vec<PathBuf>) + Send + Sync>;
+
+/// Bundle of `Arc` handles the spawned reindex timer task captures, so the
+/// scheduler does not need `Arc<Self>` (which would force `handle_command` to
+/// take `self: &Arc<Self>` and break existing `TLDRDaemon`-by-value callers).
+struct ReindexState {
+    reindex_timer: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    last_reindex_fire_ms: Arc<AtomicU64>,
+    reindex_fire_count: Arc<AtomicU64>,
+    dirty_files: Arc<RwLock<HashSet<PathBuf>>>,
+    fold_callback: Arc<RwLock<Option<FoldCallback>>>,
+    #[cfg(feature = "semantic")]
+    semantic_index: Arc<RwLock<Option<SemanticIndex>>>,
+    /// Tokio-clock origin for cooldown arithmetic. Uses `tokio::time::Instant`
+    /// (NOT `std::time::Instant`) so `tokio::time::pause`/`advance` drives the
+    /// cooldown spread in unit tests, matching the `sleep`-based debounce.
+    tokio_start: tokio::time::Instant,
+}
+
+impl ReindexState {
+    /// Timer callback: fire the deferred reindex (folds the WHOLE dirty set).
+    ///
+    /// Mirrors Python's `_drain_pending_reindex` + `_trigger_background_reindex`:
+    /// records the fire time for the cooldown spread, snapshots and clears the
+    /// dirty set ONCE, then runs the fold side effect (production: invalidate
+    /// the in-process semantic index so it rebuilds lazily; tests: record the
+    /// folded set). Because the snapshot is taken atomically, a burst delivered
+    /// as many notifies collapses to one fold carrying the whole accumulated
+    /// set.
+    async fn drain_pending_reindex(&self) {
+        // Clear our own timer handle slot (we are that timer firing).
+        {
+            let mut timer = self.reindex_timer.lock().await;
+            *timer = None;
+        }
+        self.last_reindex_fire_ms.store(
+            self.tokio_start.elapsed().as_millis() as u64,
+            Ordering::SeqCst,
+        );
+
+        // Snapshot + clear the dirty set exactly once.
+        let snapshot: Vec<PathBuf> = {
+            let mut dirty = self.dirty_files.write().await;
+            if dirty.is_empty() {
+                return;
+            }
+            let snap = dirty.iter().cloned().collect();
+            dirty.clear();
+            snap
+        };
+
+        self.reindex_fire_count.fetch_add(1, Ordering::SeqCst);
+
+        // Run the fold side effect.
+        let cb = self.fold_callback.read().await.clone();
+        if let Some(cb) = cb {
+            cb(snapshot);
+        } else {
+            // Production default: invalidate the in-process semantic index so
+            // it rebuilds lazily on the next query over the folded set.
+            #[cfg(feature = "semantic")]
+            {
+                let mut idx = self.semantic_index.write().await;
+                *idx = None;
+            }
+            #[cfg(not(feature = "semantic"))]
+            {
+                let _ = snapshot;
+            }
+        }
+    }
+}
+
 // =============================================================================
 // TLDRDaemon - Main Daemon Process
 // =============================================================================
@@ -118,6 +208,31 @@ pub struct TLDRDaemon {
     /// Persistent semantic index (built lazily on first query, invalidated on Notify)
     #[cfg(feature = "semantic")]
     semantic_index: Arc<RwLock<Option<SemanticIndex>>>,
+
+    // --- C1: RSS-watermark self-restart -------------------------------------
+    /// Count of client commands currently being handled. The watermark never
+    /// fires while this is non-zero (never exit mid-request).
+    in_flight: Arc<AtomicUsize>,
+    /// Latched once the RSS watermark is breached at a safe instant; the run
+    /// loop drains and exits on the next iteration.
+    rss_exit: Arc<AtomicBool>,
+    /// Last time the (cheap-but-not-free) RSS read ran, for the 1/s throttle.
+    last_rss_check: Arc<RwLock<Option<Instant>>>,
+    /// RSS-read seam. Defaults to `pid::current_rss_bytes`; tests inject a fake.
+    rss_probe: RssProbe,
+
+    // --- C3: re-armable notify reindex scheduler ----------------------------
+    /// The single armed reindex timer task (debounce/coalesce). Re-armed on
+    /// each threshold-crossing notify, cancelled on shutdown.
+    reindex_timer: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Monotonic ms (since `start_time`) of the last reindex fire, for cooldown.
+    last_reindex_fire_ms: Arc<AtomicU64>,
+    /// Number of completed reindex folds (test observability).
+    reindex_fire_count: Arc<AtomicU64>,
+    /// Fold side-effect seam. Receives the folded dirty snapshot.
+    fold_callback: Arc<RwLock<Option<FoldCallback>>>,
+    /// Tokio-clock origin for cooldown arithmetic (paused-clock testable).
+    tokio_start: tokio::time::Instant,
 }
 
 impl TLDRDaemon {
@@ -143,7 +258,41 @@ impl TLDRDaemon {
             indexed_files: Arc::new(RwLock::new(0)),
             #[cfg(feature = "semantic")]
             semantic_index: Arc::new(RwLock::new(None)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            rss_exit: Arc::new(AtomicBool::new(false)),
+            last_rss_check: Arc::new(RwLock::new(None)),
+            rss_probe: Arc::new(super::pid::current_rss_bytes),
+            reindex_timer: Arc::new(Mutex::new(None)),
+            last_reindex_fire_ms: Arc::new(AtomicU64::new(0)),
+            reindex_fire_count: Arc::new(AtomicU64::new(0)),
+            fold_callback: Arc::new(RwLock::new(None)),
+            tokio_start: tokio::time::Instant::now(),
         }
+    }
+
+    /// Inject a fake RSS probe (test seam for the watermark unit tests).
+    #[cfg(test)]
+    pub(crate) fn set_rss_probe(&mut self, probe: RssProbe) {
+        self.rss_probe = probe;
+    }
+
+    /// Install a fold callback observing the snapshot folded by each reindex
+    /// fire (test seam for the notify-scheduler unit tests).
+    #[cfg(test)]
+    pub(crate) async fn set_fold_callback(&self, cb: FoldCallback) {
+        *self.fold_callback.write().await = Some(cb);
+    }
+
+    /// Number of completed reindex folds so far (test observability).
+    #[cfg(test)]
+    pub(crate) fn reindex_fire_count(&self) -> u64 {
+        self.reindex_fire_count.load(Ordering::SeqCst)
+    }
+
+    /// Whether the RSS-exit latch is set (test observability).
+    #[cfg(test)]
+    pub(crate) fn rss_exit_latched(&self) -> bool {
+        self.rss_exit.load(Ordering::SeqCst)
     }
 
     /// Get the daemon's current status.
@@ -211,6 +360,92 @@ impl TLDRDaemon {
         let _ = self.shutdown_tx.send(true);
     }
 
+    // =========================================================================
+    // C1: RSS-watermark self-restart
+    // =========================================================================
+
+    /// Latch `rss_exit` if the watermark is breached NOW at a safe instant;
+    /// return whether the latch is set.
+    ///
+    /// Mirrors Python's `_maybe_flag_rss_exit`/`_rss_watermark_breached`: the
+    /// latch fires only when ALL of —
+    /// 1. the 1/s throttle window has elapsed,
+    /// 2. no command is in flight (never exit mid-request),
+    /// 3. CURRENT RSS (never a lifetime peak) exceeds the watermark —
+    /// hold. The first two are cheap and checked BEFORE the throttle window is
+    /// consumed, so a busy instant never burns the window. A watermark of 0 (or
+    /// an unreadable RSS) disables the check, so it can never spuriously fire.
+    async fn maybe_flag_rss_exit(&self) -> bool {
+        if self.rss_exit.load(Ordering::SeqCst) {
+            return true;
+        }
+        // Gate BEFORE consuming the throttle window so a busy instant can still
+        // re-check at the next idle gap (matches Python's ordering).
+        if self.in_flight.load(Ordering::SeqCst) != 0 {
+            return false;
+        }
+        let watermark_mb = self.config.rss_watermark_mb;
+        if watermark_mb == 0 {
+            return false;
+        }
+        // Throttle: at most one RSS read per RSS_CHECK_INTERVAL.
+        {
+            let mut last = self.last_rss_check.write().await;
+            let now = Instant::now();
+            if let Some(prev) = *last {
+                if now.duration_since(prev) < RSS_CHECK_INTERVAL {
+                    return false;
+                }
+            }
+            *last = Some(now);
+        }
+        let watermark_bytes = watermark_mb.saturating_mul(1024 * 1024);
+        match (self.rss_probe)() {
+            Some(rss) if rss > watermark_bytes => {
+                self.rss_exit.store(true, Ordering::SeqCst);
+                eprintln!(
+                    "RSS {} bytes breached watermark {} MiB, draining and self-exiting",
+                    rss, watermark_mb
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // =========================================================================
+    // C2: parent-death watchdog
+    // =========================================================================
+
+    /// Spawn the parent-death watchdog task IFF a parent pid was recorded.
+    ///
+    /// Mirrors Python's `_watch_parent`: polls `is_process_running(parent_pid)`
+    /// and signals shutdown when the SPECIFIC spawner dies. NEVER keyed on
+    /// `getppid()==1` — a setsid-detached daemon legitimately has ppid 1, so the
+    /// task only ever exists when `config.parent_pid` is `Some`.
+    fn spawn_parent_watchdog(self: &Arc<Self>) {
+        let Some(parent_pid) = self.config.parent_pid else {
+            return;
+        };
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                if daemon.stopping.load(Ordering::SeqCst) {
+                    break;
+                }
+                if !super::pid::is_process_running(parent_pid) {
+                    eprintln!(
+                        "Parent process {} is gone, shutting down",
+                        parent_pid
+                    );
+                    daemon.shutdown();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_POLL_SECS)).await;
+            }
+        });
+    }
+
     /// Run the daemon main loop.
     ///
     /// This function blocks until the daemon is shut down via:
@@ -247,12 +482,23 @@ impl TLDRDaemon {
             });
         }
 
+        // C2: parent-death watchdog (only when a spawner pid was recorded).
+        self.spawn_parent_watchdog();
+
         // Main event loop
         let idle_timeout = std::time::Duration::from_secs(self.config.idle_timeout_secs);
 
         loop {
             // Check for shutdown signal
             if self.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // C1: RSS watermark — if it was latched at a safe instant (idle
+            // heartbeat below or a request completion), drain and exit now.
+            // Mirrors Python's loop-top `_rss_exit.is_set()` break.
+            if self.rss_exit.load(Ordering::SeqCst) {
+                eprintln!("RSS watermark breached, draining and shutting down");
                 break;
             }
 
@@ -299,9 +545,22 @@ impl TLDRDaemon {
                     eprintln!("Accept error: {}", e);
                 }
                 Err(_) => {
-                    // Timeout - check shutdown and continue
+                    // Idle heartbeat: the accept timeout is our heartbeat — the
+                    // only idle instant on a quiet daemon. C1: check the RSS
+                    // watermark here (throttled, in-flight-gated). Mirrors the
+                    // Python idle-tick `_maybe_flag_rss_exit`.
+                    self.maybe_flag_rss_exit().await;
                     continue;
                 }
+            }
+        }
+
+        // C3: cancel any armed reindex timer on shutdown so a pending fold can
+        // never fire after the daemon has begun draining.
+        {
+            let mut timer = self.reindex_timer.lock().await;
+            if let Some(handle) = timer.take() {
+                handle.abort();
             }
         }
 
@@ -324,12 +583,47 @@ impl TLDRDaemon {
     }
 
     /// Handle a single client connection.
+    ///
+    /// C1: tracks the in-flight count for the RSS watermark gate, and runs a
+    /// request-completion watermark check (the only idle instant under a
+    /// continuous back-to-back load, where the accept heartbeat never fires).
+    ///
+    /// C4: after the full command is read, the handler future races against
+    /// `poll_peer_closed`. If the client drops mid-command, the handler future
+    /// is dropped (cooperative cancel at await points) and no response is
+    /// written. This stays cooperative — a fully-synchronous inner analysis
+    /// with no await points still runs to completion (matches Python's
+    /// "in-flight finishes" semantics).
     async fn handle_connection(self: &Arc<Self>, stream: &mut IpcStream) -> DaemonResult<()> {
+        // Track in-flight for the watermark gate; decrement on every exit path.
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let result = self.handle_connection_inner(stream).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+
+        // Request-completion watermark check: this gap — after the response and
+        // before the next accept — is the only idle moment a continuous load
+        // ever exposes (the 2026-06-12 live-verification gap). Now in-flight is
+        // back to its pre-request value.
+        self.maybe_flag_rss_exit().await;
+
+        result
+    }
+
+    /// Inner handler: read → (handle ⨉ peer-closed) → respond.
+    async fn handle_connection_inner(self: &Arc<Self>, stream: &mut IpcStream) -> DaemonResult<()> {
         // Read command
         let cmd = read_command(stream).await?;
 
-        // Handle command
-        let response = self.handle_command(cmd).await;
+        // C4: race the handler against the client disconnecting.
+        let response = tokio::select! {
+            biased;
+            // If the peer closes first, drop the handler future (cancel) and
+            // write no response.
+            _ = stream.poll_peer_closed() => {
+                return Ok(());
+            }
+            response = self.handle_command(cmd) => response,
+        };
 
         // Send response
         send_response(stream, &response).await?;
@@ -432,25 +726,33 @@ impl TLDRDaemon {
                 // 4. Warm semantic index
                 #[cfg(feature = "semantic")]
                 {
-                    let mut index_guard = self.semantic_index.write().await;
-                    if index_guard.is_some() {
-                        warmed.push("semantic_index (cached)");
+                    // C5: skip the cold semantic-index build on an ephemeral
+                    // /tmp root (honoring TLDR_INDEX_EPHEMERAL). A throwaway
+                    // /tmp project must not pay a cold-index burst. Mirrors
+                    // Python's `_is_ephemeral_root` early-return in ensure.py.
+                    if super::pid::is_ephemeral_root(&self.project) {
+                        warmed.push("semantic_index (skipped: ephemeral root)");
                     } else {
-                        let build_opts = BuildOptions {
-                            show_progress: false,
-                            use_cache: true,
-                            ..Default::default()
-                        };
-                        match SemanticIndex::build(
-                            &self.project,
-                            build_opts,
-                            Some(CacheConfig::default()),
-                        ) {
-                            Ok(idx) => {
-                                *index_guard = Some(idx);
-                                warmed.push("semantic_index");
+                        let mut index_guard = self.semantic_index.write().await;
+                        if index_guard.is_some() {
+                            warmed.push("semantic_index (cached)");
+                        } else {
+                            let build_opts = BuildOptions {
+                                show_progress: false,
+                                use_cache: true,
+                                ..Default::default()
+                            };
+                            match SemanticIndex::build(
+                                &self.project,
+                                build_opts,
+                                Some(CacheConfig::default()),
+                            ) {
+                                Ok(idx) => {
+                                    *index_guard = Some(idx);
+                                    warmed.push("semantic_index");
+                                }
+                                Err(e) => errors.push(format!("semantic_index: {}", e)),
                             }
-                            Err(e) => errors.push(format!("semantic_index: {}", e)),
                         }
                     }
                 }
@@ -478,6 +780,16 @@ impl TLDRDaemon {
 
                 // Build index lazily on first query
                 if index_guard.is_none() {
+                    // C5: do not build a cold semantic index on an ephemeral
+                    // /tmp root (honoring TLDR_INDEX_EPHEMERAL); leave the
+                    // index None and report the skip rather than paying a
+                    // cold-index burst on a throwaway project.
+                    if super::pid::is_ephemeral_root(&self.project) {
+                        return DaemonResponse::Error {
+                            status: "error".to_string(),
+                            error: "Semantic index skipped: ephemeral root (set TLDR_INDEX_EPHEMERAL=1 to force)".to_string(),
+                        };
+                    }
                     let build_opts = BuildOptions {
                         show_progress: false,
                         use_cache: true,
@@ -505,6 +817,7 @@ impl TLDRDaemon {
                     threshold: 0.5,
                     include_snippet: true,
                     snippet_lines: 5,
+                    expand: false,
                 };
 
                 match index.search(&query, &search_opts) {
@@ -1073,19 +1386,35 @@ impl TLDRDaemon {
     }
 
     /// Handle the Notify command (file change notification).
+    ///
+    /// C3: O(1) ingress that coalesces a burst into a single debounced,
+    /// cooldown-gated reindex over the WHOLE accumulated dirty set. Mirrors
+    /// Python's `_handle_notify` + `_schedule_reindex`:
+    /// - Each newly-dirtied file is added to the dirty set (deduplicated) and
+    ///   its cache entries are invalidated.
+    /// - When the dirty count crosses `auto_reindex_threshold`, a single
+    ///   re-armable timer is (re-)armed with `delay = max(debounce,
+    ///   cooldown_remaining)`. The dirty set is NOT cleared here — the fold
+    ///   that fires when the timer elapses snapshots and clears it, so a burst
+    ///   delivered as many notifies collapses to ONE fold of the whole set.
+    /// - `reindex_triggered` reports that a reindex was scheduled (the timer
+    ///   armed), not that the heavy work has finished.
     async fn handle_notify(&self, file: PathBuf) -> DaemonResponse {
-        // Add file to dirty set
+        // Add file to dirty set (dedup).
         let dirty_count = {
             let mut dirty = self.dirty_files.write().await;
             dirty.insert(file.clone());
             dirty.len()
         };
 
-        // Invalidate cache entries for this file
+        // Invalidate cache entries for this file.
         let file_hash = super::salsa::hash_path(&file);
         self.cache.invalidate_by_input(file_hash);
 
-        // Invalidate semantic index so it rebuilds on next query
+        // Eagerly invalidate the in-process semantic index so the NEXT query
+        // rebuilds over fresh content (cheap: it just drops the handle). The
+        // proactive, debounced+cooldown-gated reindex below is the separate
+        // C3 fold; this keeps a lazily-rebuilt index correct between folds.
         #[cfg(feature = "semantic")]
         {
             let mut idx = self.semantic_index.write().await;
@@ -1095,14 +1424,11 @@ impl TLDRDaemon {
         let threshold = self.config.auto_reindex_threshold;
         let reindex_triggered = dirty_count >= threshold;
 
-        // Trigger reindex if threshold reached
+        // O(1) ingress: arm the debounced/cooldown-gated scheduler instead of
+        // doing the heavy work inline. A burst coalesces into one armed timer;
+        // the fold runs later when the timer fires.
         if reindex_triggered {
-            // Clear dirty set
-            let mut dirty = self.dirty_files.write().await;
-            dirty.clear();
-
-            // In full implementation, would spawn background reindex task
-            // For now, just clear the dirty set
+            self.schedule_reindex().await;
         }
 
         DaemonResponse::NotifyResponse {
@@ -1111,6 +1437,58 @@ impl TLDRDaemon {
             threshold,
             reindex_triggered,
         }
+    }
+
+    /// Milliseconds left before a new reindex may fire (0 once elapsed).
+    fn cooldown_remaining_ms(&self) -> u64 {
+        let now_ms = self.tokio_start.elapsed().as_millis() as u64;
+        let last = self.last_reindex_fire_ms.load(Ordering::SeqCst);
+        // last == 0 means "never fired" -> no cooldown owed.
+        if last == 0 {
+            return 0;
+        }
+        let ready_at = last.saturating_add(self.config.reindex_cooldown_ms);
+        ready_at.saturating_sub(now_ms)
+    }
+
+    /// Build the bundle of `Arc` handles the spawned reindex timer task needs,
+    /// so the scheduler works with `&self` (no `Arc<Self>` required — keeps
+    /// `handle_command(&self, ..)`'s public signature unchanged).
+    fn reindex_state(&self) -> ReindexState {
+        ReindexState {
+            reindex_timer: Arc::clone(&self.reindex_timer),
+            last_reindex_fire_ms: Arc::clone(&self.last_reindex_fire_ms),
+            reindex_fire_count: Arc::clone(&self.reindex_fire_count),
+            dirty_files: Arc::clone(&self.dirty_files),
+            fold_callback: Arc::clone(&self.fold_callback),
+            #[cfg(feature = "semantic")]
+            semantic_index: Arc::clone(&self.semantic_index),
+            tokio_start: self.tokio_start,
+        }
+    }
+
+    /// Arm at most one debounced, cooldown-gated reindex timer (O(1)).
+    ///
+    /// Mirrors Python's `_schedule_reindex`: each threshold-crossing notify
+    /// cancels the prior pending timer (debounce/coalesce) so a burst arms
+    /// exactly one surviving timer; the delay is pushed out to the cooldown
+    /// boundary when a fresh burst lands inside the spread window. The timer
+    /// task sleeps via `tokio::time::sleep`, so unit tests can drive it with
+    /// `tokio::time::pause`/`advance` (no real sleeps).
+    async fn schedule_reindex(&self) {
+        let delay_ms = std::cmp::max(self.config.notify_debounce_ms, self.cooldown_remaining_ms());
+        let state = self.reindex_state();
+
+        let mut timer = self.reindex_timer.lock().await;
+        // Cancel the prior pending timer (debounce).
+        if let Some(prev) = timer.take() {
+            prev.abort();
+        }
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            state.drain_pending_reindex().await;
+        });
+        *timer = Some(handle);
     }
 
     /// Handle the Track command (hook activity tracking).
@@ -1186,6 +1564,11 @@ pub async fn start_daemon_background(project: &std::path::Path) -> DaemonResult<
     // Get the current executable path
     let exe_path = std::env::current_exe().map_err(DaemonError::Io)?;
 
+    // C2: record OUR pid as the parent for the background daemon's
+    // parent-death watchdog. setsid() will reparent the child to pid 1, so the
+    // watchdog must be keyed on this explicit value, NEVER on getppid().
+    let parent_pid = std::process::id();
+
     // Spawn the daemon process
     #[cfg(unix)]
     {
@@ -1196,6 +1579,7 @@ pub async fn start_daemon_background(project: &std::path::Path) -> DaemonResult<
                 .args(["daemon", "start", "--project"])
                 .arg(project.as_os_str())
                 .arg("--foreground")
+                .env("TLDR_DAEMON_PARENT_PID", parent_pid.to_string())
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -1221,6 +1605,7 @@ pub async fn start_daemon_background(project: &std::path::Path) -> DaemonResult<
             .args(["daemon", "start", "--project"])
             .arg(project.as_os_str())
             .arg("--foreground")
+            .env("TLDR_DAEMON_PARENT_PID", parent_pid.to_string())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1357,29 +1742,52 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = DaemonConfig {
             auto_reindex_threshold: 3, // Lower threshold for testing
+            // Large debounce so the armed timer never fires during the test —
+            // we only assert the threshold-crossing + scheduling behavior here.
+            notify_debounce_ms: 60_000,
             ..DaemonConfig::default()
         };
         let daemon = TLDRDaemon::new(temp.path().to_path_buf(), config);
 
-        // Add files up to threshold
-        for i in 0..3 {
+        // Add files below threshold: reindex must NOT be triggered yet.
+        for i in 0..2 {
             let file = temp.path().join(format!("test{}.rs", i));
-            daemon.handle_command(DaemonCommand::Notify { file }).await;
+            let resp = daemon.handle_command(DaemonCommand::Notify { file }).await;
+            match resp {
+                DaemonResponse::NotifyResponse {
+                    dirty_count,
+                    reindex_triggered,
+                    ..
+                } => {
+                    assert_eq!(dirty_count, i + 1);
+                    assert!(!reindex_triggered);
+                }
+                _ => panic!("Expected NotifyResponse"),
+            }
         }
 
-        // The third notification should trigger reindex
-        let file = temp.path().join("test3.rs");
+        // The third notification crosses the threshold -> schedules a reindex.
+        // The dirty set is NOT cleared synchronously (C3): the fold clears it
+        // when the (debounced) timer fires, so the count reflects the full set.
+        let file = temp.path().join("test2.rs");
         let response = daemon.handle_command(DaemonCommand::Notify { file }).await;
 
         match response {
             DaemonResponse::NotifyResponse {
-                reindex_triggered: _,
+                dirty_count,
+                reindex_triggered,
                 ..
             } => {
-                // After threshold is hit, dirty set is cleared
-                // So reindex_triggered would have been true, but dirty_count is now 1
+                assert_eq!(dirty_count, 3, "dirty set is not cleared on threshold");
+                assert!(reindex_triggered, "crossing the threshold schedules a reindex");
             }
             _ => panic!("Expected NotifyResponse"),
+        }
+
+        // Cancel the armed timer so it cannot fire after the test ends.
+        let pending = daemon.reindex_timer.lock().await.take();
+        if let Some(h) = pending {
+            h.abort();
         }
     }
 
@@ -2177,5 +2585,492 @@ mod tests {
         // The project doesn't exist, but daemon construction succeeds.
         // The run() loop would detect this and self-terminate.
         assert!(!fake_path.exists());
+    }
+
+    // =========================================================================
+    // C1 — RSS-watermark self-restart (fake-RSS probe seam)
+    // =========================================================================
+
+    fn daemon_with_config(config: DaemonConfig) -> TLDRDaemon {
+        let temp = TempDir::new().unwrap();
+        // Leak the temp dir guard via into_path so the project path stays valid
+        // for the duration of the test without holding the TempDir in scope.
+        let path = temp.into_path();
+        TLDRDaemon::new(path, config)
+    }
+
+    #[tokio::test]
+    async fn test_rss_watermark_fires_when_idle_and_breached() {
+        let config = DaemonConfig {
+            rss_watermark_mb: 100,
+            ..DaemonConfig::default()
+        };
+        let mut daemon = daemon_with_config(config);
+        // 200 MiB > 100 MiB watermark.
+        daemon.set_rss_probe(Arc::new(|| Some(200 * 1024 * 1024)));
+
+        assert!(!daemon.rss_exit_latched());
+        let fired = daemon.maybe_flag_rss_exit().await;
+        assert!(fired, "watermark should fire when idle and breached");
+        assert!(daemon.rss_exit_latched());
+    }
+
+    #[tokio::test]
+    async fn test_rss_watermark_never_fires_with_inflight_work() {
+        let config = DaemonConfig {
+            rss_watermark_mb: 100,
+            ..DaemonConfig::default()
+        };
+        let mut daemon = daemon_with_config(config);
+        daemon.set_rss_probe(Arc::new(|| Some(200 * 1024 * 1024)));
+
+        // Simulate a command in flight.
+        daemon.in_flight.fetch_add(1, Ordering::SeqCst);
+        let fired = daemon.maybe_flag_rss_exit().await;
+        assert!(!fired, "watermark must never fire mid-request");
+        assert!(!daemon.rss_exit_latched());
+
+        // Once the request completes, the next check fires.
+        daemon.in_flight.fetch_sub(1, Ordering::SeqCst);
+        let fired = daemon.maybe_flag_rss_exit().await;
+        assert!(fired, "watermark fires at the request-completion idle gap");
+    }
+
+    #[tokio::test]
+    async fn test_rss_watermark_does_not_fire_below_watermark() {
+        let config = DaemonConfig {
+            rss_watermark_mb: 4096,
+            ..DaemonConfig::default()
+        };
+        let mut daemon = daemon_with_config(config);
+        daemon.set_rss_probe(Arc::new(|| Some(50 * 1024 * 1024))); // 50 MiB
+        assert!(!daemon.maybe_flag_rss_exit().await);
+        assert!(!daemon.rss_exit_latched());
+    }
+
+    #[tokio::test]
+    async fn test_rss_watermark_disabled_when_zero() {
+        let config = DaemonConfig {
+            rss_watermark_mb: 0, // disabled
+            ..DaemonConfig::default()
+        };
+        let mut daemon = daemon_with_config(config);
+        daemon.set_rss_probe(Arc::new(|| Some(u64::MAX)));
+        assert!(!daemon.maybe_flag_rss_exit().await);
+    }
+
+    #[tokio::test]
+    async fn test_rss_watermark_unreadable_rss_never_fires() {
+        let config = DaemonConfig {
+            rss_watermark_mb: 1,
+            ..DaemonConfig::default()
+        };
+        let mut daemon = daemon_with_config(config);
+        daemon.set_rss_probe(Arc::new(|| None)); // unreadable
+        assert!(!daemon.maybe_flag_rss_exit().await);
+    }
+
+    #[tokio::test]
+    async fn test_rss_watermark_throttled_to_one_read_per_interval() {
+        let config = DaemonConfig {
+            rss_watermark_mb: 100,
+            ..DaemonConfig::default()
+        };
+        let mut daemon = daemon_with_config(config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        // Probe counts reads and stays BELOW the watermark so the latch never
+        // sets (a set latch would short-circuit the throttle test).
+        daemon.set_rss_probe(Arc::new(move || {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            Some(1) // 1 byte, far below the 100 MiB watermark
+        }));
+
+        // Many back-to-back checks within one RSS_CHECK_INTERVAL window.
+        for _ in 0..10 {
+            daemon.maybe_flag_rss_exit().await;
+        }
+        // Throttle: the probe is read at most once per interval window.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "RSS probe should be throttled to one read per interval"
+        );
+    }
+
+    // =========================================================================
+    // C2 — parent-death watchdog
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_parent_watchdog_fires_when_parent_dead() {
+        // A PID that is not running -> watchdog flips stopping in one tick.
+        let config = DaemonConfig {
+            parent_pid: Some(4_194_304), // above typical kernel max pid
+            ..DaemonConfig::default()
+        };
+        let daemon = Arc::new(daemon_with_config(config));
+        daemon.spawn_parent_watchdog();
+
+        // The watchdog polls immediately on its first iteration.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if daemon.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            daemon.stopping.load(Ordering::SeqCst),
+            "watchdog should self-stop when the parent pid is dead"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parent_watchdog_none_never_fires() {
+        // parent_pid == None -> no watchdog task spawned, never self-stops.
+        let config = DaemonConfig {
+            parent_pid: None,
+            ..DaemonConfig::default()
+        };
+        let daemon = Arc::new(daemon_with_config(config));
+        daemon.spawn_parent_watchdog();
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !daemon.stopping.load(Ordering::SeqCst),
+            "no watchdog should run when parent_pid is None (ppid==1 case)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parent_watchdog_live_parent_does_not_fire() {
+        // Our own pid is alive -> watchdog must not self-stop.
+        let config = DaemonConfig {
+            parent_pid: Some(std::process::id()),
+            ..DaemonConfig::default()
+        };
+        let daemon = Arc::new(daemon_with_config(config));
+        daemon.spawn_parent_watchdog();
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !daemon.stopping.load(Ordering::SeqCst),
+            "watchdog must not fire while the recorded parent is alive"
+        );
+        // Stop the watchdog loop cleanly.
+        daemon.shutdown();
+    }
+
+    // =========================================================================
+    // C3 — notify debounce + cooldown + always-on fold (paused clock)
+    // =========================================================================
+
+    #[tokio::test(start_paused = true)]
+    async fn test_notify_burst_coalesces_to_single_fold_with_full_set() {
+        let config = DaemonConfig {
+            auto_reindex_threshold: 3,
+            notify_debounce_ms: 2000,
+            reindex_cooldown_ms: 30000,
+            ..DaemonConfig::default()
+        };
+        let daemon = daemon_with_config(config);
+
+        // Install a fold-observing callback recording the folded snapshot.
+        let folded: Arc<std::sync::Mutex<Vec<Vec<PathBuf>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let folded2 = Arc::clone(&folded);
+        daemon
+            .set_fold_callback(Arc::new(move |snap| {
+                folded2.lock().unwrap().push(snap);
+            }))
+            .await;
+
+        // A burst of 5 distinct notifies (crosses threshold at the 3rd).
+        for i in 0..5 {
+            let file = daemon.project().join(format!("f{}.py", i));
+            daemon.handle_command(DaemonCommand::Notify { file }).await;
+        }
+        // Let the spawned timer task start and register its sleep deadline.
+        tokio::task::yield_now().await;
+        // No fold yet — the debounce window has not elapsed.
+        assert_eq!(daemon.reindex_fire_count(), 0);
+
+        // Advance past the debounce window; the single armed timer fires once.
+        tokio::time::advance(std::time::Duration::from_millis(2100)).await;
+        // Let the spawned timer task run its callback.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            daemon.reindex_fire_count(),
+            1,
+            "a burst must coalesce into exactly one fold"
+        );
+        let recorded = folded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].len(),
+            5,
+            "the single fold must carry the WHOLE accumulated dirty set"
+        );
+        // Dirty set cleared exactly once by the fold.
+        assert!(daemon.dirty_files.read().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_notify_handle_is_o1_nonblocking() {
+        // handle_notify must return promptly (no inline reindex). With a paused
+        // clock, an inline heavy/awaiting reindex would never complete; the
+        // call returning at all proves ingress does not block on the fold.
+        let config = DaemonConfig {
+            auto_reindex_threshold: 1,
+            notify_debounce_ms: 10_000,
+            ..DaemonConfig::default()
+        };
+        let daemon = daemon_with_config(config);
+        let resp = daemon
+            .handle_command(DaemonCommand::Notify {
+                file: daemon.project().join("a.py"),
+            })
+            .await;
+        match resp {
+            DaemonResponse::NotifyResponse {
+                reindex_triggered, ..
+            } => assert!(reindex_triggered),
+            _ => panic!("expected NotifyResponse"),
+        }
+        // The fold has NOT fired (debounce not elapsed).
+        assert_eq!(daemon.reindex_fire_count(), 0);
+        let pending = daemon.reindex_timer.lock().await.take();
+        if let Some(h) = pending {
+            h.abort();
+        }
+    }
+
+    /// The cooldown's effect is observable directly via the scheduled delay:
+    /// the first threshold-crossing notify schedules with `delay == debounce`
+    /// (no cooldown owed); a notify that lands AFTER a recent fire schedules
+    /// with `delay` pushed out to the cooldown boundary (`>= cooldown -
+    /// elapsed`, well beyond the short debounce). Asserting on
+    /// `cooldown_remaining_ms` is deterministic and avoids the paused-runtime
+    /// auto-advance hazard of "negative" fire-count assertions.
+    #[tokio::test(start_paused = true)]
+    async fn test_notify_cooldown_pushes_fire_to_boundary() {
+        let config = DaemonConfig {
+            auto_reindex_threshold: 1,
+            notify_debounce_ms: 1000,
+            reindex_cooldown_ms: 10_000,
+            ..DaemonConfig::default()
+        };
+        let daemon = daemon_with_config(config);
+        let count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let count2 = Arc::clone(&count);
+        daemon
+            .set_fold_callback(Arc::new(move |_snap| {
+                count2.fetch_add(1, Ordering::SeqCst);
+            }))
+            .await;
+
+        // Before any fire, no cooldown is owed.
+        assert_eq!(daemon.cooldown_remaining_ms(), 0);
+
+        // First notify -> fires after the debounce window (no cooldown owed).
+        daemon
+            .handle_command(DaemonCommand::Notify {
+                file: daemon.project().join("a.py"),
+            })
+            .await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(1100)).await;
+        // The just-due timer task is now ready; yielding while a ready task
+        // exists drains it without auto-advancing the paused clock.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "first fold fires after debounce");
+
+        // After a fire, a fresh notify lands inside the cooldown window, so the
+        // next fire is owed most of the cooldown — far more than the 1s
+        // debounce. Assert directly on the owed cooldown (deterministic).
+        let remaining = daemon.cooldown_remaining_ms();
+        assert!(
+            remaining > config_debounce(),
+            "after a recent fire the cooldown owed ({remaining}ms) must exceed the debounce \
+             window, so the next reindex is pushed to the cooldown boundary"
+        );
+        assert!(
+            remaining <= 10_000,
+            "cooldown owed ({remaining}ms) cannot exceed the configured cooldown"
+        );
+
+        // Advance to the cooldown boundary; the second fold then fires exactly
+        // once.
+        daemon
+            .handle_command(DaemonCommand::Notify {
+                file: daemon.project().join("b.py"),
+            })
+            .await;
+        tokio::task::yield_now().await;
+        // Jump past the whole cooldown so the (re-armed) timer is due.
+        tokio::time::advance(std::time::Duration::from_millis(11_000)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "second fold fires once the cooldown elapses"
+        );
+    }
+
+    /// The debounce window the cooldown test compares against.
+    fn config_debounce() -> u64 {
+        1000
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_notify_burst_arms_exactly_one_timer() {
+        // Each threshold-crossing notify cancels the prior timer (debounce).
+        let config = DaemonConfig {
+            auto_reindex_threshold: 1,
+            notify_debounce_ms: 1000,
+            ..DaemonConfig::default()
+        };
+        let daemon = daemon_with_config(config);
+        let count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let count2 = Arc::clone(&count);
+        daemon
+            .set_fold_callback(Arc::new(move |_snap| {
+                count2.fetch_add(1, Ordering::SeqCst);
+            }))
+            .await;
+
+        // 4 notifies, each re-arming within the debounce window.
+        for i in 0..4 {
+            daemon
+                .handle_command(DaemonCommand::Notify {
+                    file: daemon.project().join(format!("f{}.py", i)),
+                })
+                .await;
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(200)).await;
+        }
+        // Now advance well past the debounce from the LAST notify.
+        tokio::time::advance(std::time::Duration::from_millis(1100)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "re-armed timers must collapse to exactly one fire"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_cancels_armed_reindex_timer() {
+        let config = DaemonConfig {
+            auto_reindex_threshold: 1,
+            notify_debounce_ms: 5000,
+            ..DaemonConfig::default()
+        };
+        let daemon = daemon_with_config(config);
+        let count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let count2 = Arc::clone(&count);
+        daemon
+            .set_fold_callback(Arc::new(move |_snap| {
+                count2.fetch_add(1, Ordering::SeqCst);
+            }))
+            .await;
+
+        daemon
+            .handle_command(DaemonCommand::Notify {
+                file: daemon.project().join("a.py"),
+            })
+            .await;
+        tokio::task::yield_now().await;
+        // Simulate the run-loop's shutdown timer-cancel.
+        let pending = daemon.reindex_timer.lock().await.take();
+        if let Some(h) = pending {
+            h.abort();
+        }
+        // Advance past the debounce window; the aborted timer must NOT fire.
+        tokio::time::advance(std::time::Duration::from_millis(6000)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "a cancelled timer must not fire after shutdown"
+        );
+    }
+
+    // =========================================================================
+    // C5 — ephemeral-root cold-index skip
+    // =========================================================================
+
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn test_warm_skips_semantic_index_on_ephemeral_root() {
+        // Build under /tmp (ephemeral) and ensure the escape hatch is off.
+        std::env::remove_var("TLDR_INDEX_EPHEMERAL");
+        let dir = std::env::temp_dir().join(format!("tldr-eph-warm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.py"), "def f():\n    return 1\n").unwrap();
+        // Only run this assertion when the dir genuinely resolves as ephemeral
+        // (the platform temp dir is /tmp/-style on the CI/dev macs).
+        let is_eph = super::super::pid::is_ephemeral_root(&dir);
+
+        let daemon = TLDRDaemon::new(dir.clone(), DaemonConfig::default());
+        let resp = daemon
+            .handle_command(DaemonCommand::Warm { language: None })
+            .await;
+
+        if is_eph {
+            match resp {
+                DaemonResponse::Status { message, .. } => {
+                    let msg = message.unwrap_or_default();
+                    assert!(
+                        msg.contains("semantic_index (skipped: ephemeral root)"),
+                        "warm must skip the semantic index on an ephemeral root; got: {msg}"
+                    );
+                }
+                _ => panic!("expected Status response"),
+            }
+            // The semantic index must remain unbuilt.
+            assert!(daemon.semantic_index.read().await.is_none());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn test_semantic_query_skipped_on_ephemeral_root() {
+        std::env::remove_var("TLDR_INDEX_EPHEMERAL");
+        let dir = std::env::temp_dir().join(format!("tldr-eph-sem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.py"), "def f():\n    return 1\n").unwrap();
+        let is_eph = super::super::pid::is_ephemeral_root(&dir);
+
+        let daemon = TLDRDaemon::new(dir.clone(), DaemonConfig::default());
+        let resp = daemon
+            .handle_command(DaemonCommand::Semantic {
+                query: "anything".to_string(),
+                top_k: 5,
+            })
+            .await;
+
+        if is_eph {
+            match resp {
+                DaemonResponse::Error { error, .. } => {
+                    assert!(
+                        error.contains("ephemeral root"),
+                        "semantic query must be skipped on an ephemeral root; got: {error}"
+                    );
+                }
+                _ => panic!("expected Error response on ephemeral root"),
+            }
+            assert!(daemon.semantic_index.read().await.is_none());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

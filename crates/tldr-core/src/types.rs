@@ -1434,19 +1434,24 @@ pub struct FunctionInfo {
     pub line_end: u32,
 }
 
-// schema-unification-v1 BUG-17 / schema-cleanup-v1 BUG-23: manual
-// Serialize impl emits `line` and `line_end` (the canonical schema)
-// and intentionally OMITS `line_number` (which was a redundant alias
-// of `line` from BUG-17 — keeping both was dead surface).
+// schema-unification-v1 BUG-17 / schema-cleanup-v1 BUG-23 / fastedit-compat:
+// manual Serialize emits `line` (canonical) + `line_end`, AND re-emits
+// `line_number` as a value-identical alias of `line`. BUG-23 had dropped
+// `line_number` as a "redundant" alias, but the downstream fastedit CLI
+// consumer reads `line_number` from `extract --format json`
+// (inference/ast_utils.py: `_enrich_parents_from_extract` attaches
+// class→method parents keyed by it, and the `_get_ast_via_extract` fallback
+// builds nodes off it). Restored as a deliberate compat alias; `line` stays
+// the canonical key.
 impl Serialize for FunctionInfo {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        // Field count: name, params, is_method, is_async, line, line_end
-        // + optional fields.
-        let mut count = 6;
+        // Field count: name, params, is_method, is_async, line,
+        // line_number, line_end + optional fields.
+        let mut count = 7;
         if self.return_type.is_some() {
             count += 1;
         }
@@ -1471,6 +1476,8 @@ impl Serialize for FunctionInfo {
             s.serialize_field("decorators", &self.decorators)?;
         }
         s.serialize_field("line", &self.line_number)?;
+        // fastedit-compat alias of `line` (see impl comment above).
+        s.serialize_field("line_number", &self.line_number)?;
         s.serialize_field("line_end", &self.line_end)?;
         s.end()
     }
@@ -1513,16 +1520,17 @@ pub struct ClassInfo {
     pub line_end: u32,
 }
 
-// schema-unification-v1 BUG-17 / schema-cleanup-v1 BUG-23: emits
-// `line` + `line_end`; intentionally OMITS `line_number` (which was a
-// redundant alias for `line`).
+// schema-unification-v1 BUG-17 / schema-cleanup-v1 BUG-23 / fastedit-compat:
+// emits `line` (canonical) + `line_end`, AND re-emits `line_number` as a
+// value-identical alias — the fastedit `_get_ast_via_extract` fallback reads
+// `classes[].line_number`. See the FunctionInfo impl comment for rationale.
 impl Serialize for ClassInfo {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut count = 4; // name + methods + line + line_end
+        let mut count = 5; // name + methods + line + line_number + line_end
         if !self.bases.is_empty() {
             count += 1;
         }
@@ -1551,6 +1559,8 @@ impl Serialize for ClassInfo {
             s.serialize_field("decorators", &self.decorators)?;
         }
         s.serialize_field("line", &self.line_number)?;
+        // fastedit-compat alias of `line` (see impl comment above).
+        s.serialize_field("line_number", &self.line_number)?;
         s.serialize_field("line_end", &self.line_end)?;
         s.end()
     }

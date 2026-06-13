@@ -776,6 +776,7 @@ mod tests {
             detection_method: "call_graph".to_string(),
             metadata: None,
             status: tldr_core::ChangeImpactStatus::Completed,
+            ..Default::default()
         };
         assert!(ctx.set_change_impact(report).is_ok());
 

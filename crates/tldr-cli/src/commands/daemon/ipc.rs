@@ -455,6 +455,54 @@ impl IpcStream {
             IpcStreamInner::Dummy => Err(DaemonError::NotRunning),
         }
     }
+
+    /// Resolve when the peer half of this connection is closed (EOF).
+    ///
+    /// Used as the cancel arm of the per-connection `tokio::select!` in the
+    /// daemon (C4 client-disconnect cancellation, Python `5825b9b`): if the
+    /// client drops mid-command, this future resolves and the in-flight handler
+    /// future is dropped (cooperative cancel at await points).
+    ///
+    /// This is intended to be polled AFTER the full command has been read off
+    /// the stream, so the only further bytes a well-behaved client sends are
+    /// none (it is awaiting the response). It therefore detects a closed peer
+    /// via a real read that returns `Ok(0)` (EOF). If the peer instead sends
+    /// further bytes (protocol violation / pipelining we do not support), this
+    /// future stays pending — never spuriously cancelling a live request.
+    pub async fn poll_peer_closed(&mut self) {
+        match &mut self.inner {
+            #[cfg(unix)]
+            IpcStreamInner::Unix(stream) => poll_peer_closed_reader(stream).await,
+            #[cfg(windows)]
+            IpcStreamInner::Tcp(stream) => poll_peer_closed_reader(stream).await,
+            #[cfg(all(not(unix), not(windows)))]
+            IpcStreamInner::Dummy => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Resolve when `stream` reaches EOF (peer closed the write half).
+///
+/// Generic over any `AsyncRead` so it can be exercised over
+/// `tokio::io::duplex` in unit tests as well as real Unix/TCP sockets. Reads
+/// one byte at a time; resolves on `Ok(0)` (EOF) or an I/O error (treated as
+/// peer-gone). On a non-empty read (unexpected trailing bytes) it keeps
+/// reading rather than resolving, so a live peer is never reported as closed.
+pub async fn poll_peer_closed_reader<R>(stream: &mut R)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte).await {
+            // EOF: the peer closed its write half.
+            Ok(0) => return,
+            // I/O error: treat the peer as gone.
+            Err(_) => return,
+            // Unexpected trailing byte from a live peer — keep waiting.
+            Ok(_) => continue,
+        }
+    }
 }
 
 /// Shared helper: read a newline-delimited string from any `AsyncRead` stream,
@@ -710,6 +758,90 @@ mod tests {
 
         let result = IpcStream::connect(project).await;
         assert!(matches!(result, Err(DaemonError::NotRunning)));
+    }
+
+    // =========================================================================
+    // poll_peer_closed (C4 client-disconnect cancellation)
+    // =========================================================================
+
+    /// Dropping the peer half of a duplex stream makes `poll_peer_closed_reader`
+    /// resolve promptly (it observes EOF).
+    #[tokio::test]
+    async fn test_poll_peer_closed_resolves_on_peer_drop() {
+        let (mut server, client) = tokio::io::duplex(64);
+        // Drop the client (peer) half -> server side sees EOF.
+        drop(client);
+
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            poll_peer_closed_reader(&mut server),
+        )
+        .await;
+        assert!(resolved.is_ok(), "poll_peer_closed should resolve on EOF");
+    }
+
+    /// While the peer is connected and silent, `poll_peer_closed_reader` stays
+    /// pending (it must NOT spuriously resolve for a live peer).
+    #[tokio::test]
+    async fn test_poll_peer_closed_pending_while_peer_alive() {
+        let (mut server, _client) = tokio::io::duplex(64);
+        // Keep _client alive; the probe must not resolve.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            poll_peer_closed_reader(&mut server),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "poll_peer_closed must stay pending while the peer is connected"
+        );
+    }
+
+    /// In a `select!`, dropping the peer wins the race and lets us cancel the
+    /// (slow) handler future — the C4 cooperative-cancel shape end to end.
+    #[tokio::test]
+    async fn test_select_peer_closed_cancels_slow_handler() {
+        let (mut server, client) = tokio::io::duplex(64);
+        drop(client);
+
+        let mut handler_ran_to_completion = false;
+        tokio::select! {
+            _ = poll_peer_closed_reader(&mut server) => {
+                // Peer closed -> handler future dropped (cancelled).
+            }
+            _ = async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                handler_ran_to_completion = true;
+            } => {}
+        }
+        assert!(
+            !handler_ran_to_completion,
+            "the slow handler should have been cancelled by peer-closed"
+        );
+    }
+
+    /// A live peer that sends trailing bytes does NOT make the probe resolve
+    /// (the byte is consumed and the loop keeps waiting).
+    #[tokio::test]
+    async fn test_poll_peer_closed_pending_on_trailing_byte_then_resolves_on_close() {
+        let (mut server, mut client) = tokio::io::duplex(64);
+        client.write_all(b"x").await.unwrap();
+        // Still pending: a stray byte from a LIVE peer is not a close.
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(120),
+            poll_peer_closed_reader(&mut server),
+        )
+        .await;
+        assert!(pending.is_err(), "trailing byte from a live peer is not a close");
+
+        // Now drop the peer; the same probe resolves.
+        drop(client);
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            poll_peer_closed_reader(&mut server),
+        )
+        .await;
+        assert!(resolved.is_ok(), "after peer drop the probe should resolve");
     }
 
     // Integration tests for listener/stream would require a running daemon

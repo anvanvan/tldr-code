@@ -102,6 +102,7 @@ impl SimilarArgs {
             languages: None,
             show_progress: !quiet,
             use_cache: !self.no_cache,
+            device: Default::default(),
         };
 
         // Cache config
@@ -125,6 +126,7 @@ impl SimilarArgs {
             threshold: self.threshold,
             include_snippet: true,
             snippet_lines: 5,
+            expand: false,
         };
 
         // M16 (med-cleanup-bundle-v1): when the user passed a whole

@@ -101,7 +101,7 @@ pub enum ChangeImpactStatus {
 }
 
 /// Change impact analysis report
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChangeImpactReport {
     /// Files that were detected as changed
     pub changed_files: Vec<PathBuf>,
@@ -122,6 +122,24 @@ pub struct ChangeImpactReport {
     /// backwards compatibility with pre-existing JSON consumers.
     #[serde(default)]
     pub status: ChangeImpactStatus,
+    /// Number of test files NOT selected by the analysis (Python parity:
+    /// `max(0, total_tests - affected_tests.len())`). `#[serde(default)]`
+    /// keeps the struct-literal construction sites + legacy JSON consumers
+    /// backwards-compatible.
+    #[serde(default)]
+    pub skipped_count: usize,
+    /// Total number of test files discovered in the project (Python parity).
+    #[serde(default)]
+    pub total_tests: usize,
+    /// Whether the call-graph build was skipped or degraded (Python parity:
+    /// caller analysis falls back to import-graph / direct-file detection).
+    #[serde(default)]
+    pub degraded_analysis: bool,
+    /// Argv for the affected-test command (Python parity: `pytest <files>`
+    /// / `npm test -- <files>`, bare command on empty affected, `None` for
+    /// unsupported languages). This is the exact command `--run` executes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_command: Option<Vec<String>>,
 }
 
 /// Individual test function with location information
@@ -253,7 +271,7 @@ pub fn change_impact_extended(
     method: DetectionMethod,
     language: Language,
     depth: usize,
-    _include_imports: bool,    // TODO: Use this in Phase 3
+    include_imports: bool,
     _test_patterns: &[String], // TODO: Use this in Phase 3
     explicit_files: Option<Vec<PathBuf>>,
 ) -> TldrResult<ChangeImpactReport> {
@@ -345,6 +363,13 @@ pub fn change_impact_extended(
                 .map(|ext| Language::from_extension(ext) == Some(language))
                 .unwrap_or(false)
         })
+        // Normalize to the project-relative convention the call graph uses
+        // (e.g. `pkg/calc.py`, not `./pkg/calc.py` or an absolute path).
+        // WITHOUT this, the call-graph passes (find_functions_in_files,
+        // the reverse-graph traversal, find_affected_tests pass 3) cannot
+        // match `changed_files` against the graph's relative edge paths, so
+        // call-edge-affected test files never surface in `affected_tests`.
+        .map(|f| normalize_changed_path(&f, project))
         .collect();
 
     // If no changed files, return empty report with the appropriate status.
@@ -371,6 +396,11 @@ pub fn change_impact_extended(
         if matches!(status, ChangeImpactStatus::NoChanges) {
             if let Ok(call_graph) = build_project_call_graph(project, language, None, true) {
                 let edge_count = call_graph.edges().count();
+                // Python parity: even with zero changed files we still report
+                // the total test count so consumers can show "N tests skipped".
+                let total_tests = get_all_project_files(project, language)
+                    .map(|files| files.iter().filter(|f| is_test_file(f, language)).count())
+                    .unwrap_or(0);
                 return Ok(ChangeImpactReport {
                     changed_files: vec![],
                     affected_tests: vec![],
@@ -384,6 +414,10 @@ pub fn change_impact_extended(
                         analysis_depth: Some(depth),
                     }),
                     status,
+                    skipped_count: total_tests,
+                    total_tests,
+                    degraded_analysis: false,
+                    test_command: build_test_command(&[], language),
                 });
             }
         }
@@ -403,27 +437,40 @@ pub fn change_impact_extended(
     // Step 5: Find all project files
     let all_files = get_all_project_files(project, language)?;
 
-    // Step 6: Filter to test files
+    // Step 6: Filter to test files. Normalize to the call-graph relative
+    // convention (`tests/test_x.py`, not `./tests/test_x.py`) so the
+    // call-edge pass in find_affected_tests matches edge source paths AND the
+    // output paths line up with Python's `relative_to(project)` form.
     let test_files: HashSet<PathBuf> = all_files
         .iter()
         .filter(|f| is_test_file(f, language))
-        .cloned()
+        .map(|f| normalize_changed_path(f, project))
         .collect();
 
     // Step 7: Find affected tests
     // A test is affected if:
     // - It's in a changed file
-    // - It imports a changed module
+    // - It imports a changed module (import-graph backup, when include_imports)
     // - It calls a changed function
     let affected_tests = find_affected_tests(
         &test_files,
         &changed_files,
         &affected_functions,
         &call_graph,
+        include_imports,
+        language,
+        project,
     );
+
+    // Python parity: total = all test files in project; skipped = the ones
+    // we did NOT select.
+    let total_tests = test_files.len();
+    let skipped_count = total_tests.saturating_sub(affected_tests.len());
 
     // Extract test functions from affected test files (Phase 4)
     let affected_test_functions = extract_test_functions_from_files(&affected_tests, language);
+
+    let test_command = build_test_command(&affected_tests, language);
 
     Ok(ChangeImpactReport {
         changed_files,
@@ -441,6 +488,10 @@ pub fn change_impact_extended(
             })
         },
         status: ChangeImpactStatus::Completed,
+        skipped_count,
+        total_tests,
+        degraded_analysis: false,
+        test_command,
     })
 }
 
@@ -467,6 +518,7 @@ fn make_status_report(
             analysis_depth: Some(depth),
         }),
         status,
+        ..Default::default()
     }
 }
 
@@ -1010,11 +1062,15 @@ fn is_test_file(path: &Path, language: Language) -> bool {
 }
 
 /// Find test files affected by the changes
+#[allow(clippy::too_many_arguments)]
 fn find_affected_tests(
     test_files: &HashSet<PathBuf>,
     changed_files: &[PathBuf],
     affected_functions: &[FunctionRef],
     call_graph: &ProjectCallGraph,
+    include_imports: bool,
+    language: Language,
+    project: &Path,
 ) -> Vec<PathBuf> {
     let mut affected_tests = HashSet::new();
 
@@ -1042,9 +1098,143 @@ fn find_affected_tests(
         }
     }
 
+    // 4. Import-graph backup (Python `find_tests_importing_module`): a test
+    //    that imports a changed module but has NO call edge to it is still
+    //    selected. This catches `from pkg.calc import unused_helper` where the
+    //    symbol is imported but never invoked (so no call-graph edge exists).
+    //    Gated on `include_imports`.
+    if include_imports {
+        // Derive the module name of each changed source file (e.g.
+        // `pkg/calc.py` -> `pkg.calc`).
+        let changed_modules: Vec<String> = changed_files
+            .iter()
+            .filter_map(|f| derive_module_name(f, language))
+            .collect();
+
+        if !changed_modules.is_empty() {
+            for test_file in test_files {
+                if affected_tests.contains(test_file) {
+                    continue;
+                }
+                let abs_path = if test_file.is_absolute() {
+                    test_file.clone()
+                } else {
+                    project.join(test_file)
+                };
+                if let Ok(imports) = crate::ast::get_imports(&abs_path, language) {
+                    let matched = imports.iter().any(|imp| {
+                        changed_modules.iter().any(|m| {
+                            imp.module == *m || imp.module.starts_with(&format!("{m}."))
+                        })
+                    });
+                    if matched {
+                        affected_tests.insert(test_file.clone());
+                    }
+                }
+            }
+        }
+    }
+
     let mut result: Vec<PathBuf> = affected_tests.into_iter().collect();
     result.sort();
     result
+}
+
+/// Normalize a changed-file path to the project-relative convention the call
+/// graph uses (forward slashes, no leading `./`, no absolute prefix).
+///
+/// Detection methods emit `./pkg/calc.py` (git modes, via `project.join`) or
+/// absolute paths (explicit mode), but the call graph keys edges by
+/// project-relative paths like `pkg/calc.py`. Aligning the two is what makes
+/// call-edge-affected test files surface in `affected_tests`.
+fn normalize_changed_path(file: &Path, project: &Path) -> PathBuf {
+    // Strip an absolute project prefix if present.
+    if file.is_absolute() {
+        if let Ok(canon_project) = project.canonicalize() {
+            if let Ok(canon_file) = file.canonicalize() {
+                if let Ok(rel) = canon_file.strip_prefix(&canon_project) {
+                    return PathBuf::from(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        if let Ok(rel) = file.strip_prefix(project) {
+            return PathBuf::from(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    // Strip a leading `./` (git modes via `project.join(".")`).
+    let s = file.to_string_lossy().replace('\\', "/");
+    let stripped = s.strip_prefix("./").unwrap_or(&s);
+    PathBuf::from(stripped)
+}
+
+/// Derive a language-appropriate module name from a project-relative file path.
+///
+/// Mirrors Python `get_module_name`: `pkg/calc.py` -> `pkg.calc`,
+/// strips the file extension, drops a trailing `__init__`. For non-dotted
+/// languages we fall back to the slash-separated stem so import matching is at
+/// least best-effort. Returns `None` when no usable module name exists.
+fn derive_module_name(file: &Path, language: Language) -> Option<String> {
+    let rel = normalize_changed_path(file, Path::new("."));
+    let rel_str = rel.to_string_lossy();
+    // Strip the extension from the last component only.
+    let without_ext = match rel_str.rsplit_once('.') {
+        Some((stem, _ext)) => stem.to_string(),
+        None => rel_str.to_string(),
+    };
+    let mut parts: Vec<&str> = without_ext.split('/').filter(|p| !p.is_empty()).collect();
+    // Drop a trailing __init__ (package marker).
+    if parts.last() == Some(&"__init__") {
+        parts.pop();
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    // Dot-separated module path (Python convention, also the default for the
+    // languages whose import statements carry a dotted module path).
+    let _ = language;
+    Some(parts.join("."))
+}
+
+/// Build the affected-test command argv (Python parity).
+///
+/// - Python: `["pytest", <files...>]`, or `["pytest"]` when nothing affected.
+/// - TypeScript/JavaScript: `["npm", "test", "--", <files...>]`, or
+///   `["npm", "test"]` when nothing affected.
+/// - Rust (parity-PLUS): `["cargo", "test"]` (cargo selects by name, not path).
+/// - Go (parity-PLUS): `["go", "test", "./..."]`.
+/// - Anything else: `None` (Python returns `None` for unsupported languages).
+///
+/// Returned as an argv list (never a joined shell string) so the `--run`
+/// executor is injection-safe.
+pub fn build_test_command(affected_tests: &[PathBuf], language: Language) -> Option<Vec<String>> {
+    let files: Vec<String> = affected_tests
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+    match language {
+        Language::Python => {
+            let mut cmd = vec!["pytest".to_string()];
+            cmd.extend(files);
+            Some(cmd)
+        }
+        Language::TypeScript | Language::JavaScript => {
+            let mut cmd = vec!["npm".to_string(), "test".to_string()];
+            if !files.is_empty() {
+                cmd.push("--".to_string());
+                cmd.extend(files);
+            }
+            Some(cmd)
+        }
+        // Parity-PLUS: tldr-code supports Rust/Go runners that Python returns
+        // None for. cargo/go select by package/name, so we run the suite.
+        Language::Rust => Some(vec!["cargo".to_string(), "test".to_string()]),
+        Language::Go => Some(vec![
+            "go".to_string(),
+            "test".to_string(),
+            "./...".to_string(),
+        ]),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1126,6 +1316,7 @@ mod tests {
             detection_method: "explicit".to_string(),
             metadata: None,
             status: ChangeImpactStatus::NoChanges,
+            ..Default::default()
         };
 
         assert!(report.changed_files.is_empty());
@@ -1590,5 +1781,272 @@ func TestLogout(t *testing.T) {
         let report: ChangeImpactReport =
             serde_json::from_str(legacy_json).expect("legacy JSON should deserialize");
         assert_eq!(report.status, ChangeImpactStatus::Completed);
+    }
+
+    // =========================================================================
+    // Area 6 (change-impact migration): the headline call-edge bug, the
+    // import-graph backup pass, the new report fields, and the pure helpers.
+    // =========================================================================
+
+    /// Build a tiny Python project: pkg/calc.py with add/multiply/unused_helper,
+    /// tests/test_calc.py CALLING add+multiply, tests/test_importonly.py that
+    /// IMPORTS unused_helper but never calls it. Returns the project root.
+    fn make_calc_project(project: &Path) {
+        let pkg = project.join("pkg");
+        let tests = project.join("tests");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(
+            pkg.join("calc.py"),
+            "def add(a, b):\n    return a + b\n\ndef multiply(a, b):\n    return a * b\n\ndef unused_helper(x):\n    return x\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tests.join("test_calc.py"),
+            "from pkg.calc import add, multiply\n\ndef test_add():\n    assert add(1, 2) == 3\n\ndef test_multiply():\n    assert multiply(2, 3) == 6\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tests.join("test_importonly.py"),
+            "from pkg.calc import unused_helper\n\ndef test_nothing():\n    assert True\n",
+        )
+        .unwrap();
+    }
+
+    /// HEADLINE BUG (verification Behavior 2): a change to pkg/calc.py must
+    /// surface tests/test_calc.py in `affected_tests` via the call graph
+    /// (test_add -> add, test_multiply -> multiply). Before the path
+    /// normalization fix this returned `affected_tests: []`.
+    #[test]
+    fn test_call_edge_affected_tests_populated() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        make_calc_project(project);
+
+        // Explicit mode isolates the call-graph passes from git plumbing.
+        let report = change_impact_extended(
+            project,
+            DetectionMethod::Explicit,
+            Language::Python,
+            10,
+            false, // include_imports OFF -> only the call-graph passes run
+            &[],
+            Some(vec![project.join("pkg/calc.py")]),
+        )
+        .expect("change_impact_extended should succeed");
+
+        assert_eq!(report.status, ChangeImpactStatus::Completed);
+        let tests: HashSet<String> = report
+            .affected_tests
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(
+            tests.contains("tests/test_calc.py"),
+            "call-edge-affected test should be selected even with imports OFF; got {:?}",
+            report.affected_tests
+        );
+        // The changed file path must be normalized to the call-graph relative
+        // convention (no `./`, no absolute prefix).
+        assert_eq!(
+            report
+                .changed_files
+                .iter()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .collect::<Vec<_>>(),
+            vec!["pkg/calc.py".to_string()],
+        );
+    }
+
+    /// Import-graph backup (verification Behavior 3): test_importonly.py
+    /// imports unused_helper but never CALLS it. It must be selected ONLY when
+    /// include_imports=true, and NOT when false. This is the discriminator
+    /// that distinguishes the call-graph pass from the import pass.
+    #[test]
+    fn test_import_only_selection_gated_on_include_imports() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        make_calc_project(project);
+
+        let run = |include_imports: bool| -> HashSet<String> {
+            change_impact_extended(
+                project,
+                DetectionMethod::Explicit,
+                Language::Python,
+                10,
+                include_imports,
+                &[],
+                Some(vec![project.join("pkg/calc.py")]),
+            )
+            .expect("change_impact_extended should succeed")
+            .affected_tests
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect()
+        };
+
+        let without = run(false);
+        let with = run(true);
+
+        assert!(
+            !without.contains("tests/test_importonly.py"),
+            "import-only test must NOT be selected without include_imports; got {:?}",
+            without
+        );
+        assert!(
+            with.contains("tests/test_importonly.py"),
+            "import-only test MUST be selected with include_imports; got {:?}",
+            with
+        );
+        // Sanity: the call-edge test is selected in both cases.
+        assert!(without.contains("tests/test_calc.py"));
+        assert!(with.contains("tests/test_calc.py"));
+    }
+
+    /// New report fields (verification Behavior 4): a Completed report exposes
+    /// total_tests, skipped_count, degraded_analysis, and test_command.
+    #[test]
+    fn test_report_exposes_new_parity_fields() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        make_calc_project(project);
+
+        let report = change_impact_extended(
+            project,
+            DetectionMethod::Explicit,
+            Language::Python,
+            10,
+            true,
+            &[],
+            Some(vec![project.join("pkg/calc.py")]),
+        )
+        .expect("change_impact_extended should succeed");
+
+        // 3 test files total: test_calc.py, test_importonly.py.
+        // (conftest is not created here.)
+        assert_eq!(report.total_tests, 2, "two test files in the project");
+        assert_eq!(report.affected_tests.len(), 2, "both tests affected");
+        assert_eq!(
+            report.skipped_count, 0,
+            "no tests skipped (both affected): total={} affected={}",
+            report.total_tests,
+            report.affected_tests.len()
+        );
+        assert!(!report.degraded_analysis);
+        assert_eq!(
+            report.test_command,
+            Some(vec![
+                "pytest".to_string(),
+                "tests/test_calc.py".to_string(),
+                "tests/test_importonly.py".to_string(),
+            ]),
+            "test_command should be pytest + sorted affected files"
+        );
+    }
+
+    /// build_test_command table (verification Behavior 4 / spec test plan):
+    /// argv lists per language, bare command on empty, None for unsupported.
+    #[test]
+    fn test_build_test_command_table() {
+        let files = vec![
+            PathBuf::from("tests/test_a.py"),
+            PathBuf::from("tests/test_b.py"),
+        ];
+
+        // Python: pytest + files
+        assert_eq!(
+            build_test_command(&files, Language::Python),
+            Some(vec![
+                "pytest".to_string(),
+                "tests/test_a.py".to_string(),
+                "tests/test_b.py".to_string(),
+            ])
+        );
+        // Python empty: bare pytest
+        assert_eq!(
+            build_test_command(&[], Language::Python),
+            Some(vec!["pytest".to_string()])
+        );
+        // TS: npm test -- files
+        assert_eq!(
+            build_test_command(&files, Language::TypeScript),
+            Some(vec![
+                "npm".to_string(),
+                "test".to_string(),
+                "--".to_string(),
+                "tests/test_a.py".to_string(),
+                "tests/test_b.py".to_string(),
+            ])
+        );
+        // JS empty: bare npm test (no trailing --)
+        assert_eq!(
+            build_test_command(&[], Language::JavaScript),
+            Some(vec!["npm".to_string(), "test".to_string()])
+        );
+        // Parity-PLUS: Rust / Go.
+        assert_eq!(
+            build_test_command(&files, Language::Rust),
+            Some(vec!["cargo".to_string(), "test".to_string()])
+        );
+        assert_eq!(
+            build_test_command(&files, Language::Go),
+            Some(vec![
+                "go".to_string(),
+                "test".to_string(),
+                "./...".to_string()
+            ])
+        );
+        // Unsupported language -> None (Python parity).
+        assert_eq!(build_test_command(&files, Language::Java), None);
+    }
+
+    /// derive_module_name mirrors Python `get_module_name`.
+    #[test]
+    fn test_derive_module_name() {
+        assert_eq!(
+            derive_module_name(Path::new("pkg/calc.py"), Language::Python),
+            Some("pkg.calc".to_string())
+        );
+        assert_eq!(
+            derive_module_name(Path::new("./pkg/calc.py"), Language::Python),
+            Some("pkg.calc".to_string())
+        );
+        // __init__ is dropped (package marker).
+        assert_eq!(
+            derive_module_name(Path::new("pkg/__init__.py"), Language::Python),
+            Some("pkg".to_string())
+        );
+        // Top-level module.
+        assert_eq!(
+            derive_module_name(Path::new("calc.py"), Language::Python),
+            Some("calc".to_string())
+        );
+    }
+
+    /// normalize_changed_path strips `./` and absolute prefixes to the
+    /// project-relative call-graph convention.
+    #[test]
+    fn test_normalize_changed_path() {
+        let project = Path::new("/proj");
+        assert_eq!(
+            normalize_changed_path(Path::new("./pkg/calc.py"), project),
+            PathBuf::from("pkg/calc.py")
+        );
+        assert_eq!(
+            normalize_changed_path(Path::new("pkg/calc.py"), project),
+            PathBuf::from("pkg/calc.py")
+        );
+        // Absolute path under project (no canonicalize hit since /proj does
+        // not exist on disk) falls back to strip_prefix.
+        assert_eq!(
+            normalize_changed_path(Path::new("/proj/pkg/calc.py"), project),
+            PathBuf::from("pkg/calc.py")
+        );
     }
 }

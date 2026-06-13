@@ -42,7 +42,7 @@ use tldr_cli::commands::{
     ContractsArgs, CoverageArgs, DaemonListArgs, DaemonNotifyArgs, DaemonQueryArgs,
     DaemonStartArgs, DaemonStatusArgs, DaemonStopArgs, DeadArgs, DeadStoresArgs, DebtArgs,
     DefinitionArgs, DepsArgs,
-    DiagnosticsArgs, DiceArgs, DiffArgs, DoctorArgs, ExplainArgs, ExtractArgs, FixArgs,
+    DiagnosticsArgs, DiceArgs, DiffArgs, DoctorArgs, ExplainArgs, ExtractArgs, FixArgs, GrepArgs,
     HalsteadArgs, HealthArgs, HotspotsArgs, HubsArgs, ImpactArgs, ImportersArgs, ImportsArgs,
     InheritanceArgs, InvariantsArgs, LocArgs, PatternsArgs, ReachingDefsArgs, ReferencesArgs,
     SecureArgs, SliceArgs, SmartSearchArgs, SmellsArgs, SpecsArgs, StatsArgs, StructureArgs,
@@ -101,7 +101,12 @@ pub struct Cli {
     )]
     pub format: OutputFormat,
 
-    /// Programming language (auto-detect if not specified)
+    /// Programming language (auto-detect if not specified).
+    ///
+    /// For `context`, the Python-parity tokens `auto` / `all` are also
+    /// accepted (handled by an argv pre-pass in `main`, since this global flag
+    /// is typed `Option<Language>` and shared by clap arg id with ~24 sibling
+    /// commands — see `extract_context_lang_token`).
     #[arg(long, short = 'l', global = true)]
     pub lang: Option<Language>,
 
@@ -159,6 +164,10 @@ pub enum Command {
     /// Enriched search with function-level context cards (BM25 + structure + call graph)
     #[command(name = "search")]
     SmartSearch(SmartSearchArgs),
+
+    /// Line-oriented regex search emitting a flat [{file,line,content}] array
+    #[command(name = "grep")]
+    Grep(GrepArgs),
 
     /// Build LLM-ready context from entry point
     Context(ContextArgs),
@@ -448,8 +457,97 @@ pub enum BugbotCommand {
     Check(BugbotCheckArgs),
 }
 
+thread_local! {
+    /// context-batch: the `auto` / `all` `--lang` token extracted from argv by
+    /// [`extract_context_lang_token`] before clap parsing, so `context` can
+    /// honour the Python-parity tokens that the shared global `--lang`
+    /// (`Option<Language>`) cannot represent. `Some` only when such a token was
+    /// present on a `context` invocation.
+    static CONTEXT_LANG_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Scan raw argv for a `context` invocation carrying a `--lang auto|all`
+/// (or `-l auto|all`) token. When found, returns the cleaned argv (with that
+/// flag+value removed) and the token; otherwise returns `None`.
+///
+/// This is a narrow pre-pass: it only fires for the `context` subcommand and
+/// only for the literal `auto` / `all` values (explicit languages and every
+/// other command flow untouched). It exists because the global `--lang` flag
+/// is typed `Option<Language>` and shared by clap arg id with ~24 sibling
+/// commands — widening it to accept `auto` / `all` would require changing all
+/// of them. Recognised spellings: `--lang auto`, `--lang=auto`, `-l auto`,
+/// `-lauto` (and `all`), case-insensitive on the value.
+fn extract_context_lang_token(args: &[String]) -> Option<(Vec<String>, String)> {
+    // Identify the subcommand (first non-flag token after the program name).
+    let is_context = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .map(|a| a == "context")
+        .unwrap_or(false);
+    if !is_context {
+        return None;
+    }
+
+    let token_ok = |v: &str| {
+        let lv = v.to_lowercase();
+        if lv == "auto" || lv == "all" {
+            Some(lv)
+        } else {
+            None
+        }
+    };
+
+    let mut cleaned: Vec<String> = Vec::with_capacity(args.len());
+    let mut found: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        // `--lang=VALUE` / `-l=VALUE`
+        if let Some(v) = a.strip_prefix("--lang=").or_else(|| a.strip_prefix("-l=")) {
+            if let Some(tok) = token_ok(v) {
+                found = Some(tok);
+                i += 1;
+                continue; // drop the whole `--lang=auto` token
+            }
+        }
+        // `-lauto` / `-lall` (short flag glued to value)
+        if let Some(v) = a.strip_prefix("-l") {
+            if !v.is_empty() && a.len() > 2 && !a.starts_with("-l=") {
+                if let Some(tok) = token_ok(v) {
+                    found = Some(tok);
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        // `--lang VALUE` / `-l VALUE` (separate token)
+        if (a == "--lang" || a == "-l") && i + 1 < args.len() {
+            if let Some(tok) = token_ok(&args[i + 1]) {
+                found = Some(tok);
+                i += 2; // drop both the flag and its value
+                continue;
+            }
+        }
+        cleaned.push(a.clone());
+        i += 1;
+    }
+
+    found.map(|tok| (cleaned, tok))
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // context-batch: pre-pass argv for `context --lang auto|all` so the tokens
+    // survive clap (the shared global `--lang` is `Option<Language>`).
+    let raw_args: Vec<String> = std::env::args().collect();
+    let cli = match extract_context_lang_token(&raw_args) {
+        Some((cleaned, token)) => {
+            CONTEXT_LANG_OVERRIDE.with(|c| *c.borrow_mut() = Some(token));
+            Cli::parse_from(cleaned)
+        }
+        None => Cli::parse(),
+    };
 
     // Set up verbose logging if requested
     if cli.verbose {
@@ -510,6 +608,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Available(_) => "available",
         Command::Slice(_) => "slice",
         Command::SmartSearch(_) => "search",
+        Command::Grep(_) => "grep",
         Command::Context(_) => "context",
         Command::Smells(_) => "smells",
         Command::Extract(_) => "extract",
@@ -628,7 +727,18 @@ fn run_command(cli: &Cli) -> Result<()> {
         Command::Available(args) => args.run(cli.format, q),
         Command::Slice(args) => args.run(cli.format, q),
         Command::SmartSearch(args) => args.run(cli.format, q),
-        Command::Context(args) => args.run(cli.format, q),
+        Command::Grep(args) => args.run(cli.format, q),
+        Command::Context(args) => {
+            // context-batch: resolve the `--lang` token for the context
+            // resolver. Precedence: an `auto` / `all` token captured by the
+            // argv pre-pass wins; else an explicit global `--lang <language>`;
+            // else the `auto` default.
+            let lang_token = CONTEXT_LANG_OVERRIDE
+                .with(|c| c.borrow().clone())
+                .or_else(|| cli.lang.map(|l| l.as_str().to_string()))
+                .unwrap_or_else(|| "auto".to_string());
+            args.run(cli.format, q, &lang_token)
+        }
         Command::Smells(args) => args.run(cli.format, q),
         Command::Extract(args) => args.run(cli.format, q),
         Command::Imports(args) => args.run(cli.format, q),
