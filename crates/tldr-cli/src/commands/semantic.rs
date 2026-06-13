@@ -110,7 +110,7 @@ impl SemanticArgs {
         // Parse model
         let model = parse_model(&self.model)?;
 
-        // Resolve compute device: flag > TLDR_DEVICE env > Gpu default.
+        // Resolve compute device: flag > TLDR_DEVICE env > Cpu default.
         let device = Device::resolve(self.device.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
 
         let root = self.resolved_path();

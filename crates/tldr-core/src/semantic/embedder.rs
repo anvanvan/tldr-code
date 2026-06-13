@@ -66,7 +66,29 @@ pub fn providers_for(device: Device, coreml_available: bool) -> Vec<ExecutionPro
     #[cfg(feature = "coreml")]
     {
         if device == Device::Gpu && coreml_available {
-            providers.push(ort::ep::CoreML::default().build());
+            use ort::ep::coreml::{ComputeUnits, ModelFormat};
+            // BARE `CoreML::default()` (NeuralNetwork + ComputeUnits::ALL + no cache)
+            // leaks RSS without bound across `Run()` for BERT-class embedders on
+            // Apple Silicon (onnxruntime #22007 lists `snowflake-arctic-embed-m`):
+            // graph-partition churn + per-session recompilation. MLProgram (fewer
+            // partitions) + a compiled-model cache bound it. Compute units and
+            // static-shape capture are env-tunable for perf sweeps:
+            //   TLDR_COREML_UNITS  = all | cpu_ane | cpu_gpu (default) | cpu_only
+            //   TLDR_COREML_STATIC = set => RequireStaticInputShapes (fewer partitions)
+            let units = match std::env::var("TLDR_COREML_UNITS").as_deref() {
+                Ok("all") => ComputeUnits::All,
+                Ok("cpu_ane") | Ok("ane") => ComputeUnits::CPUAndNeuralEngine,
+                Ok("cpu_only") => ComputeUnits::CPUOnly,
+                _ => ComputeUnits::CPUAndGPU,
+            };
+            let mut ep = ort::ep::CoreML::default()
+                .with_model_format(ModelFormat::MLProgram)
+                .with_compute_units(units)
+                .with_model_cache_dir(coreml_cache_dir());
+            if std::env::var_os("TLDR_COREML_STATIC").is_some() {
+                ep = ep.with_static_input_shapes(true);
+            }
+            providers.push(ep.build());
         }
     }
     #[cfg(not(feature = "coreml"))]
@@ -83,6 +105,26 @@ pub fn providers_for(device: Device, coreml_available: bool) -> Vec<ExecutionPro
     }
 
     providers
+}
+
+/// Directory for the CoreML EP's compiled-model cache (`ModelCacheDirectory`).
+///
+/// Reuses the same cache root as the fastembed model cache so the compiled
+/// MLProgram is reused across runs instead of recompiled per session — a key
+/// driver of the CoreML RSS growth mitigated in [`providers_for`]. Best-effort
+/// create; ort surfaces a precise error if the path is unusable.
+#[cfg(feature = "coreml")]
+fn coreml_cache_dir() -> String {
+    let dir = std::env::var("TLDR_FASTEMBED_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::cache_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("tldr")
+        })
+        .join("coreml-cache");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.to_string_lossy().into_owned()
 }
 
 /// Whether a CoreML execution provider is reachable in this build.
@@ -159,7 +201,7 @@ impl Embedder {
     /// let embedder = Embedder::new(EmbeddingModel::ArcticM)?;
     /// ```
     pub fn new(model: EmbeddingModel) -> TldrResult<Self> {
-        // Default device is GPU (deliberate deviation from Python's CPU
+        // Default device is CPU (deliberate deviation from Python's CPU
         // default); resolves to CoreML when built with `coreml` on Apple
         // Silicon, transparent CPU fallback otherwise.
         Self::with_device(model, Device::default())

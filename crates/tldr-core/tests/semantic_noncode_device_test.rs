@@ -26,13 +26,13 @@ use tldr_core::semantic::{BuildOptions, Device, SemanticIndex};
 use tempfile::TempDir;
 
 // =============================================================================
-// Device::resolve precedence (flag > TLDR_DEVICE env > Gpu default)
+// Device::resolve precedence (flag > TLDR_DEVICE env > Cpu default)
 // =============================================================================
 
 #[test]
-fn device_default_is_gpu() {
+fn device_default_is_cpu() {
     // Deliberate deviation from Python's CPU default (per user override).
-    assert_eq!(Device::default(), Device::Gpu);
+    assert_eq!(Device::default(), Device::Cpu);
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn device_resolve_default_when_no_flag_no_env() {
     // process env (parallel tests) by only asserting the flag=None path when
     // TLDR_DEVICE is absent in this process; if a sibling set it, skip.
     if std::env::var_os("TLDR_DEVICE").is_none() {
-        assert_eq!(Device::resolve(None).unwrap(), Device::Gpu);
+        assert_eq!(Device::resolve(None).unwrap(), Device::Cpu);
     }
 }
 

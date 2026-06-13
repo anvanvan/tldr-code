@@ -18,30 +18,35 @@ use crate::Language;
 
 /// Compute device for embedding inference.
 ///
-/// Mirrors the Python `tldr semantic --device {cpu,metal}` selector with the
-/// deliberate user-mandated label deviation: the Rust port exposes
-/// `--device {cpu,gpu}` where `gpu` is the Apple-Silicon CoreML/metal path.
+/// The Rust port exposes `--device {cpu,gpu}` where `gpu` is the Apple-Silicon
+/// CoreML/Metal path.
 ///
 /// # Precedence
 ///
 /// [`Device::resolve`] applies: explicit flag > `TLDR_DEVICE` env > default
-/// ([`Device::Gpu`]). This is a deliberate deviation from Python's CPU default
-/// (per explicit user override).
+/// ([`Device::Cpu`]). The default is **CPU**: ONNX-Runtime CoreML cannot
+/// accelerate the Arctic-M embedder on Apple Silicon — every GPU/ANE compute
+/// path measured ~4-5x SLOWER than CPU (onnxruntime #22007: graph-partition
+/// churn), so CPU is both faster and leaner. (This reverses the earlier
+/// GPU-default once the leak fix proved GPU has no speed benefit here.)
 ///
 /// # Reachability
 ///
 /// `Gpu` resolves to CoreML at runtime only when the crate is built with the
 /// `coreml` cargo feature AND the platform supports CoreML (Apple Silicon).
 /// Otherwise it transparently falls back to CPU (best-effort, never hard-fails).
+/// The 33 GB CoreML leak is fixed (see `providers_for`), so `gpu` is safe — just
+/// slower; opt in with `--device gpu` / `TLDR_DEVICE=gpu`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Device {
-    /// CPU-only inference (ONNX CPU execution provider).
+    /// CPU-only inference (ONNX CPU execution provider). **Default** — fastest
+    /// and leanest for the Arctic-M embedder on this hardware.
+    #[default]
     Cpu,
     /// GPU inference — CoreML on Apple Silicon when reachable, else CPU
-    /// fallback. This is the default (deliberate deviation from Python's CPU
-    /// default).
-    #[default]
+    /// fallback. Safe and bounded (the 33 GB leak is fixed) but ~4-5x slower
+    /// than CPU for this model; explicit opt-in only.
     Gpu,
 }
 
